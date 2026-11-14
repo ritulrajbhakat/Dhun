@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Rust / Cargo build outputs
+target/
+target-test/
+**/*.rs.bk
+Cargo.lock
+
+# Tauri build artifacts
+src-tauri/target/
+
+# Local databases & logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Environment & IDE
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS files
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
