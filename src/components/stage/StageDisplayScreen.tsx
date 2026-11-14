@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useDhunStore } from '../../store/useDhunStore';
 import { StageVisualFxCanvas, FX_NAMES } from './StageVisualFxCanvas';
 import { AnimatedDjCharacter } from './AnimatedDjCharacter';
@@ -8,22 +8,22 @@ import {
   SkipForward,
   SkipBack,
   Volume2,
-  VolumeX,
-  Maximize2,
-  Minimize2,
   Sliders,
-  QrCode,
   Music,
   Disc3,
-  Flame,
   AlertTriangle,
+  FolderOpen,
+  Check,
+  X,
+  Settings,
+  Sparkles,
+  Maximize2,
+  Minimize2,
 } from 'lucide-react';
 
 export const StageDisplayScreen: React.FC = () => {
   const {
     partyStatus,
-    telemetry,
-    moodProfiles,
     startParty,
     setMasterVolume,
     masterVolume,
@@ -33,35 +33,72 @@ export const StageDisplayScreen: React.FC = () => {
     guestRequests,
     startBrowserAudio,
     loadLocalAudioFile,
+    approveRequest,
+    rejectRequest,
   } = useDhunStore();
 
   const [currentFxIndex, setCurrentFxIndex] = useState(0);
+  const [autoCycleFx, setAutoCycleFx] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPlaying, setIsPlaying] = useState(true);
-  const [currentTimeSec, setCurrentTimeSec] = useState(30);
+  const [currentTimeSec, setCurrentTimeSec] = useState(179); // 02:59 initial
   const [selectedDjType, setSelectedDjType] = useState('Advanced');
   const [selectedMood, setSelectedMood] = useState('house_party');
   const [audioActive, setAudioActive] = useState(false);
-  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const [showHostDrawer, setShowHostDrawer] = useState(false);
+  const [activeDrawerTab, setActiveDrawerTab] = useState<'library' | 'mixer' | 'requests' | 'fx'>('library');
+  const [folderPathInput, setFolderPathInput] = useState('C:/Users/ritul/Music/Celebration_Tracks');
+  const [isScanning, setIsScanning] = useState(false);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const activeTrack = partyStatus.now_playing?.track;
   const activeAnalysis = partyStatus.now_playing?.analysis;
 
   const currentTitle = activeTrack?.title || 'Chaiyya Chaiyya';
-  const currentArtist = activeTrack?.artist || 'Sukhwinder Singh, Sapna Awasthi';
+  const currentArtist = activeTrack?.artist || 'Chaiyeyya';
   const currentBpm = activeAnalysis?.bpm || 128;
   const currentEnergy = activeAnalysis?.overall_energy || 0.88;
-  const currentDurationSec = activeTrack?.duration_ms ? Math.floor(activeTrack.duration_ms / 1000) : 296;
+  const currentDurationSec = activeTrack?.duration_ms ? Math.floor(activeTrack.duration_ms / 1000) : 296; // 04:56
 
-  // Auto-cycle FX loops every 25 seconds
+  // 1. User interaction listener to immediately start WebAudio on first click/keypress
   useEffect(() => {
+    const unlockAudio = async () => {
+      await startBrowserAudio();
+      setAudioActive(true);
+    };
+    window.addEventListener('pointerdown', unlockAudio, { once: true });
+    window.addEventListener('keydown', unlockAudio, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+  }, [startBrowserAudio]);
+
+  // 2. Keyboard shortcut 'M' or 'Escape' to toggle host console drawer
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'm' || e.key === 'M') {
+        setShowHostDrawer((prev) => !prev);
+      }
+      if (e.key === 'Escape') {
+        setShowHostDrawer(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // 3. Auto-cycle FX loops every 25 seconds if enabled
+  useEffect(() => {
+    if (!autoCycleFx) return;
     const fxTimer = setInterval(() => {
       setCurrentFxIndex((idx) => (idx + 1) % 15);
     }, 25000);
     return () => clearInterval(fxTimer);
-  }, []);
+  }, [autoCycleFx]);
 
-  // Track playback time counter
+  // 4. Track playback time progress
   useEffect(() => {
     if (!isPlaying) return;
     const progressTimer = setInterval(() => {
@@ -111,6 +148,7 @@ export const StageDisplayScreen: React.FC = () => {
     }
   };
 
+  // 4 DJ Levels
   const djTypes = [
     { id: 'Pro', name: 'DJ TYPE: Professional 2-Deck' },
     { id: 'Smart', name: 'DJ TYPE: Smart Mixing' },
@@ -118,45 +156,38 @@ export const StageDisplayScreen: React.FC = () => {
     { id: 'Creative', name: 'DJ TYPE: Creative Tools' },
   ];
 
+  // All 14 Indian & International Mood Presets
   const moodsList = [
     { id: 'house_party', name: 'MOOD: House Party' },
     { id: 'shaadi', name: 'MOOD: Shaadi' },
-    { id: 'baraat', name: 'MOOD: Baraat (High Energy)' },
+    { id: 'baraat', name: 'MOOD: Baraat' },
     { id: 'mehendi', name: 'MOOD: Mehendi' },
+    { id: 'haldi', name: 'MOOD: Haldi' },
     { id: 'sangeet', name: 'MOOD: Sangeet' },
     { id: 'desi_club', name: 'MOOD: Desi Club' },
     { id: 'punjabi_tashan', name: 'MOOD: Punjabi Tashan' },
-    { id: 'garba', name: 'MOOD: Garba & Dandiya' },
+    { id: 'garba', name: 'MOOD: Garba' },
+    { id: 'dandiya', name: 'MOOD: Dandiya' },
     { id: 'retro_bollywood', name: 'MOOD: Retro Bollywood' },
+    { id: 'cocktail_night', name: 'MOOD: Cocktail Night' },
     { id: 'festival_mode', name: 'MOOD: Festival Mode' },
+    { id: 'international_party', name: 'MOOD: International Party' },
   ];
 
   const progressPercent = Math.min(100, (currentTimeSec / currentDurationSec) * 100);
 
-  // LAN QR Code target URL
-  const lanIp = partyStatus.guest_url || 'http://192.168.1.15:3000/request';
+  // Dynamic LAN IP
+  const lanHost = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
+    ? `${window.location.hostname}:1420`
+    : '192.168.1.15';
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-black select-none font-sans text-white">
       {/* ============================================================ */}
-      {/* LAYER 1: BASE STAGE AMBIENCE & WARM FESTIVAL LIGHTS           */}
+      {/* LAYER 1: GIANT LED STAGE SCREEN PLAYING 15 VIDEO FX LOOPS    */}
+      {/* Positioned precisely inside the stage screen opening         */}
       {/* ============================================================ */}
-      <div
-        className="absolute inset-0 bg-cover bg-center pointer-events-none opacity-45 mix-blend-screen scale-105"
-        style={{ backgroundImage: "url('/stage_backdrop.jpg')" }}
-      />
-
-      {/* Warm lateral stage festival bulbs */}
-      <div className="absolute top-0 left-0 bottom-0 w-48 bg-gradient-to-r from-amber-600/20 via-rose-950/20 to-transparent pointer-events-none" />
-      <div className="absolute top-0 right-0 bottom-0 w-48 bg-gradient-to-l from-amber-600/20 via-rose-950/20 to-transparent pointer-events-none" />
-
-      {/* Top stage curtain and lighting rail */}
-      <div className="absolute top-0 left-0 right-0 h-16 bg-gradient-to-b from-black via-black/80 to-transparent z-10 pointer-events-none" />
-
-      {/* ============================================================ */}
-      {/* LAYER 2: GIANT LED STAGE SCREEN PLAYING 15 VIDEO FX LOOPS    */}
-      {/* ============================================================ */}
-      <div className="absolute top-[8%] left-[10%] right-[10%] bottom-[24%] rounded-3xl overflow-hidden border-4 border-amber-900/40 shadow-[0_0_80px_rgba(245,158,11,0.25)] bg-slate-950">
+      <div className="absolute top-[2.8%] left-[12.2%] right-[12.5%] bottom-[26.2%] overflow-hidden bg-black z-0">
         <StageVisualFxCanvas
           bpm={currentBpm}
           energy={currentEnergy}
@@ -165,41 +196,44 @@ export const StageDisplayScreen: React.FC = () => {
           onFxChange={(idx) => setCurrentFxIndex(idx)}
         />
 
-        {/* Central Golden Stage Typography: "धुन डीजे" / "DHUN - PARTY REQUEST PLAYLIST" */}
-        <div className="absolute inset-0 flex flex-col items-center justify-start pt-6 md:pt-10 pointer-events-none z-10">
-          <h1 className="text-5xl md:text-8xl font-black text-amber-300 tracking-wider drop-shadow-[0_6px_20px_rgba(0,0,0,0.95)]">
+        {/* Central Golden Devanagari Title & Waveform in LED Screen */}
+        <div className="absolute inset-0 flex flex-col items-center justify-start pt-2 md:pt-4 pointer-events-none z-10">
+          <h1 className="text-6xl md:text-8xl font-black text-amber-400 tracking-wider drop-shadow-[0_4px_18px_rgba(0,0,0,0.95)]">
             धुन डीजे
           </h1>
-          <p className="text-xs md:text-sm font-bold tracking-[0.3em] uppercase text-white/90 drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)] mt-1">
+          <p className="text-xs md:text-sm font-bold tracking-[0.35em] uppercase text-white/95 drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)] mt-1">
             DHUN — PARTY REQUEST PLAYLIST
           </p>
 
           {/* Soundwave Bars Visualizer Graphic below text */}
-          <div className="flex items-center space-x-1.5 mt-2 opacity-80">
-            {[4, 12, 24, 16, 32, 20, 36, 18, 28, 14, 30, 22, 10, 26, 8].map((h, i) => (
+          <div className="flex items-center space-x-1.5 mt-2 opacity-90">
+            {[6, 14, 28, 18, 36, 22, 42, 20, 32, 16, 34, 24, 12, 30, 8].map((h, i) => (
               <div
                 key={i}
                 className="w-1 bg-amber-400 rounded-full animate-pulse"
                 style={{
                   height: `${h * (isPlaying ? 1 : 0.25)}px`,
-                  animationDuration: `${0.4 + (i % 5) * 0.15}s`,
+                  animationDuration: `${0.35 + (i % 5) * 0.12}s`,
                 }}
               />
             ))}
           </div>
         </div>
-
-        {/* Subtle FX Preset Indicator on stage screen corner */}
-        <div className="absolute top-3 right-4 z-20 flex items-center space-x-2 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/10 text-[10px] text-amber-300 font-semibold">
-          <Flame className="w-3 h-3 text-rose-500 animate-pulse" />
-          <span>FX {currentFxIndex + 1}/15: {FX_NAMES[currentFxIndex]}</span>
-        </div>
       </div>
 
       {/* ============================================================ */}
-      {/* LAYER 3: ANIMATED DJ CHARACTER IN THE CENTER                 */}
+      {/* LAYER 2: STAGE WINDOW FRAME (LATERAL BULBS & CROWD OUTLINE)   */}
       {/* ============================================================ */}
-      <div className="absolute left-1/2 bottom-[14%] -translate-x-1/2 w-[520px] h-[520px] pointer-events-none z-20">
+      <div
+        className="absolute inset-0 bg-cover bg-center select-none pointer-events-none z-10"
+        style={{ backgroundImage: "url('./stage_window_frame.png')" }}
+      />
+
+      {/* ============================================================ */}
+      {/* LAYER 3: ANIMATED RESIDENT DJ CHARACTER                      */}
+      {/* Grooves, head-bobs, pumps arm, and bounces to mood & BPM     */}
+      {/* ============================================================ */}
+      <div className="absolute left-1/2 bottom-[17.5%] -translate-x-1/2 w-[460px] md:w-[540px] h-[480px] md:h-[560px] pointer-events-none z-20">
         <AnimatedDjCharacter
           bpm={currentBpm}
           energy={currentEnergy}
@@ -209,69 +243,34 @@ export const StageDisplayScreen: React.FC = () => {
       </div>
 
       {/* ============================================================ */}
-      {/* LAYER 4: FRONT DJ CONSOLE DESK & MARIGOLD FLOWER GARLANDS    */}
+      {/* LAYER 4: FOREGROUND DJ CONSOLE DESK & MARIGOLD GARLANDS      */}
       {/* ============================================================ */}
-      <div className="absolute bottom-0 left-0 right-0 h-[22%] z-30 pointer-events-none bg-gradient-to-t from-black via-zinc-950/95 to-transparent flex flex-col justify-end">
-        {/* DJ Mixer Hardware Turntables & Platter Silhouettes */}
-        <div className="w-full max-w-5xl mx-auto flex items-center justify-between px-12 mb-3 opacity-90">
-          {/* Deck A Platter */}
-          <div className="relative w-28 h-28 rounded-full border-4 border-slate-700 bg-zinc-900/90 shadow-2xl flex items-center justify-center">
-            <div className={`w-20 h-20 rounded-full border-2 border-slate-600 bg-black flex items-center justify-center ${isPlaying ? 'animate-[spin_4s_linear_infinite]' : ''}`}>
-              <div className="w-8 h-8 rounded-full bg-rose-600 border border-white/40 flex items-center justify-center">
-                <Disc3 className="w-4 h-4 text-white" />
-              </div>
-            </div>
-          </div>
-
-          {/* Center Mixer Strips & Crossfader */}
-          <div className="h-16 w-64 bg-zinc-900/80 rounded-xl border border-slate-800 p-2 flex items-center justify-around">
-            <div className="w-1.5 h-10 bg-slate-700 rounded-full flex flex-col justify-end p-0.5">
-              <div className="w-full bg-emerald-400 rounded-full" style={{ height: isPlaying ? '70%' : '10%' }} />
-            </div>
-            <div className="w-24 h-3 bg-black rounded-full p-0.5 border border-slate-700 flex items-center">
-              <div className="w-5 h-5 rounded bg-amber-500 shadow-md transform translate-x-3" />
-            </div>
-            <div className="w-1.5 h-10 bg-slate-700 rounded-full flex flex-col justify-end p-0.5">
-              <div className="w-full bg-rose-400 rounded-full" style={{ height: isPlaying ? '60%' : '10%' }} />
-            </div>
-          </div>
-
-          {/* Deck B Platter */}
-          <div className="relative w-28 h-28 rounded-full border-4 border-slate-700 bg-zinc-900/90 shadow-2xl flex items-center justify-center">
-            <div className={`w-20 h-20 rounded-full border-2 border-slate-600 bg-black flex items-center justify-center ${isPlaying ? 'animate-[spin_4s_linear_infinite]' : ''}`}>
-              <div className="w-8 h-8 rounded-full bg-amber-500 border border-white/40 flex items-center justify-center">
-                <Disc3 className="w-4 h-4 text-white" />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Marigold Flower Garlands (Genda Phool Decor) across desk */}
-        <div className="w-full h-8 flex items-center justify-around overflow-hidden px-4 opacity-95">
-          {Array.from({ length: 42 }).map((_, idx) => (
-            <div
-              key={idx}
-              className={`w-6 h-6 rounded-full shadow-lg transform ${
-                idx % 2 === 0 ? 'bg-amber-500 -translate-y-1' : 'bg-orange-600 translate-y-1'
-              } border border-amber-300/40`}
-            />
-          ))}
-        </div>
-      </div>
+      <div
+        className="absolute bottom-0 left-0 right-0 h-[26.2%] bg-cover bg-top pointer-events-none z-30"
+        style={{ backgroundImage: "url('./dj_desk_foreground.png')" }}
+      />
 
       {/* ============================================================ */}
-      {/* LAYER 5: THREE FLOATING FROSTED GLASS UI PANELS              */}
+      {/* LAYER 5: THREE FLOATING FROSTED GLASS UI CARDS               */}
+      {/* Pixel-matched to the user's reference artwork                */}
       {/* ============================================================ */}
 
       {/* 5A. TOP-LEFT: SESSION STATUS, DJ TYPE, MOOD DROPDOWNS */}
-      <div className="absolute top-6 left-6 z-40 flex flex-col space-y-2.5 pointer-events-auto">
-        {/* Local Session Status */}
-        <div className="inline-flex items-center space-x-2.5 bg-black/70 backdrop-blur-xl border border-white/15 px-3.5 py-1.5 rounded-xl shadow-2xl">
-          <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
-          <span className="text-xs font-bold text-slate-200">Local Session Status</span>
-          <span className="text-[11px] font-semibold text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded-md border border-emerald-800">
-            Connected
-          </span>
+      <div className="absolute top-5 left-5 z-40 flex flex-col space-y-2 pointer-events-auto">
+        {/* Local Session Status Pill */}
+        <div
+          onClick={() => setShowHostDrawer(true)}
+          title="Click to open Host DJ Console & Music Library (or press 'M')"
+          className="inline-flex flex-col bg-zinc-950/75 backdrop-blur-xl border border-white/10 px-3.5 py-2 rounded-xl shadow-2xl cursor-pointer hover:border-amber-400/40 transition-all group"
+        >
+          <div className="flex items-center space-x-2">
+            <span className="text-[11px] font-bold text-slate-300">Local Session Status</span>
+            <Settings className="w-3 h-3 text-slate-400 group-hover:text-amber-400 transition-colors" />
+          </div>
+          <div className="flex items-center space-x-1.5 mt-0.5">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+            <span className="text-[11px] font-semibold text-emerald-400">Connected</span>
+          </div>
         </div>
 
         {/* DJ TYPE Dropdown */}
@@ -279,7 +278,7 @@ export const StageDisplayScreen: React.FC = () => {
           <select
             value={selectedDjType}
             onChange={(e) => setSelectedDjType(e.target.value)}
-            className="w-56 appearance-none bg-black/75 backdrop-blur-xl border border-white/15 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2.5 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
+            className="w-52 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
             {djTypes.map((t) => (
               <option key={t.id} value={t.id} className="bg-zinc-950 text-white">
@@ -292,7 +291,7 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* MOOD Dropdown */}
+        {/* MOOD Dropdown (All 14 Moods) */}
         <div className="relative">
           <select
             value={selectedMood}
@@ -300,7 +299,7 @@ export const StageDisplayScreen: React.FC = () => {
               setSelectedMood(e.target.value);
               startParty(partyStatus.party_name || 'DHUN Party', 2, e.target.value);
             }}
-            className="w-56 appearance-none bg-black/75 backdrop-blur-xl border border-white/15 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2.5 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
+            className="w-52 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
             {moodsList.map((m) => (
               <option key={m.id} value={m.id} className="bg-zinc-950 text-white">
@@ -313,69 +312,41 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* Unmute sound banner trigger if not active */}
+        {/* Floating unmute notification if user has not yet interacted */}
         {!audioActive && (
           <button
             onClick={async () => {
               await startBrowserAudio();
               setAudioActive(true);
             }}
-            className="flex items-center space-x-2 bg-gradient-to-r from-rose-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white text-xs font-extrabold px-3.5 py-2 rounded-xl shadow-lg shadow-rose-950/60 animate-bounce"
+            className="flex items-center space-x-2 bg-gradient-to-r from-rose-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white text-xs font-black px-3.5 py-1.5 rounded-xl shadow-lg shadow-rose-950/60 animate-bounce"
           >
             <Volume2 className="w-3.5 h-3.5" />
-            <span>🔊 Unmute Live Audio</span>
+            <span>🔊 Click to Unmute Live DJ Audio</span>
           </button>
         )}
       </div>
 
-      {/* 5B. TOP-RIGHT: FULLSCREEN & EMERGENCY CONTROLS */}
-      <div className="absolute top-6 right-6 z-40 flex items-center space-x-3 pointer-events-auto">
-        <label className="flex items-center space-x-1.5 px-3 py-1.5 bg-black/70 backdrop-blur-xl hover:bg-black/90 border border-white/15 rounded-xl text-xs font-bold text-amber-300 cursor-pointer transition-all">
-          <Music className="w-3.5 h-3.5" />
-          <span>Load Song (.mp3)</span>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="audio/*"
-            onChange={handleFileUpload}
-            className="hidden"
-          />
-        </label>
-
-        <button
-          onClick={emergencyFade}
-          title="Instant 300ms emergency master audio fade"
-          className="flex items-center space-x-1.5 px-3 py-1.5 bg-red-950/80 hover:bg-red-900 border border-red-700/80 rounded-xl text-xs font-bold text-red-200 transition-all shadow-lg"
-        >
-          <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
-          <span>Emergency Fade</span>
-        </button>
-
-        <button
-          onClick={toggleFullscreen}
-          className="p-2 bg-black/70 backdrop-blur-xl hover:bg-black/90 border border-white/15 rounded-xl text-slate-300 hover:text-white transition-all shadow-lg"
-          title="Toggle Fullscreen Mode"
-        >
-          {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-        </button>
-      </div>
-
-      {/* 5C. BOTTOM-LEFT: NOW PLAYING FROSTED GLASS PLAYER CARD */}
-      <div className="absolute bottom-6 left-6 z-40 w-80 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.85)] pointer-events-auto">
-        <div className="flex items-center justify-between text-xs text-slate-400 mb-2.5 font-bold">
+      {/* 5B. BOTTOM-LEFT: NOW PLAYING FROSTED GLASS CARD */}
+      <div className="absolute bottom-6 left-6 z-40 w-72 md:w-80 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.9)] pointer-events-auto">
+        <div className="flex items-center justify-between text-xs text-slate-400 mb-2 font-bold">
           <span className="text-white flex items-center space-x-1.5">
             <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
             <span>Now Playing</span>
           </span>
-          <span className="text-[10px] text-amber-400 uppercase font-mono px-1.5 py-0.5 rounded bg-amber-950/60 border border-amber-800/60">
-            {currentBpm} BPM
-          </span>
+          <button
+            onClick={() => setShowHostDrawer(true)}
+            className="text-slate-400 hover:text-white p-0.5 rounded transition-colors"
+            title="Open Console Drawer"
+          >
+            <Sliders className="w-3.5 h-3.5" />
+          </button>
         </div>
 
         {/* Track Artwork & Metadata */}
-        <div className="flex items-center space-x-3 mb-3">
-          <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-rose-600 via-amber-600 to-indigo-700 flex items-center justify-center shadow-lg relative overflow-hidden">
-            <Disc3 className={`w-7 h-7 text-white ${isPlaying ? 'animate-[spin_4s_linear_infinite]' : ''}`} />
+        <div className="flex items-center space-x-3 mb-2.5">
+          <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-red-600 via-orange-600 to-amber-500 flex items-center justify-center shadow-lg relative overflow-hidden">
+            <Disc3 className={`w-6 h-6 text-white ${isPlaying ? 'animate-[spin_4s_linear_infinite]' : ''}`} />
           </div>
           <div className="flex-1 min-w-0">
             <h4 className="text-sm font-extrabold text-white truncate drop-shadow">{currentTitle}</h4>
@@ -383,10 +354,10 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* Progress Bar & Seek */}
-        <div className="space-y-1 mb-3">
+        {/* Progress Bar with Cyan/Teal fill & Seek Knob */}
+        <div className="space-y-1 mb-2.5">
           <div
-            className="w-full h-1.5 bg-white/20 rounded-full overflow-hidden cursor-pointer relative"
+            className="w-full h-1.5 bg-white/20 rounded-full overflow-visible cursor-pointer relative"
             onClick={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
               const pct = (e.clientX - rect.left) / rect.width;
@@ -394,9 +365,11 @@ export const StageDisplayScreen: React.FC = () => {
             }}
           >
             <div
-              className="h-full bg-gradient-to-r from-emerald-400 to-amber-400 rounded-full transition-all duration-300"
+              className="h-full bg-teal-400 rounded-full transition-all duration-300 relative"
               style={{ width: `${progressPercent}%` }}
-            />
+            >
+              <div className="absolute right-0 top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full bg-teal-200 shadow-md shadow-teal-400" />
+            </div>
           </div>
           <div className="flex justify-between text-[10px] font-mono text-slate-400">
             <span>{formatTime(currentTimeSec)}</span>
@@ -405,10 +378,10 @@ export const StageDisplayScreen: React.FC = () => {
         </div>
 
         {/* Transport Controls */}
-        <div className="flex items-center justify-between pt-1">
+        <div className="flex items-center justify-between pt-0.5">
           <button
             onClick={() => setCurrentTimeSec(0)}
-            className="p-2 text-slate-300 hover:text-white transition-colors"
+            className="p-1.5 text-slate-300 hover:text-white transition-colors"
             title="Restart Track"
           >
             <SkipBack className="w-4 h-4" />
@@ -416,23 +389,23 @@ export const StageDisplayScreen: React.FC = () => {
 
           <button
             onClick={handleTogglePlay}
-            className="w-10 h-10 rounded-full bg-emerald-500 hover:bg-emerald-400 text-black flex items-center justify-center shadow-lg shadow-emerald-500/40 active:scale-95 transition-all"
+            className="w-9 h-9 rounded-full bg-teal-400 hover:bg-teal-300 text-black flex items-center justify-center shadow-lg shadow-teal-400/40 active:scale-95 transition-all"
             title={isPlaying ? 'Pause Playback' : 'Play Audio'}
           >
-            {isPlaying ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current ml-0.5" />}
+            {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
           </button>
 
           <button
             onClick={handleNextTrack}
-            className="p-2 text-slate-300 hover:text-white transition-colors"
-            title="Next Track (Harmonic Mix In)"
+            className="p-1.5 text-slate-300 hover:text-white transition-colors"
+            title="Next Track (Harmonic Mix)"
           >
             <SkipForward className="w-4 h-4" />
           </button>
 
-          {/* Master Volume */}
+          {/* Volume Control */}
           <div className="flex items-center space-x-1.5 pl-2 border-l border-white/10">
-            <Volume2 className="w-3.5 h-3.5 text-slate-400" />
+            <Volume2 className="w-3 h-3 text-slate-400" />
             <input
               type="range"
               min="0"
@@ -440,37 +413,35 @@ export const StageDisplayScreen: React.FC = () => {
               step="0.05"
               value={masterVolume}
               onChange={(e) => setMasterVolume(parseFloat(e.target.value))}
-              className="w-14 accent-emerald-400 h-1 bg-white/20 rounded cursor-pointer"
+              className="w-12 accent-teal-400 h-1 bg-white/20 rounded cursor-pointer"
             />
           </div>
         </div>
       </div>
 
-      {/* 5D. BOTTOM-RIGHT: SCAN TO REQUEST FROSTED GLASS QR CARD */}
-      <div className="absolute bottom-6 right-6 z-40 w-72 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.85)] pointer-events-auto flex flex-col items-center text-center">
-        <h4 className="text-xs font-black tracking-wider text-slate-200 uppercase mb-3 flex items-center space-x-1.5">
-          <QrCode className="w-3.5 h-3.5 text-amber-400" />
-          <span>Scan to Request</span>
+      {/* 5C. BOTTOM-RIGHT: SCAN TO REQUEST FROSTED GLASS QR CARD */}
+      <div className="absolute bottom-6 right-6 z-40 w-64 md:w-72 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.9)] pointer-events-auto flex flex-col items-center text-center">
+        <h4 className="text-xs font-bold tracking-wider text-slate-200 uppercase mb-2.5">
+          Scan to Request
         </h4>
 
-        {/* QR Code Graphic Box */}
-        <div className="w-36 h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-3">
+        {/* Clean, High-Contrast QR Code Box */}
+        <div className="w-32 h-32 md:w-36 md:h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-2.5">
           <svg viewBox="0 0 100 100" className="w-full h-full">
-            {/* Standard high-contrast QR Matrix representation */}
             <rect x="0" y="0" width="100" height="100" fill="#ffffff" />
+            {/* Finder pattern Top-Left */}
             <rect x="8" y="8" width="28" height="28" fill="#000000" />
-            <rect x="12" y="12" width="20" height="20" fill="#ffffff" />
-            <rect x="16" y="16" width="12" height="12" fill="#000000" />
-
+            <rect x="13" y="13" width="18" height="18" fill="#ffffff" />
+            <rect x="17" y="17" width="10" height="10" fill="#000000" />
+            {/* Finder pattern Top-Right */}
             <rect x="64" y="8" width="28" height="28" fill="#000000" />
-            <rect x="68" y="12" width="20" height="20" fill="#ffffff" />
-            <rect x="72" y="16" width="12" height="12" fill="#000000" />
-
+            <rect x="69" y="13" width="18" height="18" fill="#ffffff" />
+            <rect x="73" y="17" width="10" height="10" fill="#000000" />
+            {/* Finder pattern Bottom-Left */}
             <rect x="8" y="64" width="28" height="28" fill="#000000" />
-            <rect x="12" y="68" width="20" height="20" fill="#ffffff" />
-            <rect x="16" y="72" width="12" height="12" fill="#000000" />
-
-            {/* Pattern data pixels */}
+            <rect x="13" y="69" width="18" height="18" fill="#ffffff" />
+            <rect x="17" y="73" width="10" height="10" fill="#000000" />
+            {/* Data pixels */}
             <rect x="42" y="10" width="6" height="6" fill="#000000" />
             <rect x="52" y="14" width="6" height="6" fill="#000000" />
             <rect x="42" y="24" width="6" height="6" fill="#000000" />
@@ -502,10 +473,299 @@ export const StageDisplayScreen: React.FC = () => {
           स्कैन कर गाना मांगें
         </p>
         <p className="text-[10px] font-mono text-slate-400 mt-1">
-          LAN: 192.168.1.15/request
+          LAN: {lanHost}/request
         </p>
       </div>
+
+      {/* ============================================================ */}
+      {/* DISCREET HOST SLIDE-OVER DRAWER (HOTKEY 'M' OR CLICK STATUS) */}
+      {/* Hidden by default so Stage Display is completely immersive  */}
+      {/* ============================================================ */}
+      {showHostDrawer && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-md flex justify-end transition-all">
+          <div className="w-full max-w-xl h-full bg-zinc-950 border-l border-white/15 p-6 flex flex-col shadow-2xl overflow-y-auto">
+            {/* Drawer Header */}
+            <div className="flex items-center justify-between pb-4 border-b border-white/10">
+              <div className="flex items-center space-x-2.5">
+                <Sliders className="w-5 h-5 text-amber-400" />
+                <h3 className="text-lg font-black text-white">DHUN Host DJ Console</h3>
+              </div>
+              <button
+                onClick={() => setShowHostDrawer(false)}
+                className="p-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-slate-300 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Tab Navigation */}
+            <div className="flex space-x-2 my-4">
+              <button
+                onClick={() => setActiveDrawerTab('library')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
+                  activeDrawerTab === 'library'
+                    ? 'bg-amber-500/20 border-amber-400 text-amber-300'
+                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                }`}
+              >
+                Music Library
+              </button>
+              <button
+                onClick={() => setActiveDrawerTab('mixer')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
+                  activeDrawerTab === 'mixer'
+                    ? 'bg-amber-500/20 border-amber-400 text-amber-300'
+                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                }`}
+              >
+                4-Deck Mixer
+              </button>
+              <button
+                onClick={() => setActiveDrawerTab('requests')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
+                  activeDrawerTab === 'requests'
+                    ? 'bg-amber-500/20 border-amber-400 text-amber-300'
+                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                }`}
+              >
+                Guest Requests ({guestRequests.length})
+              </button>
+              <button
+                onClick={() => setActiveDrawerTab('fx')}
+                className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
+                  activeDrawerTab === 'fx'
+                    ? 'bg-amber-500/20 border-amber-400 text-amber-300'
+                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                }`}
+              >
+                15 Video FX
+              </button>
+            </div>
+
+            {/* Tab Content */}
+            <div className="flex-1 overflow-y-auto">
+              {activeDrawerTab === 'library' && (
+                <div className="space-y-4">
+                  <div className="bg-zinc-900/80 p-4 rounded-xl border border-white/10">
+                    <h4 className="text-xs font-bold text-amber-300 uppercase mb-2">Local Music Folder Scanner</h4>
+                    <div className="flex space-x-2">
+                      <input
+                        type="text"
+                        value={folderPathInput}
+                        onChange={(e) => setFolderPathInput(e.target.value)}
+                        placeholder="C:/Music or folder path..."
+                        className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono"
+                      />
+                      <button
+                        onClick={() => {
+                          setIsScanning(true);
+                          setTimeout(() => setIsScanning(false), 800);
+                        }}
+                        className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs rounded-lg flex items-center space-x-1"
+                      >
+                        <FolderOpen className="w-3.5 h-3.5" />
+                        <span>{isScanning ? 'Scanning...' : 'Scan Folder'}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Manual Single MP3 Import */}
+                  <label className="flex items-center justify-center space-x-2 p-3 bg-zinc-900/60 hover:bg-zinc-900 border border-dashed border-white/20 rounded-xl cursor-pointer text-xs font-bold text-slate-300">
+                    <Music className="w-4 h-4 text-amber-400" />
+                    <span>Import Local MP3 File Directly</span>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="audio/*"
+                      onChange={handleFileUpload}
+                      className="hidden"
+                    />
+                  </label>
+
+                  {/* Preloaded Celebration Library */}
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-400 uppercase mb-2">Available Celebration Tracks</h4>
+                    <div className="space-y-1.5">
+                      {[
+                        { title: 'Chaiyya Chaiyya', artist: 'Sukhwinder Singh', bpm: 128, key: 'D Major', energy: '88%' },
+                        { title: 'Gallan Goodiyaan', artist: 'Diljit Dosanjh', bpm: 128, key: 'G Major', energy: '92%' },
+                        { title: 'Sauda Khara Khara', artist: 'Diljit Dosanjh, Sukhbir', bpm: 130, key: 'F Minor', energy: '95%' },
+                        { title: 'Kala Chashma', artist: 'Amar Arshi, Badshah', bpm: 126, key: 'C# Minor', energy: '96%' },
+                        { title: 'Chogada (Garba Dhol)', artist: 'Darshan Raval', bpm: 124, key: 'A Major', energy: '94%' },
+                        { title: 'Mundian To Bach Ke', artist: 'Panjabi MC', bpm: 100, key: 'Ab Minor', energy: '93%' },
+                        { title: 'Aankh Marey', artist: 'Mika Singh, Neha Kakkar', bpm: 124, key: 'F Major', energy: '91%' },
+                      ].map((t, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-center justify-between p-2.5 bg-zinc-900/60 hover:bg-zinc-900 rounded-lg border border-white/5"
+                        >
+                          <div>
+                            <p className="text-xs font-bold text-white">{t.title}</p>
+                            <p className="text-[11px] text-slate-400">{t.artist}</p>
+                          </div>
+                          <div className="flex items-center space-x-3 text-[11px] font-mono text-amber-400">
+                            <span>{t.bpm} BPM</span>
+                            <span>{t.key}</span>
+                            <button
+                              onClick={() => {
+                                handleTogglePlay();
+                              }}
+                              className="px-2 py-1 bg-amber-500/20 hover:bg-amber-500/40 border border-amber-400/40 rounded text-amber-300 font-bold"
+                            >
+                              Load Deck
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeDrawerTab === 'mixer' && (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    {/* Deck A Strip */}
+                    <div className="bg-zinc-900/80 p-3 rounded-xl border border-rose-500/30">
+                      <h4 className="text-xs font-bold text-rose-400 uppercase mb-2">Deck A (Active)</h4>
+                      <div className="space-y-2 text-xs">
+                        <div>
+                          <label className="text-[10px] text-slate-400">Low (Kill -36dB)</label>
+                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-rose-400" />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-slate-400">Mid (Sweep)</label>
+                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-rose-400" />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-slate-400">High (Air)</label>
+                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-rose-400" />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Deck B Strip */}
+                    <div className="bg-zinc-900/80 p-3 rounded-xl border border-teal-500/30">
+                      <h4 className="text-xs font-bold text-teal-400 uppercase mb-2">Deck B (Preloaded)</h4>
+                      <div className="space-y-2 text-xs">
+                        <div>
+                          <label className="text-[10px] text-slate-400">Low (Kill -36dB)</label>
+                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-teal-400" />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-slate-400">Mid (Sweep)</label>
+                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-teal-400" />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-slate-400">High (Air)</label>
+                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-teal-400" />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-zinc-900/80 p-3 rounded-xl border border-white/10">
+                    <label className="text-xs font-bold text-amber-300 uppercase block mb-1">Smart Bass Swap Crossfader</label>
+                    <input type="range" min="-1" max="1" step="0.05" defaultValue="-0.9" className="w-full accent-amber-400" />
+                    <div className="flex justify-between text-[10px] text-slate-400 mt-1">
+                      <span>Deck A</span>
+                      <span>Center</span>
+                      <span>Deck B</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeDrawerTab === 'requests' && (
+                <div className="space-y-3">
+                  <h4 className="text-xs font-bold text-amber-300 uppercase">Live Guest Song Requests</h4>
+                  {guestRequests.length === 0 ? (
+                    <p className="text-xs text-slate-400">No requests yet. Guests can scan the QR code to submit songs!</p>
+                  ) : (
+                    guestRequests.map((req) => (
+                      <div key={req.id} className="p-3 bg-zinc-900 rounded-xl border border-white/10 flex items-center justify-between">
+                        <div>
+                          <p className="text-xs font-bold text-white">{req.track_title}</p>
+                          <p className="text-[11px] text-slate-400">{req.track_artist} • requested by <span className="text-amber-300">{req.guest_name}</span></p>
+                        </div>
+                        <div className="flex space-x-1.5">
+                          <button
+                            onClick={() => approveRequest(req.id)}
+                            className="p-1.5 bg-emerald-600/30 hover:bg-emerald-600 border border-emerald-500 rounded text-emerald-300"
+                            title="Approve (+1.5 score boost)"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => rejectRequest(req.id)}
+                            className="p-1.5 bg-rose-600/30 hover:bg-rose-600 border border-rose-500 rounded text-rose-300"
+                            title="Reject"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              {activeDrawerTab === 'fx' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between pb-2 border-b border-white/10">
+                    <h4 className="text-xs font-bold text-amber-300 uppercase">15 Pre-Saved Video FX Loops</h4>
+                    <label className="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={autoCycleFx}
+                        onChange={(e) => setAutoCycleFx(e.target.checked)}
+                        className="accent-amber-400"
+                      />
+                      <span>Auto-Cycle (25s)</span>
+                    </label>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {FX_NAMES.map((name, idx) => (
+                      <button
+                        key={idx}
+                        onClick={() => {
+                          setCurrentFxIndex(idx);
+                          setAutoCycleFx(false);
+                        }}
+                        className={`p-2.5 rounded-lg border text-left text-xs font-bold transition-all flex items-center justify-between ${
+                          currentFxIndex === idx
+                            ? 'bg-amber-500/20 border-amber-400 text-amber-300 shadow-md'
+                            : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        <span className="truncate">FX {idx + 1}: {name}</span>
+                        {currentFxIndex === idx && <Sparkles className="w-3 h-3 text-amber-400 flex-shrink-0 ml-1" />}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Drawer Footer Emergency Controls */}
+            <div className="pt-4 mt-auto border-t border-white/10 flex items-center justify-between">
+              <button
+                onClick={emergencyFade}
+                className="px-4 py-2 bg-red-950 hover:bg-red-900 border border-red-700 rounded-xl text-xs font-bold text-red-200 flex items-center space-x-1.5"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
+                <span>Emergency 300ms Fade</span>
+              </button>
+              <button
+                onClick={toggleFullscreen}
+                className="p-2 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-xl text-slate-300"
+              >
+                {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
-
