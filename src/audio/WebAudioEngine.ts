@@ -4,6 +4,8 @@
 class BrowserAudioEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
+  private analyser: AnalyserNode | null = null;
+  private currentKeyName: string = 'D Major';
   
   // Deck A nodes
   private deckAGain: GainNode | null = null;
@@ -41,10 +43,16 @@ class BrowserAudioEngine {
     
     this.ctx = new AudioCtx();
 
-    // Master bus
+    // Master bus & Analyser
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.setValueAtTime(0.8, this.ctx.currentTime);
-    this.masterGain.connect(this.ctx.destination);
+
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 256;
+    this.analyser.smoothingTimeConstant = 0.8;
+
+    this.masterGain.connect(this.analyser);
+    this.analyser.connect(this.ctx.destination);
 
     // Deck A Chain
     this.deckAGain = this.ctx.createGain();
@@ -115,6 +123,7 @@ class BrowserAudioEngine {
   public startPlayback(bpm = 128, keyName = 'D Major') {
     this.ensureRunning();
     this.currentBpm = bpm;
+    this.currentKeyName = keyName;
     this.currentRootFreq = this.parseKeyFrequency(keyName);
     this.isPlaying = true;
 
@@ -123,6 +132,15 @@ class BrowserAudioEngine {
       this.stepIndex = 0;
       this.scheduler();
     }
+  }
+
+  public getWaveformData(outputArray?: Uint8Array): Uint8Array {
+    if (!this.analyser) {
+      return outputArray || new Uint8Array(128).fill(128);
+    }
+    const arr = outputArray || new Uint8Array(this.analyser.frequencyBinCount);
+    this.analyser.getByteTimeDomainData(arr as any);
+    return arr;
   }
 
   public stopPlayback() {
@@ -343,21 +361,32 @@ class BrowserAudioEngine {
 
   private triggerSnareDhol(time: number, volume: number, target: GainNode) {
     if (!this.ctx) return;
-    const osc = this.ctx.createOscillator();
-    const gain = this.ctx.createGain();
+    
+    // Skin 1: Resonant high rim-slap (tilli/dayan snap)
+    const highOsc = this.ctx.createOscillator();
+    const highGain = this.ctx.createGain();
+    highOsc.type = 'triangle';
+    highOsc.frequency.setValueAtTime(460, time);
+    highOsc.frequency.exponentialRampToValueAtTime(180, time + 0.08);
+    highGain.gain.setValueAtTime(0.55 * volume, time);
+    highGain.gain.exponentialRampToValueAtTime(0.001, time + 0.10);
+    highOsc.connect(highGain);
+    highGain.connect(target);
+    highOsc.start(time);
+    highOsc.stop(time + 0.11);
 
-    osc.type = 'triangle';
-    osc.frequency.setValueAtTime(220, time);
-    osc.frequency.exponentialRampToValueAtTime(90, time + 0.1);
-
-    gain.gain.setValueAtTime(0.7 * volume, time);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.14);
-
-    osc.connect(gain);
-    gain.connect(target);
-
-    osc.start(time);
-    osc.stop(time + 0.15);
+    // Skin 2: Low dholak bass resonance (dagga boom)
+    const lowOsc = this.ctx.createOscillator();
+    const lowGain = this.ctx.createGain();
+    lowOsc.type = 'sine';
+    lowOsc.frequency.setValueAtTime(140, time);
+    lowOsc.frequency.exponentialRampToValueAtTime(65, time + 0.12);
+    lowGain.gain.setValueAtTime(0.75 * volume, time);
+    lowGain.gain.exponentialRampToValueAtTime(0.001, time + 0.15);
+    lowOsc.connect(lowGain);
+    lowGain.connect(target);
+    lowOsc.start(time);
+    lowOsc.stop(time + 0.16);
   }
 
   private triggerBassNote(time: number, freq: number, target: GainNode) {
@@ -373,7 +402,7 @@ class BrowserAudioEngine {
     filter.frequency.setValueAtTime(750, time);
     filter.frequency.exponentialRampToValueAtTime(180, time + 0.16);
 
-    gain.gain.setValueAtTime(0.5, time);
+    gain.gain.setValueAtTime(0.55, time);
     gain.gain.exponentialRampToValueAtTime(0.001, time + 0.18);
 
     osc.connect(filter);
@@ -386,15 +415,19 @@ class BrowserAudioEngine {
 
   private triggerChordStab(time: number, rootFreq: number, target: GainNode) {
     if (!this.ctx) return;
-    const freqs = [rootFreq, rootFreq * 1.25, rootFreq * 1.5]; // Major Triad
+    const isMinor = this.currentKeyName.toLowerCase().includes('minor') || 
+                    (this.currentKeyName.toLowerCase().includes('m') && !this.currentKeyName.toLowerCase().includes('major'));
+    // Minor Triad: root, minor 3rd (1.189), 5th (1.498); Major Triad: root, major 3rd (1.259), 5th (1.498)
+    const thirdMult = isMinor ? 1.1892 : 1.2599;
+    const freqs = [rootFreq, rootFreq * thirdMult, rootFreq * 1.4983];
     const gain = this.ctx.createGain();
-    gain.gain.setValueAtTime(0.22, time);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.25);
+    gain.gain.setValueAtTime(0.25, time);
+    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.28);
 
     const filter = this.ctx.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.setValueAtTime(2400, time);
-    filter.frequency.exponentialRampToValueAtTime(600, time + 0.25);
+    filter.frequency.setValueAtTime(2600, time);
+    filter.frequency.exponentialRampToValueAtTime(500, time + 0.28);
 
     freqs.forEach((f) => {
       if (!this.ctx) return;
@@ -403,7 +436,7 @@ class BrowserAudioEngine {
       osc.frequency.setValueAtTime(f, time);
       osc.connect(filter);
       osc.start(time);
-      osc.stop(time + 0.28);
+      osc.stop(time + 0.30);
     });
 
     filter.connect(gain);

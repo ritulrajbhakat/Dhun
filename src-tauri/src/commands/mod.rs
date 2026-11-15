@@ -97,6 +97,27 @@ pub async fn start_party(
 
     *scheduler_arc.lock().unwrap() = Some(scheduler);
 
+    // Continuous autonomous background DJ ticker (every 500ms)
+    {
+        let sched_bg = scheduler_arc.clone();
+        let audio_bg = audio.clone();
+        let db_bg = db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let mut guard = sched_bg.lock().unwrap();
+                if let Some(sched) = guard.as_mut() {
+                    if let Err(e) = sched.check_and_auto_transition(&audio_bg, &db_bg) {
+                        tracing::error!("Auto-transition tick error: {}", e);
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+
     Ok(PartyStatusResponse {
         is_active: true,
         session_id: Some(session_id),

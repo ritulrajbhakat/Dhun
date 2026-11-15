@@ -42,17 +42,30 @@ export const StageVisualFxCanvas: React.FC<Props> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    const resizeCanvas = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const rect = canvas.getBoundingClientRect();
+      const w = Math.round(rect.width * dpr);
+      const h = Math.round(rect.height * dpr);
+      if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+    };
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+
     let time = 0;
     const particles: { x: number; y: number; vx: number; vy: number; size: number; color: string; alpha: number }[] = [];
-    for (let i = 0; i < 70; i++) {
+    for (let i = 0; i < 90; i++) {
       particles.push({
-        x: Math.random() * 800,
-        y: Math.random() * 500,
-        vx: (Math.random() - 0.5) * 2,
-        vy: (Math.random() - 0.5) * 2,
-        size: 2 + Math.random() * 5,
-        color: ['#f43f5e', '#fbbf24', '#38bdf8', '#a855f7', '#ec4899', '#f97316'][Math.floor(Math.random() * 6)],
-        alpha: 0.3 + Math.random() * 0.7,
+        x: Math.random() * 1200,
+        y: Math.random() * 700,
+        vx: (Math.random() - 0.5) * 2.5,
+        vy: (Math.random() - 0.5) * 2.5,
+        size: 2 + Math.random() * 6,
+        color: ['#f43f5e', '#fbbf24', '#38bdf8', '#a855f7', '#ec4899', '#f97316', '#10b981'][Math.floor(Math.random() * 7)],
+        alpha: 0.35 + Math.random() * 0.65,
       });
     }
 
@@ -66,7 +79,8 @@ export const StageVisualFxCanvas: React.FC<Props> = ({
 
       const beatPulse = isPlaying ? (Math.sin(time * (bpm / 60) * Math.PI) * 0.5 + 0.5) : 0.2;
 
-      ctx.fillStyle = '#05040a';
+      // Real LED concert wall persistence / glowing motion trails
+      ctx.fillStyle = isPlaying ? 'rgba(5, 4, 10, 0.25)' : '#05040a';
       ctx.fillRect(0, 0, w, h);
 
       const cx = w / 2;
@@ -339,6 +353,7 @@ export const StageVisualFxCanvas: React.FC<Props> = ({
     render();
 
     return () => {
+      window.removeEventListener('resize', resizeCanvas);
       if (animFrameRef.current) {
         cancelAnimationFrame(animFrameRef.current);
       }
@@ -353,8 +368,6 @@ export const StageVisualFxCanvas: React.FC<Props> = ({
     >
       <canvas
         ref={canvasRef}
-        width={960}
-        height={540}
         className="w-full h-full object-cover"
       />
     </div>

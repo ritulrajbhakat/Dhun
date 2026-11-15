@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useDhunStore } from '../../store/useDhunStore';
 import { StageVisualFxCanvas, FX_NAMES } from './StageVisualFxCanvas';
 import { AnimatedDjCharacter } from './AnimatedDjCharacter';
+import { webAudioEngine } from '../../audio/WebAudioEngine';
 import {
   Play,
   Pause,
@@ -20,6 +21,86 @@ import {
   Maximize2,
   Minimize2,
 } from 'lucide-react';
+
+const AudioOscilloscopeWaveform: React.FC<{ isPlaying: boolean; bpm: number }> = ({ isPlaying, bpm }) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animId: number;
+    let waveTime = 0;
+    const waveData = new Uint8Array(128);
+
+    const draw = () => {
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      webAudioEngine.getWaveformData(waveData);
+      waveTime += 0.05 * (bpm / 128);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = '#2dd4bf'; // teal-400
+      ctx.shadowColor = '#14b8a6';
+      ctx.shadowBlur = 12;
+
+      const sliceWidth = w / 64;
+      let x = 0;
+
+      for (let i = 0; i < 64; i++) {
+        const v = isPlaying ? waveData[i * 2] / 128.0 : 1.0;
+        const synthWobble = isPlaying ? Math.sin(waveTime * 3 + i * 0.18) * 10 : 0;
+        const y = (v * h) / 2 + synthWobble;
+
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+        x += sliceWidth;
+      }
+
+      ctx.stroke();
+
+      // Mirror reflection glow
+      ctx.beginPath();
+      ctx.lineWidth = 1.0;
+      ctx.strokeStyle = 'rgba(45, 212, 191, 0.45)';
+      ctx.shadowBlur = 6;
+      x = 0;
+      for (let i = 0; i < 64; i++) {
+        const v = isPlaying ? waveData[i * 2] / 128.0 : 1.0;
+        const synthWobble = isPlaying ? Math.sin(waveTime * 3 + i * 0.18) * 5 : 0;
+        const y = h / 2 - (v * h / 2 - h / 2) - synthWobble;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+        x += sliceWidth;
+      }
+      ctx.stroke();
+      ctx.restore();
+
+      animId = requestAnimationFrame(draw);
+    };
+
+    draw();
+    return () => cancelAnimationFrame(animId);
+  }, [isPlaying, bpm]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={720}
+      height={80}
+      className="w-full max-w-2xl h-10 md:h-14 pointer-events-none opacity-90 mt-2 drop-shadow-[0_0_12px_rgba(45,212,191,0.6)]"
+    />
+  );
+};
 
 export const StageDisplayScreen: React.FC = () => {
   const {
@@ -62,52 +143,6 @@ export const StageDisplayScreen: React.FC = () => {
   const currentEnergy = activeAnalysis?.overall_energy || 0.88;
   const currentDurationSec = activeTrack?.duration_ms ? Math.floor(activeTrack.duration_ms / 1000) : 296; // 04:56
 
-  // 1. User interaction listener to immediately start WebAudio on first click/keypress
-  useEffect(() => {
-    const unlockAudio = async () => {
-      await startBrowserAudio();
-      setAudioActive(true);
-    };
-    window.addEventListener('pointerdown', unlockAudio, { once: true });
-    window.addEventListener('keydown', unlockAudio, { once: true });
-    return () => {
-      window.removeEventListener('pointerdown', unlockAudio);
-      window.removeEventListener('keydown', unlockAudio);
-    };
-  }, [startBrowserAudio]);
-
-  // 2. Keyboard shortcut 'M' or 'Escape' to toggle host console drawer
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'm' || e.key === 'M') {
-        setShowHostDrawer((prev) => !prev);
-      }
-      if (e.key === 'Escape') {
-        setShowHostDrawer(false);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
-
-  // 3. Auto-cycle FX loops every 25 seconds if enabled
-  useEffect(() => {
-    if (!autoCycleFx) return;
-    const fxTimer = setInterval(() => {
-      setCurrentFxIndex((idx) => (idx + 1) % 15);
-    }, 25000);
-    return () => clearInterval(fxTimer);
-  }, [autoCycleFx]);
-
-  // 4. Track playback time progress
-  useEffect(() => {
-    if (!isPlaying) return;
-    const progressTimer = setInterval(() => {
-      setCurrentTimeSec((t) => (t >= currentDurationSec ? 0 : t + 1));
-    }, 1000);
-    return () => clearInterval(progressTimer);
-  }, [isPlaying, currentDurationSec]);
-
   const formatTime = (secs: number) => {
     const m = Math.floor(secs / 60);
     const s = Math.floor(secs % 60);
@@ -148,6 +183,62 @@ export const StageDisplayScreen: React.FC = () => {
       setIsFullscreen(false);
     }
   };
+
+  // 1. User interaction listener to immediately start WebAudio on first click/keypress
+  useEffect(() => {
+    const unlockAudio = async () => {
+      await startBrowserAudio();
+      setAudioActive(true);
+    };
+    window.addEventListener('pointerdown', unlockAudio, { once: true });
+    window.addEventListener('keydown', unlockAudio, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+  }, [startBrowserAudio]);
+
+  // 2. Keyboard shortcuts: 'M' for host console, 'Space' for play/pause, 'F' for fullscreen
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (['INPUT', 'SELECT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
+        return;
+      }
+      if (e.key === 'm' || e.key === 'M') {
+        setShowHostDrawer((prev) => !prev);
+      }
+      if (e.key === 'Escape') {
+        setShowHostDrawer(false);
+      }
+      if (e.code === 'Space') {
+        e.preventDefault();
+        handleTogglePlay();
+      }
+      if (e.key === 'f' || e.key === 'F') {
+        toggleFullscreen();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isPlaying, audioActive]);
+
+  // 3. Auto-cycle FX loops every 25 seconds if enabled
+  useEffect(() => {
+    if (!autoCycleFx) return;
+    const fxTimer = setInterval(() => {
+      setCurrentFxIndex((idx) => (idx + 1) % 15);
+    }, 25000);
+    return () => clearInterval(fxTimer);
+  }, [autoCycleFx]);
+
+  // 4. Track playback time progress
+  useEffect(() => {
+    if (!isPlaying) return;
+    const progressTimer = setInterval(() => {
+      setCurrentTimeSec((t) => (t >= currentDurationSec ? 0 : t + 1));
+    }, 1000);
+    return () => clearInterval(progressTimer);
+  }, [isPlaying, currentDurationSec]);
 
   // 4 DJ Levels
   const djTypes = [
@@ -198,27 +289,22 @@ export const StageDisplayScreen: React.FC = () => {
         />
 
         {/* Central Golden Devanagari Title & Waveform in LED Screen */}
-        <div className="absolute inset-0 flex flex-col items-center justify-start pt-2 md:pt-4 pointer-events-none z-10">
-          <h1 className="text-6xl md:text-8xl font-black text-amber-400 tracking-wider drop-shadow-[0_4px_18px_rgba(0,0,0,0.95)]">
+        <div className="absolute inset-0 flex flex-col items-center justify-start pt-2 md:pt-4 pointer-events-none z-10 px-4">
+          <h1
+            className="text-6xl md:text-8xl font-black text-amber-400 tracking-wider"
+            style={{
+              textShadow:
+                '0 2px 0 #000, 0 4px 0 #000, 0 6px 0 #000, 0 8px 16px rgba(0,0,0,0.95), 0 0 35px rgba(245,158,11,0.55)',
+            }}
+          >
             धुन डीजे
           </h1>
           <p className="text-xs md:text-sm font-bold tracking-[0.35em] uppercase text-white/95 drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)] mt-1">
             DHUN — PARTY REQUEST PLAYLIST
           </p>
 
-          {/* Soundwave Bars Visualizer Graphic below text */}
-          <div className="flex items-center space-x-1.5 mt-2 opacity-90">
-            {[6, 14, 28, 18, 36, 22, 42, 20, 32, 16, 34, 24, 12, 30, 8].map((h, i) => (
-              <div
-                key={i}
-                className="w-1 bg-amber-400 rounded-full animate-pulse"
-                style={{
-                  height: `${h * (isPlaying ? 1 : 0.25)}px`,
-                  animationDuration: `${0.35 + (i % 5) * 0.12}s`,
-                }}
-              />
-            ))}
-          </div>
+          {/* Real Audio-Synthesizer Oscilloscope Waveform spanning across LED stage */}
+          <AudioOscilloscopeWaveform isPlaying={isPlaying} bpm={currentBpm} />
         </div>
       </div>
 
@@ -264,10 +350,7 @@ export const StageDisplayScreen: React.FC = () => {
           title="Click to open Host DJ Console & Music Library (or press 'M')"
           className="inline-flex flex-col bg-zinc-950/75 backdrop-blur-xl border border-white/10 px-3.5 py-2 rounded-xl shadow-2xl cursor-pointer hover:border-amber-400/40 transition-all group"
         >
-          <div className="flex items-center space-x-2">
-            <span className="text-[11px] font-bold text-slate-300">Local Session Status</span>
-            <Settings className="w-3 h-3 text-slate-400 group-hover:text-amber-400 transition-colors" />
-          </div>
+          <span className="text-[11px] font-bold text-slate-300">Local Session Status</span>
           <div className="flex items-center space-x-1.5 mt-0.5">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
             <span className="text-[11px] font-semibold text-emerald-400">Connected</span>
@@ -337,10 +420,10 @@ export const StageDisplayScreen: React.FC = () => {
           </span>
           <button
             onClick={() => setShowHostDrawer(true)}
-            className="text-slate-400 hover:text-white p-0.5 rounded transition-colors"
-            title="Open Console Drawer"
+            className="w-5 h-5 rounded-md bg-white/10 hover:bg-white/20 flex items-center justify-center text-slate-300 hover:text-white transition-colors"
+            title="Open Console Drawer (or press 'M')"
           >
-            <Sliders className="w-3.5 h-3.5" />
+            <span className="w-2 h-0.5 bg-current rounded-full" />
           </button>
         </div>
 
@@ -378,11 +461,11 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* Transport Controls */}
-        <div className="flex items-center justify-between pt-0.5">
+        {/* Transport Controls (Clean 3-Button Center Layout Matching Mockup) */}
+        <div className="flex items-center justify-around pt-1 px-4">
           <button
             onClick={() => setCurrentTimeSec(0)}
-            className="p-1.5 text-slate-300 hover:text-white transition-colors"
+            className="p-2 text-slate-300 hover:text-white transition-colors"
             title="Restart Track"
           >
             <SkipBack className="w-4 h-4" />
@@ -390,7 +473,7 @@ export const StageDisplayScreen: React.FC = () => {
 
           <button
             onClick={handleTogglePlay}
-            className="w-9 h-9 rounded-full bg-teal-400 hover:bg-teal-300 text-black flex items-center justify-center shadow-lg shadow-teal-400/40 active:scale-95 transition-all"
+            className="w-10 h-10 rounded-full bg-teal-400 hover:bg-teal-300 text-black flex items-center justify-center shadow-lg shadow-teal-400/40 active:scale-95 transition-all"
             title={isPlaying ? 'Pause Playback' : 'Play Audio'}
           >
             {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
@@ -398,25 +481,11 @@ export const StageDisplayScreen: React.FC = () => {
 
           <button
             onClick={handleNextTrack}
-            className="p-1.5 text-slate-300 hover:text-white transition-colors"
+            className="p-2 text-slate-300 hover:text-white transition-colors"
             title="Next Track (Harmonic Mix)"
           >
             <SkipForward className="w-4 h-4" />
           </button>
-
-          {/* Volume Control */}
-          <div className="flex items-center space-x-1.5 pl-2 border-l border-white/10">
-            <Volume2 className="w-3 h-3 text-slate-400" />
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={masterVolume}
-              onChange={(e) => setMasterVolume(parseFloat(e.target.value))}
-              className="w-12 accent-teal-400 h-1 bg-white/20 rounded cursor-pointer"
-            />
-          </div>
         </div>
       </div>
 
