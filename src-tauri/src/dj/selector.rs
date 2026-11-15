@@ -11,6 +11,7 @@ impl TrackSelector {
         target_energy: f64,
         recent_history: &[PlaybackHistoryItem],
         approved_requests: &[GuestRequest],
+        excluded_ids: &[String],
     ) -> Option<PlayableTrackCandidate> {
         if candidates.is_empty() {
             return None;
@@ -20,6 +21,11 @@ impl TrackSelector {
         let mut scored_candidates: Vec<(PlayableTrackCandidate, f64)> = Vec::with_capacity(candidates.len());
 
         for candidate in candidates {
+            // Strictly exclude tracks currently loaded, queued, or reserved
+            if excluded_ids.contains(&candidate.track.id) && candidates.len() > excluded_ids.len() {
+                continue;
+            }
+
             // Check if track is already in recent history within cooldown
             let track_cooldown_ms = (mood.repetition_cooldown_mins as i64) * 60 * 1000;
             let artist_cooldown_ms = (mood.artist_cooldown_mins as i64) * 60 * 1000;

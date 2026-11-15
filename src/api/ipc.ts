@@ -584,3 +584,11 @@ export async function apiSetCrossfader(position: number, curve: string = 'bass_s
   }
 }
 
+export async function apiScanLibraryFolder(folderPath: string): Promise<number> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('scan_library_folder', { folderPath });
+  }
+  return MOCK_TRACKS.length;
+}
+

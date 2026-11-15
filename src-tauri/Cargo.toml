@@ -34,6 +34,7 @@ qrcode = { version = "0.14", features = ["svg"] }
 # Utilities & Analysis
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
+sha2 = "0.10"
 anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"

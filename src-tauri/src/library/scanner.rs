@@ -1,12 +1,14 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::analysis::analyze_track_file;
 use crate::db::Database;
-use crate::db::models::{AudioAsset, Track};
+use crate::db::models::{AudioAsset, Track, TrackAnalysis};
 
 pub struct LibraryScanner;
 
@@ -39,12 +41,47 @@ impl LibraryScanner {
     }
 }
 
+fn compute_sha256<P: AsRef<Path>>(path: P) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536]; // 64 KB streaming buffer
+
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn infer_genre_from_metadata(file_name: &str, bpm: f64) -> String {
+    let lower = file_name.to_lowercase();
+    if lower.contains("dhol") || lower.contains("bhangra") || lower.contains("punjabi") {
+        "Punjabi Pop".to_string()
+    } else if lower.contains("garba") || lower.contains("dandiya") || lower.contains("chogada") {
+        "Garba Folk".to_string()
+    } else if lower.contains("remix") || lower.contains("club") || lower.contains("mix") {
+        "Desi Club".to_string()
+    } else if lower.contains("retro") || lower.contains("disco") {
+        "Retro Bollywood".to_string()
+    } else if bpm >= 126.0 {
+        "High-Energy Celebration".to_string()
+    } else if bpm >= 110.0 {
+        "Bollywood Dance".to_string()
+    } else {
+        "Melodic Celebration".to_string()
+    }
+}
+
 fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
     let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown Track");
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp3");
     let metadata = fs::metadata(path)?;
 
-    // Parse "Artist - Title" heuristic if tags are unpopulated
+    // Parse "Artist - Title" format if available
     let (artist, title) = if file_name.contains(" - ") {
         let parts: Vec<&str> = file_name.splitn(2, " - ").collect();
         (parts[0].trim().to_string(), parts[1].trim().to_string())
@@ -56,48 +93,66 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
     let asset_id = format!("ast_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
     let now = chrono::Utc::now().timestamp_millis();
 
-    // Run deterministic analysis
-    let analysis_res = match analyze_track_file(&track_id, path) {
-        Ok(res) => res,
+    // 1. Compute real cryptographic SHA-256 hash
+    let sha256_hash = match compute_sha256(path) {
+        Ok(h) => h,
         Err(e) => {
-            warn!("Could not fully analyze {:?}: {}, using safe fallback attributes", path, e);
-            crate::analysis::FullAnalysisResult {
-                analysis: crate::db::models::TrackAnalysis {
-                    track_id: track_id.clone(),
-                    bpm: 120.0,
-                    bpm_confidence: 0.3,
-                    key_name: "C Major".to_string(),
-                    camelot_key: "8B".to_string(),
-                    key_confidence: 0.3,
-                    time_signature_num: 4,
-                    time_signature_den: 4,
-                    downbeat_offset_ms: 0,
-                    phrase_length_bars: 32,
-                    overall_energy: 0.7,
-                    dance_suitability: 0.7,
-                    recommended_mix_in_ms: 0,
-                    recommended_mix_out_ms: 180000,
-                    analysis_version: 1,
-                    analyzed_at: now,
-                    manual_override: false,
-                },
-                beat_grid: Vec::new(),
-                phrase_markers: Vec::new(),
-            }
+            warn!("Failed to compute SHA-256 for {:?}: {}", path, e);
+            format!("sha_{:x}_{:x}", metadata.len(), now)
         }
     };
+
+    // 2. Run deterministic analysis with real duration and verification states
+    let (analysis, duration_ms, is_verified) = match analyze_track_file(&track_id, path) {
+        Ok(res) => {
+            let dur = res.duration_ms as i64;
+            (res.analysis, dur, true)
+        }
+        Err(e) => {
+            warn!("Analysis failed for {:?}: {}. Quarantining track.", path, e);
+            let unverified_analysis = TrackAnalysis {
+                track_id: track_id.clone(),
+                bpm: 0.0,
+                bpm_confidence: 0.0,
+                key_name: "Unknown".to_string(),
+                camelot_key: "Unknown".to_string(),
+                key_confidence: 0.0,
+                time_signature_num: 4,
+                time_signature_den: 4,
+                downbeat_offset_ms: 0,
+                phrase_length_bars: 32,
+                overall_energy: 0.0,
+                dance_suitability: 0.0,
+                recommended_mix_in_ms: 0,
+                recommended_mix_out_ms: 0,
+                analysis_version: 1,
+                analyzed_at: now,
+                manual_override: false,
+            };
+            (unverified_analysis, 0i64, false)
+        }
+    };
+
+    let genre = infer_genre_from_metadata(file_name, analysis.bpm);
 
     let track = Track {
         id: track_id.clone(),
         title,
         artist,
         album: None,
-        duration_ms: (metadata.len() as f64 / 32000.0 * 1000.0).round() as i64, // Approximate if unparsed
+        duration_ms,
         year: None,
-        genre: "Bollywood Dance".to_string(),
+        genre,
         subgenre: None,
         created_at: now,
         updated_at: now,
+    };
+
+    // Separate verified vs failed/quarantined states
+    let (verification_status, availability_status) = if is_verified {
+        ("verified".to_string(), "available".to_string())
+    } else {
+        ("failed_analysis".to_string(), "quarantined".to_string())
     };
 
     let asset = AudioAsset {
@@ -109,14 +164,13 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
         sample_rate: 44100,
         bit_depth: Some(16),
         channels: 2,
-        sha256_hash: format!("{:x}", metadata.len()), // fast hash approximation
-        verification_status: "verified".to_string(),
-        availability_status: "available".to_string(),
+        sha256_hash,
+        verification_status,
+        availability_status,
         last_verified_at: now,
     };
 
-    db.insert_or_update_track(&track, &asset, &analysis_res.analysis)?;
+    db.insert_or_update_track(&track, &asset, &analysis)?;
 
     Ok(())
 }
-

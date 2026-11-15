@@ -213,5 +213,126 @@ mod tests {
         // Different guest is not blocked
         assert!(limiter.check_and_record("guest_ip_2"));
     }
+
+    #[test]
+    fn test_all_14_preset_moods_exist_in_rust() {
+        use dhun_lib::dj::moods::get_preset_moods;
+        let presets = get_preset_moods();
+        assert_eq!(presets.len(), 14, "Expected exactly 14 complete preset moods in Rust backend");
+
+        let expected_mood_ids = [
+            "shaadi", "baraat", "mehendi", "sangeet", "desi_club",
+            "garba", "dandiya", "retro_bollywood", "house_party",
+            "haldi", "punjabi_tashan", "cocktail_night", "festival_mode", "international_party"
+        ];
+
+        for id in &expected_mood_ids {
+            let found = presets.iter().any(|m| m.id == *id);
+            assert!(found, "Missing preset mood: {}", id);
+        }
+    }
+
+    #[test]
+    fn test_key_detector_frequency_domain_analysis() {
+        use std::sync::Arc;
+        use dhun_lib::analysis::key_detector::KeyDetector;
+
+        // Generate 3 seconds of 440 Hz (Note A4) tone at 44100 Hz stereo
+        let sr = 44100;
+        let num_frames = sr * 3;
+        let mut samples = Vec::with_capacity(num_frames * 2);
+        for i in 0..num_frames {
+            let t = i as f32 / sr as f32;
+            let val = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            samples.push(val); // L
+            samples.push(val); // R
+        }
+
+        let (key_name, camelot_key, confidence) = KeyDetector::detect_key(&Arc::new(samples), sr as u32);
+        assert!(confidence > 0.4);
+        assert!(!key_name.is_empty());
+        assert!(!camelot_key.is_empty());
+        // Should detect A Major or A Minor or closely related harmonic
+        assert!(key_name.contains('A') || camelot_key == "11B" || camelot_key == "8A");
+    }
+
+    #[test]
+    fn test_track_selector_excludes_reserved_and_recent_history() {
+        use dhun_lib::dj::moods::get_preset_moods;
+        use dhun_lib::dj::selector::TrackSelector;
+
+        let preset_moods = get_preset_moods();
+        let mood = &preset_moods[0]; // Shaadi
+
+        let make_candidate = |id: &str, title: &str, artist: &str, bpm: f64, camelot: &str| PlayableTrackCandidate {
+            track: Track {
+                id: id.to_string(),
+                title: title.to_string(),
+                artist: artist.to_string(),
+                album: None,
+                duration_ms: 200000,
+                year: None,
+                genre: "Bollywood".to_string(),
+                subgenre: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+            asset: AudioAsset {
+                id: format!("ast_{}", id),
+                track_id: id.to_string(),
+                file_path: format!("C:/{}.mp3", id),
+                file_format: "mp3".to_string(),
+                file_size_bytes: 1000,
+                sample_rate: 44100,
+                bit_depth: Some(16),
+                channels: 2,
+                sha256_hash: "hash".to_string(),
+                verification_status: "verified".to_string(),
+                availability_status: "available".to_string(),
+                last_verified_at: 0,
+            },
+            analysis: TrackAnalysis {
+                track_id: id.to_string(),
+                bpm,
+                bpm_confidence: 0.9,
+                key_name: "C Major".to_string(),
+                camelot_key: camelot.to_string(),
+                key_confidence: 0.9,
+                time_signature_num: 4,
+                time_signature_den: 4,
+                downbeat_offset_ms: 0,
+                phrase_length_bars: 32,
+                overall_energy: 0.8,
+                dance_suitability: 0.9,
+                recommended_mix_in_ms: 0,
+                recommended_mix_out_ms: 180000,
+                analysis_version: 1,
+                analyzed_at: 0,
+                manual_override: false,
+            },
+            compatibility_score: 0.0,
+            transition_style: "bass_swap".to_string(),
+        };
+
+        let t1 = make_candidate("t1", "Song 1", "Artist A", 128.0, "8B");
+        let t2 = make_candidate("t2", "Song 2", "Artist B", 128.0, "8B");
+        let t3 = make_candidate("t3", "Song 3", "Artist C", 128.0, "9B");
+        let candidates = vec![t1.clone(), t2.clone(), t3.clone()];
+
+        // When t1 is excluded (e.g. already playing), t1 must NEVER be selected
+        let excluded = vec!["t1".to_string()];
+        let selected = TrackSelector::score_and_select(
+            &candidates,
+            Some(&t1),
+            mood,
+            0.8,
+            &[],
+            &[],
+            &excluded,
+        );
+
+        assert!(selected.is_some());
+        assert_ne!(selected.unwrap().track.id, "t1", "Excluded track t1 must not be selected");
+    }
 }
 

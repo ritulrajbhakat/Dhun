@@ -35,6 +35,7 @@ export const StageDisplayScreen: React.FC = () => {
     loadLocalAudioFile,
     approveRequest,
     rejectRequest,
+    scanFolder,
   } = useDhunStore();
 
   const [currentFxIndex, setCurrentFxIndex] = useState(0);
@@ -557,9 +558,16 @@ export const StageDisplayScreen: React.FC = () => {
                         className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono"
                       />
                       <button
-                        onClick={() => {
+                        onClick={async () => {
+                          if (!folderPathInput.trim()) return;
                           setIsScanning(true);
-                          setTimeout(() => setIsScanning(false), 800);
+                          try {
+                            await scanFolder(folderPathInput.trim());
+                          } catch (e) {
+                            console.error('Scan error:', e);
+                          } finally {
+                            setIsScanning(false);
+                          }
                         }}
                         className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs rounded-lg flex items-center space-x-1"
                       >

@@ -14,6 +14,7 @@ import {
   apiForceNext,
   apiDeckControl,
   apiSetCrossfader,
+  apiScanLibraryFolder,
 } from '../api/ipc';
 
 export type ScreenView = 'home' | 'wizard' | 'live' | 'mixer' | 'library' | 'requests' | 'history' | 'settings' | 'diagnostics';
@@ -65,6 +66,7 @@ interface DhunState {
   setDeckCount: (count: 2 | 4) => void;
   loadLocalAudioFile: (deckId: number, file: File) => Promise<void>;
   startBrowserAudio: () => Promise<void>;
+  scanFolder: (folderPath: string) => Promise<number>;
 }
 
 const defaultDeckState = (): DeckState => ({
@@ -243,6 +245,13 @@ export const useDhunStore = create<DhunState>((set, get) => ({
 
   loadLocalAudioFile: async (deckId: number, file: File) => {
     await webAudioEngine.loadUserAudioFile(deckId, file);
+  },
+
+  scanFolder: async (folderPath: string) => {
+    const count = await apiScanLibraryFolder(folderPath);
+    const tracks = await apiGetTracks();
+    set({ tracks });
+    return count;
   },
 }));
 
