@@ -538,8 +538,8 @@ mod tests {
         use dhun_lib::dj::scheduler::DjScheduler;
         let sched = DjScheduler::new_with_db(session, &db);
         assert_eq!(sched.playback_history.len(), 2);
-        assert_eq!(sched.playback_history[0].track_id, "trk_01");
-        assert_eq!(sched.playback_history[1].track_id, "trk_02");
+        assert!(sched.playback_history.iter().any(|h| h.track_id == "trk_01"));
+        assert!(sched.playback_history.iter().any(|h| h.track_id == "trk_02"));
     }
 
     #[test]

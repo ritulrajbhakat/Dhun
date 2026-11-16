@@ -416,7 +416,7 @@ impl Database {
                     h.deck_id, h.played_at, h.duration_played_ms, h.was_skipped, h.transition_type
              FROM playback_history h
              LEFT JOIN tracks t ON h.track_id = t.id
-             WHERE h.session_id = ?1 ORDER BY h.played_at ASC"
+             WHERE h.session_id = ?1 ORDER BY h.played_at ASC, h.id ASC"
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             Ok(PlaybackHistoryItem {
