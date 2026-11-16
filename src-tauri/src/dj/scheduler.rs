@@ -57,8 +57,13 @@ impl DjScheduler {
     /// Initializes DJ Scheduler restoring any persistent playback history from SQLite
     pub fn new_with_db(session: PartySession, db: &Database) -> Self {
         let mut s = Self::new(session);
-        if let Ok(history) = db.get_session_playback_history(&s.session.id) {
-            s.playback_history = history;
+        match db.get_session_playback_history(&s.session.id) {
+            Ok(history) => {
+                s.playback_history = history;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query session playback history: {}", e);
+            }
         }
         s
     }

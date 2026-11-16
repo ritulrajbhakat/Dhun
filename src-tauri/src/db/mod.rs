@@ -419,17 +419,28 @@ impl Database {
              WHERE h.session_id = ?1 ORDER BY h.played_at ASC, h.id ASC"
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
+            let id: i64 = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let track_id: String = row.get(2)?;
+            let track_title: String = row.get(3)?;
+            let track_artist: String = row.get(4)?;
+            let deck_id: i64 = row.get(5)?;
+            let played_at: i64 = row.get(6)?;
+            let duration_played_ms: i64 = row.get(7)?;
+            let was_skipped: bool = row.get::<_, i64>(8).map(|v| v != 0).unwrap_or(false);
+            let transition_type: String = row.get(9)?;
+
             Ok(PlaybackHistoryItem {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                track_id: row.get(2)?,
-                track_title: row.get(3)?,
-                track_artist: row.get(4)?,
-                deck_id: row.get(5)?,
-                played_at: row.get(6)?,
-                duration_played_ms: row.get(7)?,
-                was_skipped: row.get(8)?,
-                transition_type: row.get(9)?,
+                id,
+                session_id,
+                track_id,
+                track_title,
+                track_artist,
+                deck_id: deck_id as i32,
+                played_at,
+                duration_played_ms,
+                was_skipped,
+                transition_type,
             })
         })?;
         let mut list = Vec::new();
