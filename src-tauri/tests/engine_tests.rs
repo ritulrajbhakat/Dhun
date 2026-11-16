@@ -521,7 +521,7 @@ mod tests {
             start_time: 1000,
             end_time: None,
             dj_level: 2,
-            primary_mood_id: "house_party".to_string(),
+            primary_mood_id: "shaadi".to_string(),
             secondary_mood_id: None,
             output_device_name: "Default".to_string(),
             status: "active".to_string(),
@@ -530,16 +530,110 @@ mod tests {
         };
         db.create_session(&session).unwrap();
 
+        let t1 = Track {
+            id: "trk_hist_1".to_string(),
+            title: "Song One".to_string(),
+            artist: "Artist One".to_string(),
+            album: None,
+            duration_ms: 180000,
+            year: None,
+            genre: "Bollywood".to_string(),
+            subgenre: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let t2 = Track {
+            id: "trk_hist_2".to_string(),
+            title: "Song Two".to_string(),
+            artist: "Artist Two".to_string(),
+            album: None,
+            duration_ms: 190000,
+            year: None,
+            genre: "Bollywood".to_string(),
+            subgenre: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let asset1 = AudioAsset {
+            id: "ast_h1".to_string(),
+            track_id: "trk_hist_1".to_string(),
+            file_path: "/music/1.mp3".to_string(),
+            file_format: "mp3".to_string(),
+            file_size_bytes: 1000,
+            sample_rate: 44100,
+            bit_depth: Some(16),
+            channels: 2,
+            sha256_hash: "h1".to_string(),
+            verification_status: "verified".to_string(),
+            availability_status: "available".to_string(),
+            last_verified_at: 0,
+        };
+        let asset2 = AudioAsset {
+            id: "ast_h2".to_string(),
+            track_id: "trk_hist_2".to_string(),
+            file_path: "/music/2.mp3".to_string(),
+            file_format: "mp3".to_string(),
+            file_size_bytes: 1000,
+            sample_rate: 44100,
+            bit_depth: Some(16),
+            channels: 2,
+            sha256_hash: "h2".to_string(),
+            verification_status: "verified".to_string(),
+            availability_status: "available".to_string(),
+            last_verified_at: 0,
+        };
+        let analysis1 = TrackAnalysis {
+            track_id: "trk_hist_1".to_string(),
+            bpm: 128.0,
+            bpm_confidence: 0.9,
+            key_name: "C".to_string(),
+            camelot_key: "8B".to_string(),
+            key_confidence: 0.9,
+            time_signature_num: 4,
+            time_signature_den: 4,
+            downbeat_offset_ms: 0,
+            phrase_length_bars: 32,
+            overall_energy: 0.8,
+            dance_suitability: 0.8,
+            recommended_mix_in_ms: 0,
+            recommended_mix_out_ms: 180000,
+            analysis_version: 1,
+            analyzed_at: 0,
+            manual_override: false,
+        };
+        let analysis2 = TrackAnalysis {
+            track_id: "trk_hist_2".to_string(),
+            bpm: 128.0,
+            bpm_confidence: 0.9,
+            key_name: "C".to_string(),
+            camelot_key: "8B".to_string(),
+            key_confidence: 0.9,
+            time_signature_num: 4,
+            time_signature_den: 4,
+            downbeat_offset_ms: 0,
+            phrase_length_bars: 32,
+            overall_energy: 0.8,
+            dance_suitability: 0.8,
+            recommended_mix_in_ms: 0,
+            recommended_mix_out_ms: 180000,
+            analysis_version: 1,
+            analyzed_at: 0,
+            manual_override: false,
+        };
+
+        db.insert_or_update_track(&t1, &asset1, &analysis1).unwrap();
+        db.insert_or_update_track(&t2, &asset2, &analysis2).unwrap();
+
         // Log 2 tracks played
-        db.log_playback("ses_history_test", "trk_01", 0, 180000, false, "phrase_swap").unwrap();
-        db.log_playback("ses_history_test", "trk_02", 1, 190000, false, "phrase_swap").unwrap();
+        db.log_playback("ses_history_test", "trk_hist_1", 0, 180000, false, "phrase_swap").unwrap();
+        db.log_playback("ses_history_test", "trk_hist_2", 1, 190000, false, "phrase_swap").unwrap();
 
         // Restore scheduler with new_with_db
         use dhun_lib::dj::scheduler::DjScheduler;
         let sched = DjScheduler::new_with_db(session, &db);
         assert_eq!(sched.playback_history.len(), 2);
-        assert!(sched.playback_history.iter().any(|h| h.track_id == "trk_01"));
-        assert!(sched.playback_history.iter().any(|h| h.track_id == "trk_02"));
+        assert!(sched.playback_history.iter().any(|h| h.track_id == "trk_hist_1"));
+        assert!(sched.playback_history.iter().any(|h| h.track_id == "trk_hist_2"));
     }
 
     #[test]

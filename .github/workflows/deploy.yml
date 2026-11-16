@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
+  test-backend:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -32,6 +32,12 @@ jobs:
           RUST_BACKTRACE: 1
         run: cargo test --manifest-path src-tauri/Cargo.toml --tests -- --nocapture
 
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -48,5 +54,6 @@ jobs:
         with:
           folder: dist
           branch: gh-pages
+
 
 
