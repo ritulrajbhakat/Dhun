@@ -14,10 +14,13 @@ use crate::db::Database;
 use crate::db::models::DownloadTask;
 use crate::library::ingest::{ingest_audio_asset, IngestResult};
 
+pub const DEFAULT_MAX_AUDIO_DOWNLOAD_BYTES: i64 = 500 * 1024 * 1024; // 500 MB max audio file size
+
 #[derive(Clone)]
 pub struct AudioDownloader {
     cache_dir: PathBuf,
     client: reqwest::Client,
+    max_file_size_bytes: i64,
     cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
@@ -33,12 +36,22 @@ impl AudioDownloader {
         Self {
             cache_dir: dir,
             client,
+            max_file_size_bytes: DEFAULT_MAX_AUDIO_DOWNLOAD_BYTES,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    pub fn with_max_file_size(mut self, max_bytes: i64) -> Self {
+        self.max_file_size_bytes = max_bytes;
+        self
+    }
+
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    pub fn max_file_size_bytes(&self) -> i64 {
+        self.max_file_size_bytes
     }
 
     /// Cancels an in-progress download task
@@ -52,7 +65,8 @@ impl AudioDownloader {
         Ok(())
     }
 
-    /// Streams an audio file from a direct URL with hash verification and automatic ingestion
+    /// Streams an audio file from an authorized direct URL with file size limits,
+    /// format validation, SHA-256 duplicate detection, and atomic ingestion
     pub async fn download_audio(
         &self,
         url: &str,
@@ -63,10 +77,11 @@ impl AudioDownloader {
         let task_id = format!("dl_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
         let now = chrono::Utc::now().timestamp_millis();
 
-        // Determine destination file path
+        // Determine destination file format and path
         let ext = if url.ends_with(".wav") { "wav" }
             else if url.ends_with(".flac") { "flac" }
             else if url.ends_with(".m4a") { "m4a" }
+            else if url.ends_with(".aac") { "aac" }
             else if url.ends_with(".ogg") { "ogg" }
             else { "mp3" };
 
@@ -118,11 +133,30 @@ impl AudioDownloader {
             return Err(anyhow!(err_msg));
         }
 
+        // Validate audio content-type if provided
+        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+            let lower_ct = ct.to_lowercase();
+            if lower_ct.starts_with("text/html") || lower_ct.starts_with("application/json") || lower_ct.starts_with("text/plain") {
+                let err_msg = format!("Invalid audio format: server returned non-audio Content-Type '{}'", ct);
+                db.update_download_status(&task_id, "failed", Some(&err_msg))?;
+                return Err(anyhow!(err_msg));
+            }
+        }
+
+        // Enforce file size limit via Content-Length header
+        if let Some(content_length) = resp.content_length() {
+            if content_length as i64 > self.max_file_size_bytes {
+                let err_msg = format!("Remote file size ({} bytes) exceeds maximum allowed limit of {} bytes", content_length, self.max_file_size_bytes);
+                db.update_download_status(&task_id, "failed", Some(&err_msg))?;
+                return Err(anyhow!(err_msg));
+            }
+        }
+
         let total_bytes = resp.content_length().map(|len| len as i64);
         db.update_download_status(&task_id, "downloading", None)?;
         db.update_download_progress(&task_id, 0, total_bytes)?;
 
-        // Stream body to part file while calculating SHA-256
+        // Stream body to temporary .part file while calculating SHA-256
         let mut file = match File::create(&part_path) {
             Ok(f) => f,
             Err(e) => {
@@ -157,6 +191,15 @@ impl AudioDownloader {
                 }
             };
 
+            // Enforce max size limit during streaming chunks
+            if downloaded + chunk.len() as i64 > self.max_file_size_bytes {
+                drop(file);
+                let _ = fs::remove_file(&part_path);
+                let err_msg = format!("Download exceeded maximum allowable file size ({} bytes)", self.max_file_size_bytes);
+                db.update_download_status(&task_id, "failed", Some(&err_msg))?;
+                return Err(anyhow!(err_msg));
+            }
+
             if let Err(e) = file.write_all(&chunk) {
                 drop(file);
                 let _ = fs::remove_file(&part_path);
@@ -182,7 +225,7 @@ impl AudioDownloader {
         let calculated_hash = format!("{:x}", hasher.finalize());
         db.update_download_status(&task_id, "verifying", None)?;
 
-        // Verify hash if expected hash was provided
+        // Verify cryptographic hash if expected hash was provided
         if let Some(expected) = expected_sha256 {
             if !calculated_hash.eq_ignore_ascii_case(expected.trim()) {
                 let _ = fs::remove_file(&part_path);
@@ -192,7 +235,7 @@ impl AudioDownloader {
             }
         }
 
-        // Rename part file to destination path
+        // Atomically rename .part file to final destination path
         if let Err(e) = fs::rename(&part_path, &dest_path) {
             let _ = fs::remove_file(&part_path);
             let err_msg = format!("Failed to move finished download: {}", e);
@@ -205,11 +248,18 @@ impl AudioDownloader {
         let ingest_res = match ingest_audio_asset(&dest_path, "url_download", Some(url), true, db) {
             Ok(res) => res,
             Err(e) => {
+                let _ = fs::remove_file(&dest_path);
                 let err_msg = format!("Ingestion/analysis failed: {}", e);
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
             }
         };
+
+        // If this was detected as a duplicate asset, clean up the duplicate downloaded file from disk
+        if ingest_res.is_duplicate {
+            let _ = fs::remove_file(&dest_path);
+            info!("Duplicate file removed from disk; reused existing asset '{}'", ingest_res.asset_id);
+        }
 
         db.update_download_status(&task_id, "completed", None)?;
         db.update_download_progress(&task_id, downloaded, Some(downloaded))?;
@@ -220,7 +270,8 @@ impl AudioDownloader {
             map.remove(&task_id);
         }
 
-        info!("Successfully completed download task '{}' (Track: '{}', Hash: {})", task_id, ingest_res.title, calculated_hash);
+        info!("Successfully completed download task '{}' (Track: '{}', Hash: {}, Duplicate: {})",
+            task_id, ingest_res.title, calculated_hash, ingest_res.is_duplicate);
         Ok(ingest_res)
     }
 }

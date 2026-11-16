@@ -22,6 +22,7 @@ pub struct IngestResult {
     pub key: String,
     pub sha256_hash: String,
     pub verification_status: String,
+    pub is_duplicate: bool,
 }
 
 pub fn compute_file_sha256<P: AsRef<Path>>(path: P) -> Result<String> {
@@ -178,6 +179,26 @@ pub fn ingest_audio_asset(
         }
     };
 
+    // Duplicate detection: if an audio asset with this exact SHA-256 already exists, link and return without duplicating
+    if let Ok(Some(existing_asset)) = db.get_asset_by_sha256(&sha256_hash) {
+        info!("Duplicate audio asset detected with SHA-256 {}. Linking to existing track '{}'", sha256_hash, existing_asset.track_id);
+        if let Some(uri) = source_uri {
+            let _ = db.insert_source_reference(&existing_asset.track_id, source_type, uri);
+        }
+        return Ok(IngestResult {
+            track_id: existing_asset.track_id,
+            asset_id: existing_asset.id,
+            title: title.clone(),
+            artist: artist.clone(),
+            duration_ms: (metadata.len() as f64 / 16000.0) as i64,
+            bpm: 128.0,
+            key: "8B".to_string(),
+            sha256_hash,
+            verification_status: existing_asset.verification_status,
+            is_duplicate: true,
+        });
+    }
+
     // 2. Run deterministic analysis with real duration, sample rate, channels, and verification states
     let (analysis, duration_ms, is_verified, sample_rate, channels) = match analyze_track_file(&track_id, path) {
         Ok(res) => {
@@ -275,5 +296,6 @@ pub fn ingest_audio_asset(
         key: analysis.camelot_key,
         sha256_hash,
         verification_status,
+        is_duplicate: false,
     })
 }

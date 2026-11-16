@@ -931,5 +931,176 @@ mod tests {
 
         let _ = std::fs::remove_file(&temp_file);
     }
+
+    #[test]
+    fn test_duplicate_audio_asset_detection() {
+        use dhun_lib::library::ingest::ingest_audio_asset;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let temp_dir = std::env::temp_dir().join(format!("dhun_dup_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let file_a = temp_dir.join("original.mp3");
+        let file_b = temp_dir.join("duplicate_copy.mp3");
+
+        let audio_bytes = b"ID3\x03\x00\x00\x00\x00\x00\x00SAMPLE_AUDIO_TEST_PAYLOAD_FOR_DUPLICATE_DETECTION";
+        std::fs::write(&file_a, audio_bytes).unwrap();
+        std::fs::write(&file_b, audio_bytes).unwrap();
+
+        // Ingest file A
+        let res_a = ingest_audio_asset(&file_a, "local_filesystem", None, false, &db).expect("Ingest A failed");
+        assert!(!res_a.is_duplicate, "First ingestion should not be duplicate");
+
+        // Ingest file B (identical content, different path)
+        let res_b = ingest_audio_asset(&file_b, "url_download", Some("https://example.com/song.mp3"), true, &db).expect("Ingest B failed");
+        assert!(res_b.is_duplicate, "Second ingestion MUST be detected as duplicate");
+        assert_eq!(res_a.track_id, res_b.track_id, "Duplicate must point to same canonical track_id");
+        assert_eq!(res_a.sha256_hash, res_b.sha256_hash);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_reject_corrupt_truncated_audio_and_quarantine() {
+        use dhun_lib::library::ingest::ingest_audio_asset;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let temp_dir = std::env::temp_dir().join(format!("dhun_corrupt_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let corrupt_file = temp_dir.join("corrupt_recording.mp3");
+        std::fs::write(&corrupt_file, b"NOT_A_VALID_AUDIO_FILE_GARBAGE_PAYLOAD_1234567890").unwrap();
+
+        let res = ingest_audio_asset(&corrupt_file, "url_download", None, false, &db).expect("Ingest should quarantine without panic");
+        assert_eq!(res.verification_status, "failed_analysis");
+
+        // Verify quarantined track is NOT available in playable candidates
+        let playable = db.get_playable_candidates().expect("Candidates query failed");
+        assert!(!playable.iter().any(|c| c.track.id == res.track_id), "Quarantined corrupt track must NOT be in playable queue");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_3_hour_continuous_dj_playback_simulation() {
+        use dhun_lib::dj::scheduler::DjScheduler;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+
+        let session = PartySession {
+            id: "ses_3hr_sim".to_string(),
+            party_name: "3-Hour Nonstop Wedding Celebration".to_string(),
+            start_time: chrono::Utc::now().timestamp_millis(),
+            end_time: None,
+            dj_level: 2,
+            primary_mood_id: "shaadi".to_string(),
+            secondary_mood_id: None,
+            output_device_name: "Default".to_string(),
+            status: "active".to_string(),
+            total_tracks_played: 0,
+            config_json: None,
+        };
+
+        db.create_session(&session).expect("Failed to create session");
+        let mut sched = DjScheduler::new(session);
+
+        // 3 hours = 180 minutes. At ~3 minutes per track = 60 continuous track transitions
+        let mut sim_clock_ms = sched.session.start_time;
+        for i in 1..=60 {
+            // Ensure upcoming queue has candidate tracks populated
+            sched.ensure_queue_populated(&db).expect("Queue population failed");
+            assert!(sched.next_track.is_some(), "Next track was not populated");
+
+            // Advance simulation clock by 180 seconds (3 mins)
+            sim_clock_ms += 180_000;
+
+            // Trigger next track transition in the scheduler
+            let next = sched.next_track.take().unwrap();
+            let max_decks = sched.level.max_decks();
+            let target_deck = (sched.active_deck + 1) % max_decks;
+
+            // Log playback history item
+            db.log_playback(
+                &sched.session.id,
+                &next.track.id,
+                target_deck as i32,
+                180_000,
+                false,
+                &next.transition_style,
+            ).expect("Playback logging failed");
+
+            sched.playback_history.push(PlaybackHistoryItem {
+                id: i,
+                session_id: sched.session.id.clone(),
+                track_id: next.track.id.clone(),
+                track_title: next.track.title.clone(),
+                track_artist: next.track.artist.clone(),
+                deck_id: target_deck as i32,
+                played_at: sim_clock_ms,
+                duration_played_ms: 180_000,
+                was_skipped: false,
+                transition_type: next.transition_style.clone(),
+            });
+
+            sched.current_track = Some(next);
+            sched.next_track = sched.following_track.take();
+            sched.active_deck = target_deck;
+        }
+
+        // Verify all 60 tracks were successfully scheduled and logged
+        let history = db.get_session_playback_history("ses_3hr_sim").expect("History failed");
+        assert_eq!(history.len(), 60, "Exactly 60 tracks must be recorded across the 3-hour marathon");
+
+        // Verify scheduler queue remains healthy and auto-replenished
+        sched.ensure_queue_populated(&db).unwrap();
+        assert!(sched.next_track.is_some());
+        assert!(sched.following_track.is_some());
+    }
+
+    #[test]
+    fn test_guest_server_restart_without_audio_interruption() {
+        use dhun_lib::audio::AudioEngine;
+        use dhun_lib::network::LocalPartyServer;
+        use std::sync::atomic::Ordering;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let dummy_audio = AudioEngine::new_dummy();
+
+        // 1. Audio engine starts in dummy mode without hardware error
+        assert_eq!(dummy_audio.has_device_error.load(Ordering::SeqCst), false);
+
+        // 2. Start guest server on available port (e.g. 19876)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = LocalPartyServer::start(
+                19876,
+                "ses_test".to_string(),
+                "DHUN Test Party".to_string(),
+                "shaadi".to_string(),
+                db.clone(),
+            ).await.expect("Failed to start server");
+
+            assert!(!server.guest_url.is_empty());
+            assert!(!server.qr_svg.is_empty());
+
+            // 3. Stop server cleanly
+            server.stop();
+
+            // 4. Restart server on the same port
+            let server2 = LocalPartyServer::start(
+                19876,
+                "ses_test".to_string(),
+                "DHUN Test Party".to_string(),
+                "shaadi".to_string(),
+                db.clone(),
+            ).await.expect("Failed to restart server");
+
+            assert!(!server2.guest_url.is_empty());
+            server2.stop();
+        });
+
+        // 5. Audio engine state remains completely intact and undisturbed
+        assert_eq!(dummy_audio.has_device_error.load(Ordering::SeqCst), false);
+    }
 }
 

@@ -375,6 +375,48 @@ impl Database {
         }
     }
 
+    pub fn get_asset_by_sha256(&self, hash: &str) -> Result<Option<AudioAsset>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, track_id, file_path, file_format, file_size_bytes, sample_rate, bit_depth, channels, sha256_hash, verification_status, availability_status, last_verified_at
+             FROM audio_assets WHERE sha256_hash = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![hash], |row| {
+            Ok(AudioAsset {
+                id: row.get(0)?,
+                track_id: row.get(1)?,
+                file_path: row.get(2)?,
+                file_format: row.get(3)?,
+                file_size_bytes: row.get(4)?,
+                sample_rate: row.get(5)?,
+                bit_depth: row.get(6)?,
+                channels: row.get(7)?,
+                sha256_hash: row.get(8)?,
+                verification_status: row.get(9)?,
+                availability_status: row.get(10)?,
+                last_verified_at: row.get(11)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn insert_source_reference(&self, track_id: &str, source_type: &str, source_uri: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let id = format!("src_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO source_references (id, track_id, source_type, source_uri, imported_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, track_id, source_type, source_uri, now],
+        )?;
+        Ok(())
+    }
+
     pub fn update_session_dj_level(&self, session_id: &str, level: i32) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

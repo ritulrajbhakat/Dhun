@@ -43,9 +43,14 @@ impl TrackSelector {
                 }
             }
 
-            // Exclude recently played track unless library has very few tracks
-            if was_track_played_recently && candidates.len() > 3 {
-                continue;
+            // Exclude recently played track unless all available tracks are in cooldown (never silence the party)
+            if was_track_played_recently {
+                let unplayed_candidates_exist = candidates
+                    .iter()
+                    .any(|c| !excluded_ids.contains(&c.track.id) && !recent_history.iter().any(|h| h.track_id == c.track.id && (now - h.played_at).abs() < track_cooldown_ms));
+                if unplayed_candidates_exist {
+                    continue;
+                }
             }
 
             // 1. Genre Score (0.0 to 1.0)
@@ -81,7 +86,13 @@ impl TrackSelector {
             let energy_score = (1.0 - energy_diff).clamp(0.1, 1.0);
 
             // 5. Repetition Penalty
-            let repetition_penalty = if was_artist_played_recently { 0.35 } else { 0.0 };
+            let repetition_penalty = if was_track_played_recently {
+                0.60
+            } else if was_artist_played_recently {
+                0.35
+            } else {
+                0.0
+            };
 
             // 6. Guest Request Boost (STRICT: only applies if status is 'approved')
             let matching_approved = approved_requests.iter().find(|r| r.track_id == candidate.track.id && r.status == "approved");
