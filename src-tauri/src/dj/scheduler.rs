@@ -186,27 +186,38 @@ impl DjScheduler {
         });
     }
 
-    /// Periodic autonomous tick: monitors audio clock, track mix-out points, and auto-transitions
+    /// Periodic autonomous tick: monitors real audio clock & playhead, track mix-out points, and auto-transitions
     pub fn check_and_auto_transition(&mut self, audio: &AudioEngine, db: &Database) -> Result<()> {
         if self.is_transitioning || self.current_track.is_none() {
             return Ok(());
         }
 
         let curr = self.current_track.as_ref().unwrap();
-        let now = chrono::Utc::now().timestamp_millis();
-        let elapsed_ms = (now - self.current_track_started_at_ms).max(0);
 
-        let mix_out_ms = if curr.analysis.recommended_mix_out_ms > 0 {
-            curr.analysis.recommended_mix_out_ms as i64
+        // 1. Query the actual playhead and playback status from the active virtual deck
+        let (position_ms, is_playing) = if let Some(status) = audio.get_deck_playhead(self.active_deck) {
+            status
         } else {
-            (curr.track.duration_ms - 8000).max(10000)
+            let elapsed = (chrono::Utc::now().timestamp_millis() - self.current_track_started_at_ms).max(0) as u64;
+            (elapsed, true)
         };
 
-        // If elapsed time has reached the phrase mix-out point or end of track
-        if elapsed_ms >= mix_out_ms {
+        // 2. If the active deck is paused, pause the transition countdown completely
+        if !is_playing {
+            return Ok(());
+        }
+
+        let mix_out_ms = if curr.analysis.recommended_mix_out_ms > 0 {
+            curr.analysis.recommended_mix_out_ms as u64
+        } else {
+            (curr.track.duration_ms as u64).saturating_sub(8000).max(10000)
+        };
+
+        // 3. Trigger transition when the real audio playhead reaches the phrase mix-out point
+        if position_ms >= mix_out_ms {
             info!(
-                "Auto-DJ: Phrase boundary reached for '{}' (elapsed: {}ms, mix_out: {}ms). Auto-transitioning.",
-                curr.track.title, elapsed_ms, mix_out_ms
+                "Auto-DJ: Audio playhead reached phrase boundary for '{}' (position: {}ms, mix_out: {}ms). Auto-transitioning.",
+                curr.track.title, position_ms, mix_out_ms
             );
             self.trigger_transition(audio, false)?;
             self.ensure_queue_populated(db)?;

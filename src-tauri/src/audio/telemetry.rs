@@ -13,6 +13,22 @@ pub struct DeckTelemetry {
     pub vu_r_db: f32,
 }
 
+impl DeckTelemetry {
+    pub fn empty(deck_id: usize) -> Self {
+        Self {
+            deck_id,
+            track_id: None,
+            position_ms: 0,
+            duration_ms: 0,
+            bpm: 128.0,
+            tempo_rate: 1.0,
+            is_playing: false,
+            vu_l_db: -96.0,
+            vu_r_db: -96.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MasterTelemetry {
     pub vu_master_l_db: f32,
@@ -33,7 +49,12 @@ impl MasterTelemetry {
             underrun_count: 0,
             cpu_load_pct: 0.0,
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            decks: Vec::new(),
+            decks: vec![
+                DeckTelemetry::empty(0),
+                DeckTelemetry::empty(1),
+                DeckTelemetry::empty(2),
+                DeckTelemetry::empty(3),
+            ],
         }
     }
 }

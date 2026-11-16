@@ -1,7 +1,7 @@
 import { PartyStatus, MasterTelemetry, MoodProfile, AudioDeviceInfo, Track, GuestRequest, PlayableTrackCandidate } from '../types';
 
 // Check if running inside native Tauri runtime
-const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 // Sample Indian Party Tracks for offline fallback & rich testing
 export const MOCK_TRACKS: PlayableTrackCandidate[] = [

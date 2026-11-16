@@ -40,6 +40,7 @@ pub enum AudioCommand {
 pub struct AudioEngine {
     pub cmd_tx: Sender<AudioCommand>,
     telemetry_rx: Receiver<MasterTelemetry>,
+    latest_telemetry: Arc<std::sync::Mutex<MasterTelemetry>>,
     _is_running: Arc<AtomicBool>,
     _stream: Option<Stream>,
 }
@@ -67,7 +68,7 @@ impl AudioEngine {
         let sample_format = supported_config.sample_format();
         let config: StreamConfig = supported_config.into();
 
-        info!("Initializing CPAL audio stream at {}Hz, {} channels", sample_rate, channels);
+        info!("Initializing CPAL audio stream at {}Hz, {} channels, format: {:?}", sample_rate, channels, sample_format);
 
         // Pre-allocate mixing state
         let mut decks = vec![
@@ -85,6 +86,7 @@ impl AudioEngine {
         let mut emergency_fade_total_samples: u32 = 0;
 
         let mut telemetry_counter = 0;
+        let mut underrun_counter = 0u64;
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
@@ -103,6 +105,7 @@ impl AudioEngine {
                         &mut emergency_fade_samples_remaining,
                         &mut emergency_fade_total_samples,
                         &mut telemetry_counter,
+                        &mut underrun_counter,
                         sample_rate,
                     );
                 },
@@ -111,7 +114,71 @@ impl AudioEngine {
                 },
                 None,
             )?,
-            _ => return Err(anyhow!("Unsupported audio sample format (F32 required)")),
+            SampleFormat::I16 => {
+                let mut float_buf = Vec::new();
+                device.build_output_stream(
+                    &config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        float_buf.resize(data.len(), 0.0);
+                        process_audio_block(
+                            &mut float_buf,
+                            channels as usize,
+                            &mut decks,
+                            &mut crossfader,
+                            &mut limiter,
+                            &mut clock,
+                            &cmd_rx,
+                            &telemetry_tx,
+                            &mut master_volume,
+                            &mut emergency_fade_samples_remaining,
+                            &mut emergency_fade_total_samples,
+                            &mut telemetry_counter,
+                            &mut underrun_counter,
+                            sample_rate,
+                        );
+                        for (i, &sample) in float_buf.iter().enumerate() {
+                            data[i] = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                    },
+                    |err| {
+                        error!("Audio stream error: {}", err);
+                    },
+                    None,
+                )?
+            }
+            SampleFormat::U16 => {
+                let mut float_buf = Vec::new();
+                device.build_output_stream(
+                    &config,
+                    move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                        float_buf.resize(data.len(), 0.0);
+                        process_audio_block(
+                            &mut float_buf,
+                            channels as usize,
+                            &mut decks,
+                            &mut crossfader,
+                            &mut limiter,
+                            &mut clock,
+                            &cmd_rx,
+                            &telemetry_tx,
+                            &mut master_volume,
+                            &mut emergency_fade_samples_remaining,
+                            &mut emergency_fade_total_samples,
+                            &mut telemetry_counter,
+                            &mut underrun_counter,
+                            sample_rate,
+                        );
+                        for (i, &sample) in float_buf.iter().enumerate() {
+                            data[i] = ((sample.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
+                        }
+                    },
+                    |err| {
+                        error!("Audio stream error: {}", err);
+                    },
+                    None,
+                )?
+            }
+            _ => return Err(anyhow!("Unsupported audio sample format: {:?}", sample_format)),
         };
 
         stream.play()?;
@@ -119,6 +186,7 @@ impl AudioEngine {
         Ok(Self {
             cmd_tx,
             telemetry_rx,
+            latest_telemetry: Arc::new(std::sync::Mutex::new(MasterTelemetry::empty())),
             _is_running: is_running,
             _stream: Some(stream),
         })
@@ -133,7 +201,18 @@ impl AudioEngine {
         while let Ok(t) = self.telemetry_rx.try_recv() {
             latest = Some(t);
         }
-        latest
+        if let Some(ref l) = latest {
+            *self.latest_telemetry.lock().unwrap() = l.clone();
+            latest
+        } else {
+            Some(self.latest_telemetry.lock().unwrap().clone())
+        }
+    }
+
+    pub fn get_deck_playhead(&self, deck_id: usize) -> Option<(u64, bool)> {
+        self.poll_telemetry();
+        let guard = self.latest_telemetry.lock().unwrap();
+        guard.decks.iter().find(|d| d.deck_id == deck_id).map(|d| (d.position_ms, d.is_playing))
     }
 }
 
@@ -151,8 +230,10 @@ fn process_audio_block(
     fade_remaining: &mut u32,
     fade_total: &mut u32,
     telemetry_counter: &mut usize,
+    underrun_counter: &mut u64,
     sample_rate: u32,
 ) {
+    let start_time = std::time::Instant::now();
     // 1. Drain incoming commands without locking or allocating
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
@@ -297,27 +378,26 @@ fn process_audio_block(
             }
         };
 
-        let mut deck_telemetries = Vec::with_capacity(decks.len());
-        for d in decks.iter() {
-            deck_telemetries.push(DeckTelemetry {
-                deck_id: d.id,
-                track_id: d.track_id.clone(),
-                position_ms: d.current_position_ms(),
-                duration_ms: d.duration_ms(),
-                bpm: d.bpm,
-                tempo_rate: d.tempo_rate,
-                is_playing: d.state == TransportState::Playing,
-                vu_l_db: to_db(d.gain),
-                vu_r_db: to_db(d.gain),
-            });
+        let elapsed_secs = start_time.elapsed().as_secs_f64();
+        let budget_secs = frames as f64 / sample_rate as f64;
+        if elapsed_secs > budget_secs {
+            *underrun_counter += 1;
         }
+        let cpu_load = ((elapsed_secs / budget_secs.max(0.0001)) * 100.0).clamp(0.0, 100.0) as f32;
+
+        let deck_telemetries = vec![
+            decks[0].telemetry(),
+            decks[1].telemetry(),
+            decks[2].telemetry(),
+            decks[3].telemetry(),
+        ];
 
         let telemetry = MasterTelemetry {
             vu_master_l_db: to_db(peak_master_l),
             vu_master_r_db: to_db(peak_master_r),
             crossfader_pos: crossfader.position(),
-            underrun_count: 0,
-            cpu_load_pct: 1.2,
+            underrun_count: *underrun_counter,
+            cpu_load_pct: cpu_load,
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
             decks: deck_telemetries,
         };

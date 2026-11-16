@@ -66,14 +66,19 @@ pub async fn start_party(
         config_json: None,
     };
 
-    state.db.create_session(&session).map_err(|e| e.to_string())?;
-
     let db = state.db.clone();
     let audio = state.audio.clone();
     let server_arc = state.server.clone();
     let scheduler_arc = state.scheduler.clone();
 
-    // Start local guest server on port 3000
+    // 1. Initialize DJ Scheduler and start playback first (verifies audio pipeline)
+    let mut scheduler = DjScheduler::new(session.clone());
+    scheduler.start_playback(&audio, &db).map_err(|e| format!("Failed to initialize audio playback: {}", e))?;
+
+    // 2. Playback started successfully! Record session in database
+    state.db.create_session(&session).map_err(|e| e.to_string())?;
+
+    // 3. Start local guest server on port 3000
     let server = LocalPartyServer::start(
         3000,
         session_id.clone(),
@@ -86,10 +91,6 @@ pub async fn start_party(
     let guest_url = server.guest_url.clone();
 
     *server_arc.lock().unwrap() = Some(server);
-
-    // Initialize DJ Scheduler and start playback
-    let mut scheduler = DjScheduler::new(session);
-    let _ = scheduler.start_playback(&audio, &db);
 
     let now_playing = scheduler.current_track.clone();
     let next_track = scheduler.next_track.clone();
@@ -279,9 +280,10 @@ pub fn set_dj_level(level: i32, state: State<'_, AppContext>) -> Result<(), Stri
     if let Some(sched) = sched_lock.as_mut() {
         sched.level = crate::dj::levels::DjLevel::from_i32(level);
         sched.session.dj_level = level;
-        let _ = state.db.update_session_dj_level(&sched.session.id, level);
+        state.db.update_session_dj_level(&sched.session.id, level).map_err(|e| e.to_string())?;
+        return Ok(());
     }
-    Ok(())
+    Err("No active party session".to_string())
 }
 
 #[tauri::command]
@@ -292,11 +294,14 @@ pub fn set_party_mood(mood_id: String, state: State<'_, AppContext>) -> Result<(
         if let Some(m) = preset_moods.into_iter().find(|m| m.id == mood_id) {
             sched.mood = m;
             sched.session.primary_mood_id = mood_id.clone();
-            let _ = state.db.update_session_mood(&sched.session.id, &mood_id);
+            state.db.update_session_mood(&sched.session.id, &mood_id).map_err(|e| e.to_string())?;
             // Refresh upcoming queue and preload next deck based on new mood profile
-            let _ = sched.ensure_queue_populated(&state.db);
-            let _ = sched.preload_next_deck(&state.audio);
+            sched.ensure_queue_populated(&state.db).map_err(|e| e.to_string())?;
+            sched.preload_next_deck(&state.audio).map_err(|e| e.to_string())?;
+            return Ok(());
+        } else {
+            return Err(format!("Unknown mood profile ID: '{}'", mood_id));
         }
     }
-    Ok(())
+    Err("No active party session".to_string())
 }

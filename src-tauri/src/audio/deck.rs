@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::dsp::eq3::Eq3Isolator;
 use crate::audio::dsp::filter::DjFilterSweep;
+use crate::audio::telemetry::DeckTelemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportState {
@@ -152,6 +153,28 @@ impl VirtualDeck {
                 ((total_frames as f64 / self.sample_rate as f64) * 1000.0).round() as u64
             }
             None => 0,
+        }
+    }
+
+    pub fn telemetry(&self) -> DeckTelemetry {
+        let to_db = |lin: f32| -> f32 {
+            if lin <= 0.00001 {
+                -96.0
+            } else {
+                (20.0 * lin.log10()).max(-96.0)
+            }
+        };
+
+        DeckTelemetry {
+            deck_id: self.id,
+            track_id: self.track_id.clone(),
+            position_ms: self.current_position_ms(),
+            duration_ms: self.duration_ms(),
+            bpm: self.bpm,
+            tempo_rate: self.tempo_rate,
+            is_playing: self.state == TransportState::Playing,
+            vu_l_db: to_db(self.gain),
+            vu_r_db: to_db(self.gain),
         }
     }
 

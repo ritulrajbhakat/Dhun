@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { PartyStatus, MasterTelemetry, MoodProfile, AudioDeviceInfo, Track, GuestRequest, PlayableTrackCandidate } from '../types';
 import { webAudioEngine } from '../audio/WebAudioEngine';
 import {
+  isTauri,
   apiGetPartyStatus,
   apiGetTelemetry,
   apiGetMoodProfiles,
@@ -71,6 +72,7 @@ interface DhunState {
   scanFolder: (folderPath: string) => Promise<number>;
   setDjLevel: (level: number) => Promise<void>;
   setPartyMood: (moodId: string) => Promise<void>;
+  pollTelemetry: () => Promise<void>;
 }
 
 const defaultDeckState = (): DeckState => ({
@@ -135,10 +137,12 @@ export const useDhunStore = create<DhunState>((set, get) => ({
       output_device_name: outputDevice,
     });
 
-    // Start WebAudio playback in browser mode
-    const bpm = status.now_playing?.analysis.bpm || 128;
-    const key = status.now_playing?.analysis.key_name || 'D Major';
-    webAudioEngine.startPlayback(bpm, key);
+    // Start WebAudio playback only in browser mode (Tauri uses native CPAL audio)
+    if (!isTauri) {
+      const bpm = status.now_playing?.analysis.bpm || 128;
+      const key = status.now_playing?.analysis.key_name || 'D Major';
+      webAudioEngine.startPlayback(bpm, key);
+    }
 
     set({
       partyStatus: status,
@@ -148,14 +152,18 @@ export const useDhunStore = create<DhunState>((set, get) => ({
   },
 
   startBrowserAudio: async () => {
-    const bpm = get().partyStatus.now_playing?.analysis.bpm || 128;
-    const key = get().partyStatus.now_playing?.analysis.key_name || 'D Major';
-    await webAudioEngine.ensureRunning();
-    webAudioEngine.startPlayback(bpm, key);
+    if (!isTauri) {
+      const bpm = get().partyStatus.now_playing?.analysis.bpm || 128;
+      const key = get().partyStatus.now_playing?.analysis.key_name || 'D Major';
+      await webAudioEngine.ensureRunning();
+      webAudioEngine.startPlayback(bpm, key);
+    }
   },
 
   emergencyFade: async () => {
-    webAudioEngine.emergencyFade(300);
+    if (!isTauri) {
+      webAudioEngine.emergencyFade(300);
+    }
     await apiEmergencyFade(300);
     set((state) => ({
       partyStatus: { ...state.partyStatus, is_active: false },
@@ -178,14 +186,18 @@ export const useDhunStore = create<DhunState>((set, get) => ({
     await apiForceNext(requestId);
     const [requests, status] = await Promise.all([apiGetGuestRequests(), apiGetPartyStatus()]);
     set({ guestRequests: requests, partyStatus: status });
-    const bpm = status.now_playing?.analysis.bpm || 128;
-    const key = status.now_playing?.analysis.key_name || 'D Major';
-    webAudioEngine.startPlayback(bpm, key);
+    if (!isTauri) {
+      const bpm = status.now_playing?.analysis.bpm || 128;
+      const key = status.now_playing?.analysis.key_name || 'D Major';
+      webAudioEngine.startPlayback(bpm, key);
+    }
   },
 
   setCrossfaderPos: async (pos) => {
     set({ crossfader: pos });
-    webAudioEngine.setCrossfader(pos);
+    if (!isTauri) {
+      webAudioEngine.setCrossfader(pos);
+    }
     await apiSetCrossfader(pos, get().crossfaderCurve);
   },
 
@@ -195,7 +207,9 @@ export const useDhunStore = create<DhunState>((set, get) => ({
       decks[deckId] = { ...decks[deckId], eqLow: low, eqMid: mid, eqHigh: high };
       return { decks };
     });
-    webAudioEngine.setDeckEq(deckId, low, mid, high);
+    if (!isTauri) {
+      webAudioEngine.setDeckEq(deckId, low, mid, high);
+    }
     await apiDeckControl('eq', deckId, { lowDb: low, midDb: mid, highDb: high });
   },
 
@@ -205,7 +219,9 @@ export const useDhunStore = create<DhunState>((set, get) => ({
       decks[deckId] = { ...decks[deckId], gain };
       return { decks };
     });
-    webAudioEngine.setDeckGain(deckId, gain);
+    if (!isTauri) {
+      webAudioEngine.setDeckGain(deckId, gain);
+    }
     await apiDeckControl('gain', deckId, { gain });
   },
 
@@ -215,7 +231,9 @@ export const useDhunStore = create<DhunState>((set, get) => ({
       decks[deckId] = { ...decks[deckId], filter };
       return { decks };
     });
-    webAudioEngine.setDeckFilter(deckId, filter);
+    if (!isTauri) {
+      webAudioEngine.setDeckFilter(deckId, filter);
+    }
     await apiDeckControl('filter', deckId, { position: filter });
   },
 
@@ -230,19 +248,23 @@ export const useDhunStore = create<DhunState>((set, get) => ({
 
   toggleDeckPlay: async (deckId) => {
     const isPlaying = get().telemetry?.decks[deckId]?.is_playing ?? false;
-    if (isPlaying) {
-      webAudioEngine.stopPlayback();
-    } else {
-      const bpm = get().partyStatus.now_playing?.analysis.bpm || 128;
-      const key = get().partyStatus.now_playing?.analysis.key_name || 'D Major';
-      webAudioEngine.startPlayback(bpm, key);
+    if (!isTauri) {
+      if (isPlaying) {
+        webAudioEngine.stopPlayback();
+      } else {
+        const bpm = get().partyStatus.now_playing?.analysis.bpm || 128;
+        const key = get().partyStatus.now_playing?.analysis.key_name || 'D Major';
+        webAudioEngine.startPlayback(bpm, key);
+      }
     }
     await apiDeckControl(isPlaying ? 'pause' : 'play', deckId);
   },
 
   setMasterVolume: (vol) => {
     set({ masterVolume: vol });
-    webAudioEngine.setMasterVolume(vol);
+    if (!isTauri) {
+      webAudioEngine.setMasterVolume(vol);
+    }
   },
 
   setDeckCount: (count) => set({ selectedDeckCount: count }),
@@ -271,6 +293,15 @@ export const useDhunStore = create<DhunState>((set, get) => ({
     set((state) => ({
       partyStatus: { ...state.partyStatus, primary_mood_id: moodId },
     }));
+  },
+
+  pollTelemetry: async () => {
+    try {
+      const telemetry = await apiGetTelemetry();
+      set({ telemetry });
+    } catch (e) {
+      // Telemetry poll silent
+    }
   },
 }));
 

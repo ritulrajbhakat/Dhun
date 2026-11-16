@@ -4,6 +4,7 @@ import { StageVisualFxCanvas, FX_NAMES } from './StageVisualFxCanvas';
 import { AnimatedDjCharacter } from './AnimatedDjCharacter';
 import { webAudioEngine } from '../../audio/WebAudioEngine';
 import { generateQrSvg } from '../../utils/qr';
+import { isTauri, apiDeckControl } from '../../api/ipc';
 import {
   Play,
   Pause,
@@ -106,6 +107,8 @@ const AudioOscilloscopeWaveform: React.FC<{ isPlaying: boolean; bpm: number }> =
 export const StageDisplayScreen: React.FC = () => {
   const {
     partyStatus,
+    telemetry,
+    pollTelemetry,
     startParty,
     setDjLevel,
     setPartyMood,
@@ -125,8 +128,8 @@ export const StageDisplayScreen: React.FC = () => {
   const [currentFxIndex, setCurrentFxIndex] = useState(0);
   const [autoCycleFx, setAutoCycleFx] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(true);
-  const [currentTimeSec, setCurrentTimeSec] = useState(179); // 02:59 initial
+  const [localIsPlaying, setLocalIsPlaying] = useState(true);
+  const [localCurrentTimeSec, setLocalCurrentTimeSec] = useState(179); // 02:59 initial
   const [selectedDjType, setSelectedDjType] = useState('Advanced');
   const [selectedMood, setSelectedMood] = useState('house_party');
   const [audioActive, setAudioActive] = useState(false);
@@ -144,7 +147,16 @@ export const StageDisplayScreen: React.FC = () => {
   const currentArtist = activeTrack?.artist || 'Chaiyeyya';
   const currentBpm = activeAnalysis?.bpm || 128;
   const currentEnergy = activeAnalysis?.overall_energy || 0.88;
-  const currentDurationSec = activeTrack?.duration_ms ? Math.floor(activeTrack.duration_ms / 1000) : 296; // 04:56
+
+  // Real-time audio playhead synchronization from native engine telemetry
+  const activeDeckTelem = telemetry?.decks?.find((d) => d.is_playing) || telemetry?.decks?.[0];
+  const isPlaying = isTauri && activeDeckTelem ? activeDeckTelem.is_playing : localIsPlaying;
+  const currentDurationSec = isTauri && activeDeckTelem && activeDeckTelem.duration_ms > 0
+    ? Math.floor(activeDeckTelem.duration_ms / 1000)
+    : (activeTrack?.duration_ms ? Math.floor(activeTrack.duration_ms / 1000) : 296);
+  const currentTimeSec = isTauri && activeDeckTelem && activeDeckTelem.duration_ms > 0
+    ? Math.min(currentDurationSec, Math.floor(activeDeckTelem.position_ms / 1000))
+    : localCurrentTimeSec;
 
   const formatTime = (secs: number) => {
     const m = Math.floor(secs / 60);
@@ -153,18 +165,18 @@ export const StageDisplayScreen: React.FC = () => {
   };
 
   const handleTogglePlay = async () => {
-    if (!audioActive) {
+    if (!isTauri && !audioActive) {
       await startBrowserAudio();
       setAudioActive(true);
     }
-    setIsPlaying(!isPlaying);
+    setLocalIsPlaying(!isPlaying);
     await toggleDeckPlay(0);
   };
 
   const handleNextTrack = async () => {
     if (partyStatus.next_track) {
       await forceNextRequest(partyStatus.next_track.track.id);
-      setCurrentTimeSec(0);
+      setLocalCurrentTimeSec(0);
     }
   };
 
@@ -173,7 +185,7 @@ export const StageDisplayScreen: React.FC = () => {
     if (file) {
       await loadLocalAudioFile(0, file);
       setAudioActive(true);
-      setIsPlaying(true);
+      setLocalIsPlaying(true);
     }
   };
 
@@ -187,8 +199,18 @@ export const StageDisplayScreen: React.FC = () => {
     }
   };
 
-  // 1. User interaction listener to immediately start WebAudio on first click/keypress
+  // 0. Periodic telemetry polling in native Tauri desktop runtime
   useEffect(() => {
+    if (!isTauri) return;
+    const telemTimer = setInterval(() => {
+      pollTelemetry();
+    }, 100);
+    return () => clearInterval(telemTimer);
+  }, [pollTelemetry]);
+
+  // 1. User interaction listener to start WebAudio in browser demo mode
+  useEffect(() => {
+    if (isTauri) return;
     const unlockAudio = async () => {
       await startBrowserAudio();
       setAudioActive(true);
@@ -234,14 +256,14 @@ export const StageDisplayScreen: React.FC = () => {
     return () => clearInterval(fxTimer);
   }, [autoCycleFx]);
 
-  // 4. Track playback time progress
+  // 4. Track playback time progress (browser demo mode only - Tauri is driven by audio clock)
   useEffect(() => {
-    if (!isPlaying) return;
+    if (isTauri || !localIsPlaying) return;
     const progressTimer = setInterval(() => {
-      setCurrentTimeSec((t) => (t >= currentDurationSec ? 0 : t + 1));
+      setLocalCurrentTimeSec((t) => (t >= currentDurationSec ? 0 : t + 1));
     }, 1000);
     return () => clearInterval(progressTimer);
-  }, [isPlaying, currentDurationSec]);
+  }, [localIsPlaying, currentDurationSec]);
 
   // 4 DJ Levels
   const djTypes = [
@@ -269,14 +291,15 @@ export const StageDisplayScreen: React.FC = () => {
     { id: 'international_party', name: 'MOOD: International Party' },
   ];
 
-  const progressPercent = Math.min(100, (currentTimeSec / currentDurationSec) * 100);
+  const progressPercent = Math.min(100, (currentTimeSec / Math.max(1, currentDurationSec)) * 100);
 
-  // Dynamic LAN host and port (Axum server runs on port 3000)
-  const lanHost = typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
-    ? `${window.location.hostname}:3000`
-    : '192.168.1.15:3000';
+  // Single source of truth for guest mobile requests (derived strictly from backend guest_url)
+  const rawGuestUrl = partyStatus.guest_url || (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
+    ? `http://${window.location.hostname}:3000/`
+    : 'http://192.168.1.15:3000/');
 
-  const guestRequestUrl = partyStatus.guest_url || `http://${lanHost}/request`;
+  const guestRequestUrl = rawGuestUrl.endsWith('/') ? `${rawGuestUrl}request` : `${rawGuestUrl}/request`;
+  const displayedLanAddress = guestRequestUrl.replace(/^https?:\/\//, '');
   const qrSvgHtml = partyStatus.qr_svg || generateQrSvg(guestRequestUrl, 144);
 
   return (
@@ -358,8 +381,10 @@ export const StageDisplayScreen: React.FC = () => {
         >
           <span className="text-[11px] font-bold text-slate-300">Local Session Status</span>
           <div className="flex items-center space-x-1.5 mt-0.5">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-            <span className="text-[11px] font-semibold text-emerald-400">Connected</span>
+            <span className={`w-2 h-2 rounded-full ${partyStatus.is_active || !isTauri ? 'bg-emerald-400 animate-ping' : 'bg-amber-400 animate-pulse'}`} />
+            <span className={`text-[11px] font-semibold ${partyStatus.is_active || !isTauri ? 'text-emerald-400' : 'text-amber-400'}`}>
+              {partyStatus.is_active ? 'Connected' : (!isTauri ? 'Connected' : 'Offline / Setup')}
+            </span>
           </div>
         </div>
 
@@ -457,7 +482,11 @@ export const StageDisplayScreen: React.FC = () => {
             onClick={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
               const pct = (e.clientX - rect.left) / rect.width;
-              setCurrentTimeSec(Math.floor(pct * currentDurationSec));
+              const targetSec = Math.floor(pct * currentDurationSec);
+              setLocalCurrentTimeSec(targetSec);
+              if (isTauri) {
+                apiDeckControl('seek', 0, { positionMs: targetSec * 1000 });
+              }
             }}
           >
             <div
@@ -476,7 +505,12 @@ export const StageDisplayScreen: React.FC = () => {
         {/* Transport Controls (Clean 3-Button Center Layout Matching Mockup) */}
         <div className="flex items-center justify-around pt-1 px-4">
           <button
-            onClick={() => setCurrentTimeSec(0)}
+            onClick={() => {
+              setLocalCurrentTimeSec(0);
+              if (isTauri) {
+                apiDeckControl('seek', 0, { positionMs: 0 });
+              }
+            }}
             className="p-2 text-slate-300 hover:text-white transition-colors"
             title="Restart Track"
           >
@@ -520,7 +554,7 @@ export const StageDisplayScreen: React.FC = () => {
           स्कैन कर गाना मांगें
         </p>
         <p className="text-[10px] font-mono text-slate-400 mt-1">
-          LAN: {lanHost}/request
+          LAN: {displayedLanAddress}
         </p>
       </div>
 
