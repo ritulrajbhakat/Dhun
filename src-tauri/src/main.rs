@@ -9,6 +9,7 @@ mod dj;
 mod library;
 mod network;
 mod recovery;
+mod sync;
 
 use std::sync::{Arc, Mutex};
 use tracing::{info, Level};
@@ -17,6 +18,9 @@ use tracing_subscriber::FmtSubscriber;
 use crate::audio::AudioEngine;
 use crate::commands::AppContext;
 use crate::db::Database;
+use crate::library::cache::{RollingCacheManager, DEFAULT_MAX_CACHE_BYTES};
+use crate::library::downloader::AudioDownloader;
+use crate::sync::MetadataSyncManager;
 
 #[tokio::main]
 async fn main() {
@@ -48,11 +52,19 @@ async fn main() {
         }
     };
 
+    let cache_dir = root_dir.join("cache");
+    let cache = Arc::new(RollingCacheManager::new(&cache_dir, DEFAULT_MAX_CACHE_BYTES));
+    let downloader = Arc::new(AudioDownloader::new(&cache_dir));
+    let sync = Arc::new(MetadataSyncManager::new(None));
+
     let context = AppContext {
         db: db.clone(),
         audio,
         scheduler: Arc::new(Mutex::new(None)),
         server: Arc::new(Mutex::new(None)),
+        cache,
+        downloader,
+        sync,
     };
 
     tauri::Builder::default()
@@ -80,6 +92,15 @@ async fn main() {
             commands::force_next_request,
             commands::set_dj_level,
             commands::set_party_mood,
+            commands::download_track,
+            commands::cancel_download,
+            commands::get_download_tasks,
+            commands::get_cache_stats,
+            commands::purge_cache,
+            commands::verify_audio_asset,
+            commands::sync_metadata_correction,
+            commands::trigger_sync,
+            commands::get_sync_status,
         ])
         .run(tauri::generate_context!())
         .expect("Error while running DHUN application");

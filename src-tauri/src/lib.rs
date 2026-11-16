@@ -8,3 +8,4 @@ pub mod dj;
 pub mod library;
 pub mod network;
 pub mod recovery;
+pub mod sync;

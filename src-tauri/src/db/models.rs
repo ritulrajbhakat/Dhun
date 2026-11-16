@@ -174,3 +174,59 @@ pub struct PlayableTrackCandidate {
     pub transition_style: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadTask {
+    pub id: String,
+    pub url: String,
+    pub destination_path: String,
+    pub expected_sha256: Option<String>,
+    pub status: String, // 'pending', 'downloading', 'verifying', 'ingesting', 'completed', 'failed', 'cancelled'
+    pub bytes_downloaded: i64,
+    pub total_bytes: Option<i64>,
+    pub error_message: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheEntry {
+    pub asset_id: String,
+    pub cached_file_path: String,
+    pub size_bytes: i64,
+    pub is_locked: bool,
+    pub lock_reason: Option<String>,
+    pub last_accessed_at: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStats {
+    pub total_files: usize,
+    pub total_bytes: i64,
+    pub locked_files: usize,
+    pub locked_bytes: i64,
+    pub max_cache_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncOutboxItem {
+    pub id: String,
+    pub entity_type: String, // 'track_metadata', 'playback_event', 'guest_rating'
+    pub entity_id: String,
+    pub payload_json: String,
+    pub retry_count: i32,
+    pub status: String, // 'pending', 'in_flight', 'synced', 'failed'
+    pub last_attempt_at: Option<i64>,
+    pub error_message: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatusOverview {
+    pub pending_count: usize,
+    pub in_flight_count: usize,
+    pub synced_count: usize,
+    pub failed_count: usize,
+}
+

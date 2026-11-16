@@ -2,7 +2,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
-use symphonia::core::audio::{AudioBufferRef, Signal};
+use symphonia::core::audio::{AudioBufferRef, SampleBuffer, Signal};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -47,7 +47,6 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 
     let track_id = track.id;
     let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let _channels = track.codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
 
     let dec_opts: DecoderOptions = Default::default();
     let mut decoder = symphonia::default::get_codecs()
@@ -55,6 +54,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         .map_err(|e| anyhow!("Failed to instantiate codec: {}", e))?;
 
     let mut interleaved = Vec::with_capacity(sample_rate as usize * 60 * 2); // Initial pre-allocation for ~1 min stereo
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     loop {
         let packet = match format.next_packet() {
@@ -78,7 +78,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                append_audio_buffer(&decoded, &mut interleaved);
+                append_audio_buffer(&decoded, &mut sample_buf, &mut interleaved);
             }
             Err(SymphoniaError::IoError(_)) => break,
             Err(SymphoniaError::DecodeError(e)) => {
@@ -103,61 +103,75 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
     })
 }
 
-fn append_audio_buffer(buf_ref: &AudioBufferRef, out: &mut Vec<f32>) {
-    match buf_ref {
-        AudioBufferRef::F32(buf) => {
-            let spec = buf.spec();
-            let frames = buf.frames();
-            if spec.channels.count() >= 2 {
-                for i in 0..frames {
-                    out.push(buf.chan(0)[i]);
-                    out.push(buf.chan(1)[i]);
-                }
-            } else if spec.channels.count() == 1 {
-                // Mono to stereo upmix
-                for i in 0..frames {
-                    let s = buf.chan(0)[i];
-                    out.push(s);
-                    out.push(s);
-                }
+/// Robust conversion of any Symphonia sample format (U8, S16, S24, S32, F32, F64)
+/// with universal downmixing/upmixing into standardized stereo [L, R]
+fn append_audio_buffer(
+    buf_ref: &AudioBufferRef,
+    sample_buf: &mut Option<SampleBuffer<f32>>,
+    out: &mut Vec<f32>,
+) {
+    let num_channels = buf_ref.spec().channels.count();
+    let num_frames = buf_ref.frames();
+    if num_frames == 0 || num_channels == 0 {
+        return;
+    }
+
+    // Reuse or create the SampleBuffer<f32> converter
+    if sample_buf.is_none() || sample_buf.as_ref().map(|b| b.capacity() < num_frames * num_channels).unwrap_or(false) {
+        *sample_buf = Some(SampleBuffer::<f32>::new(buf_ref.capacity() as u64, *buf_ref.spec()));
+    }
+
+    let sbuf = sample_buf.as_mut().unwrap();
+    sbuf.copy_interleaved_ref(buf_ref.clone());
+    let raw_samples = sbuf.samples();
+
+    match num_channels {
+        1 => {
+            // Mono to stereo duplicate [M, M]
+            out.reserve(num_frames * 2);
+            for &sample in raw_samples.iter().take(num_frames) {
+                out.push(sample);
+                out.push(sample);
             }
         }
-        AudioBufferRef::S16(buf) => {
-            let spec = buf.spec();
-            let frames = buf.frames();
-            let norm = 1.0 / 32768.0;
-            if spec.channels.count() >= 2 {
-                for i in 0..frames {
-                    out.push(buf.chan(0)[i] as f32 * norm);
-                    out.push(buf.chan(1)[i] as f32 * norm);
-                }
-            } else if spec.channels.count() == 1 {
-                for i in 0..frames {
-                    let s = buf.chan(0)[i] as f32 * norm;
-                    out.push(s);
-                    out.push(s);
-                }
-            }
+        2 => {
+            // Direct stereo [L, R]
+            let total_samples = num_frames * 2;
+            out.extend_from_slice(&raw_samples[..total_samples.min(raw_samples.len())]);
         }
-        AudioBufferRef::U8(buf) => {
-            let spec = buf.spec();
-            let frames = buf.frames();
-            if spec.channels.count() >= 2 {
-                for i in 0..frames {
-                    out.push((buf.chan(0)[i] as f32 - 128.0) / 128.0);
-                    out.push((buf.chan(1)[i] as f32 - 128.0) / 128.0);
+        ch => {
+            // Multi-channel downmix to stereo (e.g., 5.1 surround, quadraphonic)
+            // L_out = L + 0.707 * Center + 0.707 * Ls
+            // R_out = R + 0.707 * Center + 0.707 * Rs
+            out.reserve(num_frames * 2);
+            let center_weight = 0.7071f32;
+            let surround_weight = 0.7071f32;
+
+            for frame_idx in 0..num_frames {
+                let base = frame_idx * ch;
+                if base + 1 >= raw_samples.len() {
+                    break;
                 }
-            } else if spec.channels.count() == 1 {
-                for i in 0..frames {
-                    let s = (buf.chan(0)[i] as f32 - 128.0) / 128.0;
-                    out.push(s);
-                    out.push(s);
-                }
+                let left = raw_samples[base];
+                let right = raw_samples[base + 1];
+
+                let (mix_l, mix_r) = if ch >= 6 {
+                    // Standard 5.1 surround: 0=L, 1=R, 2=C, 3=LFE, 4=Ls, 5=Rs
+                    let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * center_weight;
+                    let ls = raw_samples.get(base + 4).copied().unwrap_or(0.0) * surround_weight;
+                    let rs = raw_samples.get(base + 5).copied().unwrap_or(0.0) * surround_weight;
+                    ((left + center + ls) * 0.7, (right + center + rs) * 0.7)
+                } else if ch >= 3 {
+                    // 3.0 / quadraphonic: 0=L, 1=R, 2=Center/Rear
+                    let extra = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.5;
+                    ((left + extra) * 0.8, (right + extra) * 0.8)
+                } else {
+                    (left, right)
+                };
+
+                out.push(mix_l.clamp(-1.0, 1.0));
+                out.push(mix_r.clamp(-1.0, 1.0));
             }
-        }
-        _ => {
-            // Other formats (e.g. S32, S24)
-            tracing::warn!("Encountered unhandled buffer format, skipped frame chunk");
         }
     }
 }

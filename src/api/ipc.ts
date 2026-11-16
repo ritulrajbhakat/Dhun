@@ -614,4 +614,102 @@ export async function apiSetPartyMood(moodId: string): Promise<void> {
   console.log(`[IPC Mock] Set Party Mood to ${moodId}`);
 }
 
+// --- Download, Cache & Sync API ---
+
+export async function apiDownloadTrack(url: string, expectedSha256?: string, customFilename?: string): Promise<any> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('download_track', { url, expectedSha256, customFilename });
+  }
+  console.log(`[IPC Mock] Download Track: ${url}`);
+  return {
+    track_id: `trk_mock_${Date.now()}`,
+    asset_id: `ast_mock_${Date.now()}`,
+    title: customFilename || 'Downloaded Audio Anthem',
+    artist: 'DHUN Guest Artist',
+    duration_ms: 210000,
+    bpm: 128.0,
+    key: '8B',
+    sha256_hash: 'mocksha256hashdownloadedfile',
+    verification_status: 'verified',
+  };
+}
+
+export async function apiCancelDownload(taskId: string): Promise<void> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('cancel_download', { taskId });
+  }
+  console.log(`[IPC Mock] Cancel Download: ${taskId}`);
+}
+
+export async function apiGetDownloadTasks(limit?: number): Promise<any[]> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('get_download_tasks', { limit });
+  }
+  return [];
+}
+
+export async function apiGetCacheStats(): Promise<{ total_files: number; total_bytes: number; locked_files: number; locked_bytes: number; max_cache_bytes: number }> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('get_cache_stats');
+  }
+  return {
+    total_files: 10,
+    total_bytes: 45000000,
+    locked_files: 2,
+    locked_bytes: 9000000,
+    max_cache_bytes: 5368709120,
+  };
+}
+
+export async function apiPurgeCache(): Promise<number> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('purge_cache');
+  }
+  console.log('[IPC Mock] Purge cache requested');
+  return 3;
+}
+
+export async function apiVerifyAudioAsset(assetId: string): Promise<boolean> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('verify_audio_asset', { assetId });
+  }
+  return true;
+}
+
+export async function apiSyncMetadataCorrection(correction: any): Promise<string> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('sync_metadata_correction', { correction });
+  }
+  return `sync_mock_${Date.now()}`;
+}
+
+export async function apiTriggerSync(): Promise<number> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('trigger_sync');
+  }
+  return 0;
+}
+
+export async function apiGetSyncStatus(): Promise<{ pending_count: number; in_flight_count: number; synced_count: number; failed_count: number }> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('get_sync_status');
+  }
+  return {
+    pending_count: 0,
+    in_flight_count: 0,
+    synced_count: 5,
+    failed_count: 0,
+  };
+}
+
+
 

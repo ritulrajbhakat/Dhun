@@ -449,5 +449,328 @@ impl Database {
         }
         Ok(list)
     }
+
+    // --- Download Tasks ---
+    pub fn create_download_task(&self, task: &DownloadTask) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO download_tasks (id, url, destination_path, expected_sha256, status, bytes_downloaded, total_bytes, error_message, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                task.id, task.url, task.destination_path, task.expected_sha256,
+                task.status, task.bytes_downloaded, task.total_bytes, task.error_message,
+                task.created_at, task.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_download_progress(&self, task_id: &str, bytes_downloaded: i64, total_bytes: Option<i64>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE download_tasks SET bytes_downloaded = ?1, total_bytes = COALESCE(?2, total_bytes), updated_at = ?3 WHERE id = ?4",
+            params![bytes_downloaded, total_bytes, now, task_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_download_status(&self, task_id: &str, status: &str, error_message: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE download_tasks SET status = ?1, error_message = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, error_message, now, task_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_download_task(&self, task_id: &str) -> Result<Option<DownloadTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, url, destination_path, expected_sha256, status, bytes_downloaded, total_bytes, error_message, created_at, updated_at
+             FROM download_tasks WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![task_id], |row| {
+            Ok(DownloadTask {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                destination_path: row.get(2)?,
+                expected_sha256: row.get(3)?,
+                status: row.get(4)?,
+                bytes_downloaded: row.get(5)?,
+                total_bytes: row.get(6)?,
+                error_message: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_download_tasks(&self, limit: usize) -> Result<Vec<DownloadTask>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, url, destination_path, expected_sha256, status, bytes_downloaded, total_bytes, error_message, created_at, updated_at
+             FROM download_tasks ORDER BY created_at DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(DownloadTask {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                destination_path: row.get(2)?,
+                expected_sha256: row.get(3)?,
+                status: row.get(4)?,
+                bytes_downloaded: row.get(5)?,
+                total_bytes: row.get(6)?,
+                error_message: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+
+        let mut tasks = Vec::new();
+        for r in rows {
+            tasks.push(r?);
+        }
+        Ok(tasks)
+    }
+
+    // --- Cache Manifest & Rolling Eviction ---
+    pub fn upsert_cache_entry(&self, entry: &CacheEntry) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cache_manifest (asset_id, cached_file_path, size_bytes, is_locked, lock_reason, last_accessed_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(asset_id) DO UPDATE SET
+                cached_file_path = excluded.cached_file_path,
+                size_bytes = excluded.size_bytes,
+                is_locked = excluded.is_locked,
+                lock_reason = excluded.lock_reason,
+                last_accessed_at = excluded.last_accessed_at",
+            params![
+                entry.asset_id, entry.cached_file_path, entry.size_bytes,
+                if entry.is_locked { 1 } else { 0 }, entry.lock_reason,
+                entry.last_accessed_at, entry.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_asset_cache_lock(&self, asset_id: &str, is_locked: bool, reason: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE cache_manifest SET is_locked = ?1, lock_reason = ?2, last_accessed_at = ?3 WHERE asset_id = ?4",
+            params![if is_locked { 1 } else { 0 }, reason, now, asset_id],
+        )?;
+        let avail_status = if is_locked { "locked_playback" } else { "available" };
+        let _ = conn.execute(
+            "UPDATE audio_assets SET availability_status = ?1 WHERE id = ?2",
+            params![avail_status, asset_id],
+        );
+        Ok(())
+    }
+
+    pub fn get_cache_entries(&self) -> Result<Vec<CacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT asset_id, cached_file_path, size_bytes, is_locked, lock_reason, last_accessed_at, created_at
+             FROM cache_manifest ORDER BY last_accessed_at ASC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let is_locked_val: i64 = row.get(3)?;
+            Ok(CacheEntry {
+                asset_id: row.get(0)?,
+                cached_file_path: row.get(1)?,
+                size_bytes: row.get(2)?,
+                is_locked: is_locked_val != 0,
+                lock_reason: row.get(4)?,
+                last_accessed_at: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn get_cache_stats(&self, max_cache_bytes: i64) -> Result<CacheStats> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT 
+                COUNT(*) as total_files,
+                COALESCE(SUM(size_bytes), 0) as total_bytes,
+                COALESCE(SUM(CASE WHEN is_locked = 1 THEN 1 ELSE 0 END), 0) as locked_files,
+                COALESCE(SUM(CASE WHEN is_locked = 1 THEN size_bytes ELSE 0 END), 0) as locked_bytes
+             FROM cache_manifest"
+        )?;
+
+        let stats = stmt.query_row([], |row| {
+            let total_files: i64 = row.get(0)?;
+            let total_bytes: i64 = row.get(1)?;
+            let locked_files: i64 = row.get(2)?;
+            let locked_bytes: i64 = row.get(3)?;
+
+            Ok(CacheStats {
+                total_files: total_files as usize,
+                total_bytes,
+                locked_files: locked_files as usize,
+                locked_bytes,
+                max_cache_bytes,
+            })
+        })?;
+
+        Ok(stats)
+    }
+
+    /// Prunes unlocked LRU cache entries when cache size exceeds limit or when requested.
+    /// Returns paths of files that should be deleted from the filesystem.
+    pub fn prune_unlocked_cache_entries(&self, max_bytes: i64) -> Result<Vec<(String, String)>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let total_bytes: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM cache_manifest",
+            [],
+            |r| r.get(0),
+        )?;
+
+        if total_bytes <= max_bytes {
+            return Ok(Vec::new());
+        }
+
+        let bytes_to_free = total_bytes - max_bytes;
+        let mut freed_so_far = 0i64;
+        let mut candidates_to_remove = Vec::new();
+
+        {
+            let mut stmt = tx.prepare(
+                "SELECT asset_id, cached_file_path, size_bytes
+                 FROM cache_manifest
+                 WHERE is_locked = 0
+                 ORDER BY last_accessed_at ASC"
+            )?;
+
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })?;
+
+            for r in rows {
+                let (asset_id, path, size) = r?;
+                candidates_to_remove.push((asset_id, path));
+                freed_so_far += size;
+                if freed_so_far >= bytes_to_free {
+                    break;
+                }
+            }
+        }
+
+        for (asset_id, _) in &candidates_to_remove {
+            tx.execute("DELETE FROM cache_manifest WHERE asset_id = ?1", params![asset_id])?;
+            tx.execute(
+                "UPDATE audio_assets SET availability_status = 'offline' WHERE id = ?1",
+                params![asset_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(candidates_to_remove)
+    }
+
+    // --- Sync Outbox ---
+    pub fn enqueue_sync_item(&self, item: &SyncOutboxItem) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sync_outbox (id, entity_type, entity_id, payload_json, retry_count, status, last_attempt_at, error_message, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                item.id, item.entity_type, item.entity_id, item.payload_json,
+                item.retry_count, item.status, item.last_attempt_at, item.error_message,
+                item.created_at, item.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pending_sync_items(&self, limit: usize) -> Result<Vec<SyncOutboxItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, entity_type, entity_id, payload_json, retry_count, status, last_attempt_at, error_message, created_at, updated_at
+             FROM sync_outbox
+             WHERE status IN ('pending', 'failed') AND retry_count < 5
+             ORDER BY retry_count ASC, created_at ASC LIMIT ?1"
+        )?;
+
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let retry_val: i64 = row.get(4)?;
+            Ok(SyncOutboxItem {
+                id: row.get(0)?,
+                entity_type: row.get(1)?,
+                entity_id: row.get(2)?,
+                payload_json: row.get(3)?,
+                retry_count: retry_val as i32,
+                status: row.get(5)?,
+                last_attempt_at: row.get(6)?,
+                error_message: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn update_sync_item_status(&self, id: &str, status: &str, error: Option<&str>, increment_retry: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let retry_inc = if increment_retry { 1 } else { 0 };
+        conn.execute(
+            "UPDATE sync_outbox
+             SET status = ?1, last_attempt_at = ?2, error_message = ?3, retry_count = retry_count + ?4, updated_at = ?2
+             WHERE id = ?5",
+            params![status, now, error, retry_inc, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_sync_overview(&self) -> Result<SyncStatusOverview> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT
+                COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'in_flight' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'synced' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+             FROM sync_outbox"
+        )?;
+
+        let overview = stmt.query_row([], |row| {
+            let p: i64 = row.get(0)?;
+            let inflight: i64 = row.get(1)?;
+            let s: i64 = row.get(2)?;
+            let f: i64 = row.get(3)?;
+            Ok(SyncStatusOverview {
+                pending_count: p as usize,
+                in_flight_count: inflight as usize,
+                synced_count: s as usize,
+                failed_count: f as usize,
+            })
+        })?;
+
+        Ok(overview)
+    }
 }
 

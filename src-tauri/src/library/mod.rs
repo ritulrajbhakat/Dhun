@@ -1,8 +1,9 @@
 pub mod cache;
+pub mod downloader;
+pub mod ingest;
 pub mod scanner;
 
-#[allow(unused_imports)]
 pub use cache::*;
-#[allow(unused_imports)]
+pub use downloader::*;
+pub use ingest::*;
 pub use scanner::*;
-

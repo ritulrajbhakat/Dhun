@@ -7,11 +7,15 @@ use crate::audio::device::AudioDeviceManager;
 use crate::audio::dsp::crossfader::CrossfaderCurve;
 use crate::audio::telemetry::MasterTelemetry;
 use crate::db::Database;
-use crate::db::models::{GuestRequest, PartySession, Track};
+use crate::db::models::{CacheStats, DownloadTask, GuestRequest, PartySession, SyncStatusOverview, Track};
 use crate::dj::moods::{get_preset_moods, MoodDefinition};
 use crate::dj::scheduler::DjScheduler;
+use crate::library::cache::RollingCacheManager;
+use crate::library::downloader::AudioDownloader;
+use crate::library::ingest::{compute_file_sha256, IngestResult};
 use crate::library::scanner::LibraryScanner;
 use crate::network::LocalPartyServer;
+use crate::sync::{MetadataSyncManager, TrackMetadataCorrection};
 
 #[derive(Clone)]
 pub struct AppContext {
@@ -19,6 +23,9 @@ pub struct AppContext {
     pub audio: Arc<Mutex<AudioEngine>>,
     pub scheduler: Arc<Mutex<Option<DjScheduler>>>,
     pub server: Arc<Mutex<Option<LocalPartyServer>>>,
+    pub cache: Arc<RollingCacheManager>,
+    pub downloader: Arc<AudioDownloader>,
+    pub sync: Arc<MetadataSyncManager>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -374,4 +381,70 @@ pub fn set_party_mood(mood_id: String, state: State<'_, AppContext>) -> Result<(
         }
     }
     Err("No active party session".to_string())
+}
+
+#[tauri::command]
+pub async fn download_track(
+    url: String,
+    expected_sha256: Option<String>,
+    custom_filename: Option<String>,
+    state: State<'_, AppContext>,
+) -> Result<IngestResult, String> {
+    state.downloader
+        .download_audio(&url, expected_sha256.as_deref(), custom_filename.as_deref(), &state.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_download(task_id: String, state: State<'_, AppContext>) -> Result<(), String> {
+    state.downloader.cancel_download(&task_id, &state.db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_download_tasks(limit: Option<usize>, state: State<'_, AppContext>) -> Result<Vec<DownloadTask>, String> {
+    state.db.list_download_tasks(limit.unwrap_or(50)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_cache_stats(state: State<'_, AppContext>) -> Result<CacheStats, String> {
+    state.cache.get_stats(&state.db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn purge_cache(state: State<'_, AppContext>) -> Result<usize, String> {
+    state.cache.purge_unlocked(&state.db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn verify_audio_asset(asset_id: String, state: State<'_, AppContext>) -> Result<bool, String> {
+    let candidates = state.db.get_playable_candidates().map_err(|e| e.to_string())?;
+    if let Some(target) = candidates.into_iter().find(|c| c.asset.id == asset_id) {
+        let p = std::path::Path::new(&target.asset.file_path);
+        if !p.exists() {
+            return Ok(false);
+        }
+        let calculated = compute_file_sha256(p).map_err(|e| e.to_string())?;
+        Ok(calculated.eq_ignore_ascii_case(&target.asset.sha256_hash))
+    } else {
+        Err(format!("Asset '{}' not found", asset_id))
+    }
+}
+
+#[tauri::command]
+pub fn sync_metadata_correction(
+    correction: TrackMetadataCorrection,
+    state: State<'_, AppContext>,
+) -> Result<String, String> {
+    state.sync.enqueue_metadata_correction(&correction, &state.db).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn trigger_sync(state: State<'_, AppContext>) -> Result<usize, String> {
+    state.sync.process_pending_outbox(20, &state.db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_sync_status(state: State<'_, AppContext>) -> Result<SyncStatusOverview, String> {
+    state.sync.get_sync_overview(&state.db).map_err(|e| e.to_string())
 }

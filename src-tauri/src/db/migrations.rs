@@ -34,6 +34,48 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         info!("Migration v1 applied successfully.");
     }
 
+    if current_version < 2 {
+        info!("Applying DHUN schema migration v2 (download_tasks & sync_outbox)...");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS download_tasks (
+                id TEXT PRIMARY KEY NOT NULL,
+                url TEXT NOT NULL,
+                destination_path TEXT NOT NULL,
+                expected_sha256 TEXT,
+                status TEXT NOT NULL,
+                bytes_downloaded INTEGER NOT NULL DEFAULT 0,
+                total_bytes INTEGER,
+                error_message TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_download_tasks_status ON download_tasks(status);
+
+            CREATE TABLE IF NOT EXISTS sync_outbox (
+                id TEXT PRIMARY KEY NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                last_attempt_at INTEGER,
+                error_message TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_outbox_status ON sync_outbox(status);
+            CREATE INDEX IF NOT EXISTS idx_sync_outbox_retry ON sync_outbox(retry_count, status);
+            ",
+        )?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at, description) VALUES (2, ?1, 'Added download_tasks and sync_outbox tables')",
+            params![now],
+        )?;
+        info!("Migration v2 applied successfully.");
+    }
+
     Ok(())
 }
 

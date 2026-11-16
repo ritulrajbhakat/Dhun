@@ -670,5 +670,266 @@ mod tests {
         assert!(recovered.is_ok());
         assert_eq!(dummy.has_device_error.load(Ordering::SeqCst), false);
     }
+
+    #[test]
+    fn test_schema_migration_v2_and_outbox_tables() {
+        let db = Database::new_in_memory().expect("Failed to initialize in-memory DB");
+
+        // Verify download_tasks table CRUD
+        let now = chrono::Utc::now().timestamp_millis();
+        let task = DownloadTask {
+            id: "dl_test_1".to_string(),
+            url: "https://example.com/audio/test_track.mp3".to_string(),
+            destination_path: "/tmp/cache/test_track.mp3".to_string(),
+            expected_sha256: Some("abcd1234ef5678".to_string()),
+            status: "pending".to_string(),
+            bytes_downloaded: 0,
+            total_bytes: Some(10485760),
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        db.create_download_task(&task).expect("Failed to create download task");
+        db.update_download_progress("dl_test_1", 5242880, Some(10485760)).expect("Failed to update download progress");
+        db.update_download_status("dl_test_1", "downloading", None).expect("Failed to update status");
+
+        let fetched = db.get_download_task("dl_test_1").expect("Query failed").expect("Task not found");
+        assert_eq!(fetched.status, "downloading");
+        assert_eq!(fetched.bytes_downloaded, 5242880);
+        assert_eq!(fetched.total_bytes, Some(10485760));
+
+        let tasks = db.list_download_tasks(10).expect("Failed to list tasks");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "dl_test_1");
+    }
+
+    #[test]
+    fn test_managed_rolling_cache_eviction_and_locking() {
+        use dhun_lib::library::cache::RollingCacheManager;
+        use std::fs;
+
+        let db = Database::new_in_memory().expect("Failed to initialize DB");
+        let temp_dir = std::env::temp_dir().join(format!("dhun_test_cache_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let file1_path = temp_dir.join("song1.mp3");
+        let file2_path = temp_dir.join("song2.mp3");
+        let file3_path = temp_dir.join("song3.mp3");
+
+        // Create 3 dummy files of size 100 bytes each
+        fs::write(&file1_path, vec![0u8; 100]).unwrap();
+        fs::write(&file2_path, vec![0u8; 100]).unwrap();
+        fs::write(&file3_path, vec![0u8; 100]).unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // Seed 3 tracks and audio_assets in DB
+        for i in 1..=3 {
+            let trk_id = format!("trk_cache_{}", i);
+            let ast_id = format!("ast_cache_{}", i);
+            let path_str = match i {
+                1 => file1_path.to_string_lossy().to_string(),
+                2 => file2_path.to_string_lossy().to_string(),
+                _ => file3_path.to_string_lossy().to_string(),
+            };
+
+            let track = Track {
+                id: trk_id.clone(),
+                title: format!("Test Song {}", i),
+                artist: "Test Artist".to_string(),
+                album: None,
+                duration_ms: 180000,
+                year: Some(2024),
+                genre: "Bollywood Dance".to_string(),
+                subgenre: None,
+                created_at: now,
+                updated_at: now,
+            };
+
+            let asset = AudioAsset {
+                id: ast_id.clone(),
+                track_id: trk_id.clone(),
+                file_path: path_str.clone(),
+                file_format: "mp3".to_string(),
+                file_size_bytes: 100,
+                sample_rate: 44100,
+                bit_depth: Some(16),
+                channels: 2,
+                sha256_hash: format!("hash_{}", i),
+                verification_status: "verified".to_string(),
+                availability_status: "available".to_string(),
+                last_verified_at: now,
+            };
+
+            let analysis = TrackAnalysis {
+                track_id: trk_id,
+                bpm: 128.0,
+                bpm_confidence: 0.95,
+                key_name: "8B".to_string(),
+                camelot_key: "8B".to_string(),
+                key_confidence: 0.95,
+                time_signature_num: 4,
+                time_signature_den: 4,
+                downbeat_offset_ms: 0,
+                phrase_length_bars: 32,
+                overall_energy: 0.8,
+                dance_suitability: 0.8,
+                recommended_mix_in_ms: 10000,
+                recommended_mix_out_ms: 170000,
+                analysis_version: 1,
+                analyzed_at: now,
+                manual_override: false,
+            };
+
+            db.insert_or_update_track(&track, &asset, &analysis).unwrap();
+
+            // Insert into cache manifest with staggered last_accessed_at
+            let entry = CacheEntry {
+                asset_id: ast_id,
+                cached_file_path: path_str,
+                size_bytes: 100,
+                is_locked: false,
+                lock_reason: None,
+                last_accessed_at: now + (i as i64 * 1000), // song 1 is oldest, song 3 is newest
+                created_at: now,
+            };
+            db.upsert_cache_entry(&entry).unwrap();
+        }
+
+        // Initialize cache manager with max 150 bytes limit (holding 1.5 songs)
+        let cache_mgr = RollingCacheManager::new(&temp_dir, 150);
+
+        // Lock song 1 (oldest accessed, but currently playing on Deck A)
+        cache_mgr.lock_asset("ast_cache_1", Some(&db));
+        assert!(cache_mgr.is_locked("ast_cache_1"));
+
+        // Run rolling cleanup
+        let pruned = cache_mgr.run_cleanup(&db).expect("Cleanup failed");
+        assert!(pruned >= 1, "Should have pruned at least one file to stay under 150 bytes");
+
+        // Song 1 MUST still exist on disk and in cache because it is LOCKED!
+        assert!(file1_path.exists(), "Active deck locked file was evicted!");
+
+        // Song 2 was unlocked and older than song 3, so song 2 should have been evicted
+        assert!(!file2_path.exists(), "Oldest unlocked file was not pruned!");
+
+        // Check stats
+        let stats = cache_mgr.get_stats(&db).expect("Stats query failed");
+        assert_eq!(stats.locked_files, 1);
+        assert!(stats.total_bytes <= 200);
+
+        // Unlock song 1 and test purge
+        cache_mgr.unlock_asset("ast_cache_1", Some(&db));
+        assert!(!cache_mgr.is_locked("ast_cache_1"));
+
+        let purged = cache_mgr.purge_unlocked(&db).expect("Purge failed");
+        assert!(purged >= 1);
+        assert!(!file1_path.exists(), "Purged file was not deleted after unlock!");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_online_metadata_sync_outbox() {
+        use dhun_lib::sync::{MetadataSyncManager, PlaybackSyncEvent, TrackMetadataCorrection};
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let sync_mgr = MetadataSyncManager::new(None); // Local standalone / mock receiver
+
+        let correction = TrackMetadataCorrection {
+            track_id: "trk_01".to_string(),
+            title: Some("Gallan Goodiyaan (Live Festival Edit)".to_string()),
+            artist: Some("Diljit Dosanjh".to_string()),
+            genre: Some("Punjabi Pop".to_string()),
+            bpm: Some(130.0),
+            camelot_key: Some("10B".to_string()),
+            manual_override: true,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let sync_id1 = sync_mgr.enqueue_metadata_correction(&correction, &db).expect("Enqueue failed");
+        assert!(sync_id1.starts_with("sync_"));
+
+        let playback_ev = PlaybackSyncEvent {
+            session_id: "ses_party_01".to_string(),
+            track_id: "trk_01".to_string(),
+            played_at: chrono::Utc::now().timestamp_millis(),
+            duration_played_ms: 120000,
+            was_skipped: false,
+            transition_type: "bass_swap".to_string(),
+        };
+
+        let sync_id2 = sync_mgr.enqueue_playback_event(&playback_ev, &db).expect("Enqueue failed");
+        assert!(sync_id2.starts_with("sync_"));
+
+        // Check pending counts
+        let initial_overview = sync_mgr.get_sync_overview(&db).expect("Overview failed");
+        assert_eq!(initial_overview.pending_count, 2);
+        assert_eq!(initial_overview.synced_count, 0);
+
+        // Process outbox batch asynchronously in tokio runtime
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let synced_count = rt.block_on(async {
+            sync_mgr.process_pending_outbox(10, &db).await.expect("Outbox processing failed")
+        });
+
+        assert_eq!(synced_count, 2);
+
+        let final_overview = sync_mgr.get_sync_overview(&db).expect("Overview failed");
+        assert_eq!(final_overview.pending_count, 0);
+        assert_eq!(final_overview.synced_count, 2);
+    }
+
+    #[test]
+    fn test_downloader_cancellation_and_status() {
+        use dhun_lib::library::downloader::AudioDownloader;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let temp_dir = std::env::temp_dir().join(format!("dhun_dl_test_{}", uuid::Uuid::new_v4()));
+        let downloader = AudioDownloader::new(&temp_dir);
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let task = DownloadTask {
+            id: "dl_cancel_test".to_string(),
+            url: "https://example.com/audio/huge_set.wav".to_string(),
+            destination_path: temp_dir.join("huge_set.wav").to_string_lossy().to_string(),
+            expected_sha256: None,
+            status: "downloading".to_string(),
+            bytes_downloaded: 1024,
+            total_bytes: Some(104857600),
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        db.create_download_task(&task).unwrap();
+        downloader.cancel_download("dl_cancel_test", &db).expect("Cancel failed");
+
+        let task_after = db.get_download_task("dl_cancel_test").unwrap().unwrap();
+        assert_eq!(task_after.status, "cancelled");
+        assert_eq!(task_after.error_message, Some("Cancelled by user".to_string()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_audio_hash_cryptographic_verification() {
+        use dhun_lib::library::ingest::compute_file_sha256;
+        use sha2::{Digest, Sha256};
+
+        let temp_file = std::env::temp_dir().join(format!("dhun_hash_{}.dat", uuid::Uuid::new_v4()));
+        let test_bytes = b"DHUN_AUTOMATIC_DJ_AUDIO_STREAM_TEST_PAYLOAD_12345";
+        std::fs::write(&temp_file, test_bytes).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(test_bytes);
+        let expected_hash = format!("{:x}", hasher.finalize());
+
+        let calculated_hash = compute_file_sha256(&temp_file).expect("Hash calculation failed");
+        assert_eq!(calculated_hash, expected_hash);
+
+        let _ = std::fs::remove_file(&temp_file);
+    }
 }
 
