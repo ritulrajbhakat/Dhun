@@ -19,6 +19,8 @@ pub struct FullAnalysisResult {
     pub beat_grid: Vec<crate::db::models::BeatGridPoint>,
     pub phrase_markers: Vec<crate::db::models::PhraseMarker>,
     pub duration_ms: u64,
+    pub sample_rate: u32,
+    pub channels: u32,
 }
 
 pub fn analyze_track_file<P: AsRef<Path>>(track_id: &str, file_path: P) -> Result<FullAnalysisResult> {
@@ -57,6 +59,8 @@ pub fn analyze_track_file<P: AsRef<Path>>(track_id: &str, file_path: P) -> Resul
         beat_grid,
         phrase_markers,
         duration_ms: decoded.duration_ms,
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels,
     })
 }
 

@@ -32,6 +32,7 @@ pub enum AudioCommand {
     SetEq { deck_id: usize, low_db: f32, mid_db: f32, high_db: f32 },
     SetFilter { deck_id: usize, position: f32 },
     SetCrossfader { position: f32, curve: CrossfaderCurve },
+    StartTransition { target_pos: f32, duration_ms: u32, curve: CrossfaderCurve },
     EmergencyFade { duration_ms: u32 },
     SetMasterVolume { volume: f32 },
 }
@@ -204,6 +205,9 @@ fn process_audio_block(
                 crossfader.set_position(position);
                 crossfader.set_curve(curve);
             }
+            AudioCommand::StartTransition { target_pos, duration_ms, curve } => {
+                crossfader.start_ramp(target_pos, duration_ms, sample_rate, curve);
+            }
             AudioCommand::EmergencyFade { duration_ms } => {
                 let frames = ((duration_ms as f64 / 1000.0) * (sample_rate as f64)).round() as u32;
                 *fade_total = frames.max(1);
@@ -216,21 +220,21 @@ fn process_audio_block(
     }
 
     let frames = data.len() / channels;
-    let (gain_a, gain_b) = crossfader.gains();
-    let (bass_a_db, bass_b_db) = crossfader.bass_attenuations_db();
-
-    // Temporarily apply smart bass swap to Decks A and B EQs if configured
-    if bass_a_db != 0.0 {
-        decks[0].eq.low_db = (decks[0].eq.low_db + bass_a_db).clamp(-48.0, 6.0);
-    }
-    if bass_b_db != 0.0 {
-        decks[1].eq.low_db = (decks[1].eq.low_db + bass_b_db).clamp(-48.0, 6.0);
-    }
-
     let mut peak_master_l: f32 = 0.0;
     let mut peak_master_r: f32 = 0.0;
 
     for frame_idx in 0..frames {
+        // Continuous smooth crossfader interpolation
+        crossfader.tick_frame();
+        let (gain_a, gain_b) = crossfader.gains();
+        let (bass_a_db, bass_b_db) = crossfader.bass_attenuations_db();
+
+        // Apply clean Smart Bass Swap without mutating user EQ state
+        decks[0].eq.set_smart_bass_attenuation(bass_a_db);
+        decks[2].eq.set_smart_bass_attenuation(bass_a_db);
+        decks[1].eq.set_smart_bass_attenuation(bass_b_db);
+        decks[3].eq.set_smart_bass_attenuation(bass_b_db);
+
         // Emergency fade multiplier ramp
         let fade_mult = if *fade_remaining > 0 {
             let mult = *fade_remaining as f32 / *fade_total as f32;
@@ -251,15 +255,16 @@ fn process_audio_block(
         let (d2_l, d2_r) = decks[2].next_frame();
         let (d3_l, d3_r) = decks[3].next_frame();
 
-        // Crossfade Decks 0 (A) and 1 (B)
-        let sum_a_l = d0_l * gain_a;
-        let sum_a_r = d0_r * gain_a;
-        let sum_b_l = d1_l * gain_b;
-        let sum_b_r = d1_r * gain_b;
+        // 4-Deck Crossfading:
+        // Side A: Decks 0 (A) and 2 (C)
+        // Side B: Decks 1 (B) and 3 (D)
+        let ch_a_l = d0_l + d2_l;
+        let ch_a_r = d0_r + d2_r;
+        let ch_b_l = d1_l + d3_l;
+        let ch_b_r = d1_r + d3_r;
 
-        // Sum with aux decks 2 & 3
-        let mixed_l = (sum_a_l + sum_b_l + d2_l + d3_l) * *master_volume * fade_mult;
-        let mixed_r = (sum_a_r + sum_b_r + d2_r + d3_r) * *master_volume * fade_mult;
+        let mixed_l = (ch_a_l * gain_a + ch_b_l * gain_b) * *master_volume * fade_mult;
+        let mixed_r = (ch_a_r * gain_a + ch_b_r * gain_b) * *master_volume * fade_mult;
 
         // Master Limiter Protection
         let (limited_l, limited_r) = limiter.process_sample(mixed_l, mixed_r);
@@ -267,10 +272,13 @@ fn process_audio_block(
         peak_master_l = peak_master_l.max(limited_l.abs());
         peak_master_r = peak_master_r.max(limited_r.abs());
 
-        // Interleaved output
+        // Interleaved output to all available channels
         data[frame_idx * channels] = limited_l;
         if channels > 1 {
             data[frame_idx * channels + 1] = limited_r;
+        }
+        for ch in 2..channels {
+            data[frame_idx * channels + ch] = if ch % 2 == 0 { limited_l } else { limited_r };
         }
     }
 

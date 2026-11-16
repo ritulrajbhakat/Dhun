@@ -21,7 +21,8 @@ pub struct VirtualDeck {
     
     // Decoded audio PCM stereo buffer (interleaved L, R, L, R...)
     samples: Option<Arc<Vec<f32>>>,
-    sample_rate: u32,
+    pub sample_rate: u32,
+    pub output_sample_rate: u32,
     
     // Playhead position in stereo frames (1 frame = 1 L + 1 R)
     pub cursor_frame: f64,
@@ -49,13 +50,14 @@ pub struct VirtualDeck {
 }
 
 impl VirtualDeck {
-    pub fn new(id: usize, sample_rate: u32) -> Self {
+    pub fn new(id: usize, output_sample_rate: u32) -> Self {
         Self {
             id,
             state: TransportState::Stopped,
             track_id: None,
             samples: None,
-            sample_rate,
+            sample_rate: output_sample_rate,
+            output_sample_rate,
             cursor_frame: 0.0,
             cue_frame: 0,
             hot_cues: [None; 8],
@@ -66,8 +68,8 @@ impl VirtualDeck {
             loop_start_frame: 0,
             loop_end_frame: 0,
             gain: 1.0,
-            eq: Eq3Isolator::new(sample_rate as f32),
-            filter: DjFilterSweep::new(sample_rate as f32),
+            eq: Eq3Isolator::new(output_sample_rate as f32),
+            filter: DjFilterSweep::new(output_sample_rate as f32),
             scratch_rate: 0.0,
             is_scratching: false,
         }
@@ -183,13 +185,20 @@ impl VirtualDeck {
         let raw_l = s0_l + frac * (s1_l - s0_l);
         let raw_r = s0_r + frac * (s1_r - s0_r);
 
-        // Advance cursor based on tempo rate or scratch rate
-        let advance = if self.is_scratching {
+        // Resample ratio: converts source sample rate (e.g. 44100) to output hardware sample rate (e.g. 48000)
+        let resample_ratio = if self.output_sample_rate > 0 && self.sample_rate > 0 {
+            self.sample_rate as f64 / self.output_sample_rate as f64
+        } else {
+            1.0
+        };
+
+        // Advance cursor based on tempo rate or scratch rate, scaled by resampling ratio
+        let base_rate = if self.is_scratching {
             self.scratch_rate
         } else {
             self.tempo_rate
         };
-        self.cursor_frame += advance;
+        self.cursor_frame += base_rate * resample_ratio;
 
         // Loop check
         if self.loop_enabled && self.loop_end_frame > self.loop_start_frame {

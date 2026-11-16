@@ -89,7 +89,12 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
         ("Various Artists".to_string(), file_name.trim().to_string())
     };
 
-    let track_id = format!("trk_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
+    let file_path_str = path.to_string_lossy().to_string();
+    let track_id = if let Ok(Some(existing_id)) = db.get_track_id_by_path(&file_path_str) {
+        existing_id
+    } else {
+        format!("trk_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string())
+    };
     let asset_id = format!("ast_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -102,11 +107,11 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
         }
     };
 
-    // 2. Run deterministic analysis with real duration and verification states
-    let (analysis, duration_ms, is_verified) = match analyze_track_file(&track_id, path) {
+    // 2. Run deterministic analysis with real duration, sample rate, channels, and verification states
+    let (analysis, duration_ms, is_verified, sample_rate, channels) = match analyze_track_file(&track_id, path) {
         Ok(res) => {
             let dur = res.duration_ms as i64;
-            (res.analysis, dur, true)
+            (res.analysis, dur, true, res.sample_rate as i64, res.channels as i64)
         }
         Err(e) => {
             warn!("Analysis failed for {:?}: {}. Quarantining track.", path, e);
@@ -129,7 +134,7 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
                 analyzed_at: now,
                 manual_override: false,
             };
-            (unverified_analysis, 0i64, false)
+            (unverified_analysis, 0i64, false, 44100i64, 2i64)
         }
     };
 
@@ -158,12 +163,12 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
     let asset = AudioAsset {
         id: asset_id,
         track_id: track_id.clone(),
-        file_path: path.to_string_lossy().to_string(),
+        file_path: file_path_str,
         file_format: ext.to_string(),
         file_size_bytes: metadata.len() as i64,
-        sample_rate: 44100,
+        sample_rate: sample_rate as i32,
         bit_depth: Some(16),
-        channels: 2,
+        channels: channels as i32,
         sha256_hash,
         verification_status,
         availability_status,

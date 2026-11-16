@@ -99,6 +99,12 @@ impl Database {
                 bit_depth, channels, sha256_hash, verification_status, availability_status, last_verified_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(file_path) DO UPDATE SET
+                track_id = excluded.track_id,
+                file_size_bytes = excluded.file_size_bytes,
+                sample_rate = excluded.sample_rate,
+                bit_depth = excluded.bit_depth,
+                channels = excluded.channels,
+                sha256_hash = excluded.sha256_hash,
                 verification_status = excluded.verification_status,
                 availability_status = excluded.availability_status,
                 last_verified_at = excluded.last_verified_at",
@@ -356,6 +362,35 @@ impl Database {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    pub fn get_track_id_by_path(&self, file_path: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT track_id FROM audio_assets WHERE file_path = ?1")?;
+        let mut rows = stmt.query_map(params![file_path], |row| row.get(0))?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_session_dj_level(&self, session_id: &str, level: i32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE party_sessions SET dj_level = ?1 WHERE id = ?2",
+            params![level, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_session_mood(&self, session_id: &str, mood_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE party_sessions SET primary_mood_id = ?1 WHERE id = ?2",
+            params![mood_id, session_id],
+        )?;
+        Ok(())
     }
 
     // --- Playback History ---

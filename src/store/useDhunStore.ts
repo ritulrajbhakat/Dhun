@@ -15,6 +15,8 @@ import {
   apiDeckControl,
   apiSetCrossfader,
   apiScanLibraryFolder,
+  apiSetDjLevel,
+  apiSetPartyMood,
 } from '../api/ipc';
 
 export type ScreenView = 'home' | 'wizard' | 'live' | 'mixer' | 'library' | 'requests' | 'history' | 'settings' | 'diagnostics';
@@ -67,6 +69,8 @@ interface DhunState {
   loadLocalAudioFile: (deckId: number, file: File) => Promise<void>;
   startBrowserAudio: () => Promise<void>;
   scanFolder: (folderPath: string) => Promise<number>;
+  setDjLevel: (level: number) => Promise<void>;
+  setPartyMood: (moodId: string) => Promise<void>;
 }
 
 const defaultDeckState = (): DeckState => ({
@@ -252,6 +256,21 @@ export const useDhunStore = create<DhunState>((set, get) => ({
     const tracks = await apiGetTracks();
     set({ tracks });
     return count;
+  },
+
+  setDjLevel: async (level: number) => {
+    await apiSetDjLevel(level);
+    set((state) => ({
+      partyStatus: { ...state.partyStatus, dj_level: level as any },
+      selectedDeckCount: level >= 3 ? 4 : 2,
+    }));
+  },
+
+  setPartyMood: async (moodId: string) => {
+    await apiSetPartyMood(moodId);
+    set((state) => ({
+      partyStatus: { ...state.partyStatus, primary_mood_id: moodId },
+    }));
   },
 }));
 

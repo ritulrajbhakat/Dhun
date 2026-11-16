@@ -46,6 +46,7 @@ impl LocalPartyServer {
 
         let app = Router::new()
             .route("/", get(serve_guest_mobile_html))
+            .route("/request", get(serve_guest_mobile_html))
             .route("/api/party/info", get(get_party_info))
             .route("/api/guest/search", get(search_catalog))
             .route("/api/guest/request", post(submit_request))

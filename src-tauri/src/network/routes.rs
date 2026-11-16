@@ -129,15 +129,27 @@ pub async fn get_session_requests(
     Ok(Json(requests))
 }
 
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html<String> {
-    // 100% self-contained, offline-first mobile web application (no external CDN dependencies)
+    let clean_party = escape_html(&state.party_name);
+    let clean_mood = escape_html(&state.primary_mood);
+
+    // 100% self-contained, offline-first mobile web application with strict DOM XSS protection
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>DHUN — {party_name}</title>
+  <title>DHUN — {clean_party}</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -241,7 +253,7 @@ pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html
   <header>
     <div class="logo">DHUN</div>
     <div class="subtitle">Your Party. Your DJ.</div>
-    <div class="badge">{party_name} &bull; {primary_mood}</div>
+    <div class="badge">{clean_party} &bull; {clean_mood}</div>
   </header>
 
   <div class="input-group">
@@ -279,19 +291,41 @@ pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html
         let res = await fetch('/api/guest/search?q=' + encodeURIComponent(query));
         let tracks = await res.json();
         let container = document.getElementById('resultsList');
+        container.innerHTML = '';
         if (!tracks || tracks.length === 0) {{
-          container.innerHTML = '<div style="text-align:center; padding:30px; color:#64748b;">No tracks found</div>';
+          let msg = document.createElement('div');
+          msg.style.cssText = 'text-align:center; padding:30px; color:#64748b;';
+          msg.textContent = 'No tracks found in catalogue';
+          container.appendChild(msg);
           return;
         }}
-        container.innerHTML = tracks.map(t => `
-          <div class="track-card">
-            <div style="min-width:0; flex:1;">
-              <div class="track-title">${{t.title}}</div>
-              <div class="track-artist">${{t.artist}} &bull; ${{t.genre}}</div>
-            </div>
-            <button onclick="requestSong('${{t.id}}', '${{t.title.replace(/'/g, "\\'")}}')" class="btn-req">Request</button>
-          </div>
-        `).join('');
+        tracks.forEach(t => {{
+          let card = document.createElement('div');
+          card.className = 'track-card';
+
+          let info = document.createElement('div');
+          info.style.cssText = 'min-width:0; flex:1;';
+
+          let title = document.createElement('div');
+          title.className = 'track-title';
+          title.textContent = t.title;
+
+          let artist = document.createElement('div');
+          artist.className = 'track-artist';
+          artist.textContent = `${{t.artist}} • ${{t.genre}}`;
+
+          info.appendChild(title);
+          info.appendChild(artist);
+
+          let btn = document.createElement('button');
+          btn.className = 'btn-req';
+          btn.textContent = 'Request';
+          btn.addEventListener('click', () => requestSong(t.id, t.title));
+
+          card.appendChild(info);
+          card.appendChild(btn);
+          container.appendChild(card);
+        }});
       }} catch (err) {{
         console.error(err);
       }}
@@ -323,16 +357,30 @@ pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html
         let requests = await res.json();
         let my = requests.filter(r => r.guest_id === guestId);
         let container = document.getElementById('myRequestsList');
+        container.innerHTML = '';
         if (!my || my.length === 0) {{
-          container.innerHTML = '<div style="color:#64748b; font-style:italic; font-size:12px;">No requests submitted yet.</div>';
+          let msg = document.createElement('div');
+          msg.style.cssText = 'color:#64748b; font-style:italic; font-size:12px;';
+          msg.textContent = 'No requests submitted yet.';
+          container.appendChild(msg);
           return;
         }}
-        container.innerHTML = my.map(r => `
-          <div class="req-item">
-            <span style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:8px;">${{r.track_title || 'Track'}}</span>
-            <span class="status-badge status-${{r.status}}">${{r.status}}</span>
-          </div>
-        `).join('');
+        my.forEach(r => {{
+          let item = document.createElement('div');
+          item.className = 'req-item';
+
+          let title = document.createElement('span');
+          title.style.cssText = 'font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-right:8px;';
+          title.textContent = r.track_title || 'Track';
+
+          let badge = document.createElement('span');
+          badge.className = 'status-badge status-' + r.status;
+          badge.textContent = r.status;
+
+          item.appendChild(title);
+          item.appendChild(badge);
+          container.appendChild(item);
+        }});
       }} catch (err) {{
         console.error(err);
       }}
@@ -345,8 +393,8 @@ pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html
   </script>
 </body>
 </html>"#,
-        party_name = state.party_name,
-        primary_mood = state.primary_mood
+        clean_party = clean_party,
+        clean_mood = clean_mood
     );
 
     Html(html)

@@ -9,6 +9,7 @@ pub struct Eq3Isolator {
     pub low_db: f32,
     pub mid_db: f32,
     pub high_db: f32,
+    pub smart_bass_attenuation_db: f32,
     
     pub low_kill: bool,
     pub mid_kill: bool,
@@ -24,6 +25,7 @@ impl Eq3Isolator {
             low_db: 0.0,
             mid_db: 0.0,
             high_db: 0.0,
+            smart_bass_attenuation_db: 0.0,
             low_kill: false,
             mid_kill: false,
             high_kill: false,
@@ -35,13 +37,30 @@ impl Eq3Isolator {
         self.mid_db = mid_db.clamp(-48.0, 6.0);
         self.high_db = high_db.clamp(-48.0, 6.0);
 
-        let effective_low = if self.low_kill { -96.0 } else { self.low_db };
+        let effective_low = if self.low_kill {
+            -96.0
+        } else {
+            (self.low_db + self.smart_bass_attenuation_db).clamp(-96.0, 6.0)
+        };
         let effective_mid = if self.mid_kill { -96.0 } else { self.mid_db };
         let effective_high = if self.high_kill { -96.0 } else { self.high_db };
 
         self.low_shelf.set_gain_db(effective_low);
         self.mid_peak.set_gain_db(effective_mid);
         self.high_shelf.set_gain_db(effective_high);
+    }
+
+    /// Transient Smart Bass Swap attenuation from crossfader (-36 dB to 0 dB)
+    pub fn set_smart_bass_attenuation(&mut self, atten_db: f32) {
+        if (self.smart_bass_attenuation_db - atten_db).abs() > 0.05 {
+            self.smart_bass_attenuation_db = atten_db;
+            let effective_low = if self.low_kill {
+                -96.0
+            } else {
+                (self.low_db + self.smart_bass_attenuation_db).clamp(-96.0, 6.0)
+            };
+            self.low_shelf.set_gain_db(effective_low);
+        }
     }
 
     pub fn set_kills(&mut self, low_kill: bool, mid_kill: bool, high_kill: bool) {

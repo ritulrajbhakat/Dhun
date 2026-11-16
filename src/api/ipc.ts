@@ -592,3 +592,26 @@ export async function apiScanLibraryFolder(folderPath: string): Promise<number> 
   return MOCK_TRACKS.length;
 }
 
+export async function apiSetDjLevel(level: number): Promise<void> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('set_dj_level', { level });
+  }
+  if (mockPartyState) {
+    mockPartyState.dj_level = level as any;
+  }
+  console.log(`[IPC Mock] Set DJ Level to ${level}`);
+}
+
+export async function apiSetPartyMood(moodId: string): Promise<void> {
+  if (isTauri) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('set_party_mood', { moodId });
+  }
+  if (mockPartyState) {
+    mockPartyState.primary_mood_id = moodId;
+  }
+  console.log(`[IPC Mock] Set Party Mood to ${moodId}`);
+}
+
+

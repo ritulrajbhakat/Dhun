@@ -3,6 +3,7 @@ import { useDhunStore } from '../../store/useDhunStore';
 import { StageVisualFxCanvas, FX_NAMES } from './StageVisualFxCanvas';
 import { AnimatedDjCharacter } from './AnimatedDjCharacter';
 import { webAudioEngine } from '../../audio/WebAudioEngine';
+import { generateQrSvg } from '../../utils/qr';
 import {
   Play,
   Pause,
@@ -106,6 +107,8 @@ export const StageDisplayScreen: React.FC = () => {
   const {
     partyStatus,
     startParty,
+    setDjLevel,
+    setPartyMood,
     setMasterVolume,
     masterVolume,
     emergencyFade,
@@ -268,10 +271,13 @@ export const StageDisplayScreen: React.FC = () => {
 
   const progressPercent = Math.min(100, (currentTimeSec / currentDurationSec) * 100);
 
-  // Dynamic LAN IP
-  const lanHost = typeof window !== 'undefined' && window.location.hostname !== 'localhost'
-    ? `${window.location.hostname}:1420`
-    : '192.168.1.15';
+  // Dynamic LAN host and port (Axum server runs on port 3000)
+  const lanHost = typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
+    ? `${window.location.hostname}:3000`
+    : '192.168.1.15:3000';
+
+  const guestRequestUrl = partyStatus.guest_url || `http://${lanHost}/request`;
+  const qrSvgHtml = partyStatus.qr_svg || generateQrSvg(guestRequestUrl, 144);
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-black select-none font-sans text-white">
@@ -361,7 +367,12 @@ export const StageDisplayScreen: React.FC = () => {
         <div className="relative">
           <select
             value={selectedDjType}
-            onChange={(e) => setSelectedDjType(e.target.value)}
+            onChange={async (e) => {
+              const val = e.target.value;
+              setSelectedDjType(val);
+              const levelMap: Record<string, number> = { Pro: 1, Smart: 2, Advanced: 3, Creative: 4 };
+              await setDjLevel(levelMap[val] || 2);
+            }}
             className="w-52 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
             {djTypes.map((t) => (
@@ -379,9 +390,10 @@ export const StageDisplayScreen: React.FC = () => {
         <div className="relative">
           <select
             value={selectedMood}
-            onChange={(e) => {
-              setSelectedMood(e.target.value);
-              startParty(partyStatus.party_name || 'DHUN Party', 2, e.target.value);
+            onChange={async (e) => {
+              const moodVal = e.target.value;
+              setSelectedMood(moodVal);
+              await setPartyMood(moodVal);
             }}
             className="w-52 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
@@ -495,46 +507,11 @@ export const StageDisplayScreen: React.FC = () => {
           Scan to Request
         </h4>
 
-        {/* Clean, High-Contrast QR Code Box */}
-        <div className="w-32 h-32 md:w-36 md:h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-2.5">
-          <svg viewBox="0 0 100 100" className="w-full h-full">
-            <rect x="0" y="0" width="100" height="100" fill="#ffffff" />
-            {/* Finder pattern Top-Left */}
-            <rect x="8" y="8" width="28" height="28" fill="#000000" />
-            <rect x="13" y="13" width="18" height="18" fill="#ffffff" />
-            <rect x="17" y="17" width="10" height="10" fill="#000000" />
-            {/* Finder pattern Top-Right */}
-            <rect x="64" y="8" width="28" height="28" fill="#000000" />
-            <rect x="69" y="13" width="18" height="18" fill="#ffffff" />
-            <rect x="73" y="17" width="10" height="10" fill="#000000" />
-            {/* Finder pattern Bottom-Left */}
-            <rect x="8" y="64" width="28" height="28" fill="#000000" />
-            <rect x="13" y="69" width="18" height="18" fill="#ffffff" />
-            <rect x="17" y="73" width="10" height="10" fill="#000000" />
-            {/* Data pixels */}
-            <rect x="42" y="10" width="6" height="6" fill="#000000" />
-            <rect x="52" y="14" width="6" height="6" fill="#000000" />
-            <rect x="42" y="24" width="6" height="6" fill="#000000" />
-            <rect x="50" y="30" width="6" height="6" fill="#000000" />
-            <rect x="14" y="44" width="6" height="6" fill="#000000" />
-            <rect x="24" y="48" width="6" height="6" fill="#000000" />
-            <rect x="36" y="42" width="6" height="6" fill="#000000" />
-            <rect x="46" y="46" width="6" height="6" fill="#000000" />
-            <rect x="56" y="42" width="6" height="6" fill="#000000" />
-            <rect x="66" y="46" width="6" height="6" fill="#000000" />
-            <rect x="76" y="42" width="6" height="6" fill="#000000" />
-            <rect x="86" y="46" width="6" height="6" fill="#000000" />
-            <rect x="42" y="64" width="6" height="6" fill="#000000" />
-            <rect x="52" y="68" width="6" height="6" fill="#000000" />
-            <rect x="62" y="64" width="6" height="6" fill="#000000" />
-            <rect x="72" y="68" width="6" height="6" fill="#000000" />
-            <rect x="82" y="64" width="6" height="6" fill="#000000" />
-            <rect x="42" y="82" width="6" height="6" fill="#000000" />
-            <rect x="54" y="86" width="6" height="6" fill="#000000" />
-            <rect x="66" y="82" width="6" height="6" fill="#000000" />
-            <rect x="78" y="86" width="6" height="6" fill="#000000" />
-          </svg>
-        </div>
+        {/* Authentic, High-Contrast QR Code Box */}
+        <div
+          className="w-32 h-32 md:w-36 md:h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-2.5 overflow-hidden [&>svg]:w-full [&>svg]:h-full"
+          dangerouslySetInnerHTML={{ __html: qrSvgHtml }}
+        />
 
         <p className="text-xs font-black tracking-wide text-white uppercase drop-shadow">
           SCAN TO REQUEST

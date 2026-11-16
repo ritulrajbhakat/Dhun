@@ -247,8 +247,9 @@ impl DjScheduler {
 
         // Crossfader target: Decks 1 & 3 are Side B (+1.0), Decks 0 & 2 are Side A (-1.0)
         let target_pos = if to_deck == 1 || to_deck == 3 { 1.0 } else { -1.0 };
-        audio.send_command(AudioCommand::SetCrossfader {
-            position: target_pos,
+        audio.send_command(AudioCommand::StartTransition {
+            target_pos,
+            duration_ms: plan.duration_ms as u32,
             curve: plan.curve,
         })?;
 

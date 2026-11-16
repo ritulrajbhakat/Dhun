@@ -17,6 +17,11 @@ pub struct CrossfaderUnit {
     gain_b: f32,
     bass_attenuation_a_db: f32,
     bass_attenuation_b_db: f32,
+
+    // Continuous smooth ramping
+    target_position: f32,
+    ramp_frames_remaining: u32,
+    ramp_step: f32,
 }
 
 impl CrossfaderUnit {
@@ -28,19 +33,52 @@ impl CrossfaderUnit {
             gain_b: 1.0,
             bass_attenuation_a_db: 0.0,
             bass_attenuation_b_db: 0.0,
+            target_position: 0.0,
+            ramp_frames_remaining: 0,
+            ramp_step: 0.0,
         };
         cf.recalculate();
         cf
     }
 
     pub fn set_position(&mut self, pos: f32) {
+        self.ramp_frames_remaining = 0;
         self.position = pos.clamp(-1.0, 1.0);
+        self.target_position = self.position;
         self.recalculate();
     }
 
     pub fn set_curve(&mut self, curve: CrossfaderCurve) {
         self.curve = curve;
         self.recalculate();
+    }
+
+    /// Begins a continuous smooth transition ramp over duration_ms
+    pub fn start_ramp(&mut self, target_pos: f32, duration_ms: u32, sample_rate: u32, curve: CrossfaderCurve) {
+        self.curve = curve;
+        let clamped_target = target_pos.clamp(-1.0, 1.0);
+        if duration_ms == 0 || sample_rate == 0 {
+            self.set_position(clamped_target);
+            return;
+        }
+
+        let total_frames = ((duration_ms as f64 / 1000.0) * (sample_rate as f64)).round() as u32;
+        self.ramp_frames_remaining = total_frames.max(1);
+        self.target_position = clamped_target;
+        self.ramp_step = (self.target_position - self.position) / (self.ramp_frames_remaining as f32);
+    }
+
+    /// Advance interpolation by one audio frame
+    #[inline(always)]
+    pub fn tick_frame(&mut self) {
+        if self.ramp_frames_remaining > 0 {
+            self.position += self.ramp_step;
+            self.ramp_frames_remaining -= 1;
+            if self.ramp_frames_remaining == 0 {
+                self.position = self.target_position;
+            }
+            self.recalculate();
+        }
     }
 
     pub fn position(&self) -> f32 {

@@ -334,5 +334,62 @@ mod tests {
         assert!(selected.is_some());
         assert_ne!(selected.unwrap().track.id, "t1", "Excluded track t1 must not be selected");
     }
+
+    #[test]
+    fn test_continuous_crossfader_ramping() {
+        let mut cf = CrossfaderUnit::new();
+        cf.set_position(-1.0); // Side A (Deck 0 / 2)
+        assert_eq!(cf.position(), -1.0);
+
+        // Start a 1000-frame ramp toward Side B (+1.0)
+        // duration_ms: 100, sample_rate: 10000 => 1000 frames
+        cf.start_ramp(1.0, 100, 10000, CrossfaderCurve::Linear);
+
+        // After 500 frames, should be at center (0.0)
+        for _ in 0..500 {
+            cf.tick_frame();
+        }
+        assert!((cf.position() - 0.0).abs() < 0.01, "Expected ~0.0 at halfway, got {}", cf.position());
+
+        // After 500 more frames, should reach 1.0
+        for _ in 0..500 {
+            cf.tick_frame();
+        }
+        assert!((cf.position() - 1.0).abs() < 0.001, "Expected 1.0 at completion, got {}", cf.position());
+
+        // Further ticks should remain pegged at target
+        cf.tick_frame();
+        assert_eq!(cf.position(), 1.0);
+    }
+
+    #[test]
+    fn test_session_dj_level_and_mood_updates() {
+        let db = Database::new_in_memory().expect("Failed to initialize in-memory DB");
+        let session = PartySession {
+            id: "ses_update_test".to_string(),
+            party_name: "Baraat Blast".to_string(),
+            start_time: 1000,
+            end_time: None,
+            dj_level: 2,
+            primary_mood_id: "shaadi".to_string(),
+            secondary_mood_id: None,
+            output_device_name: "Default".to_string(),
+            status: "active".to_string(),
+            total_tracks_played: 0,
+            config_json: None,
+        };
+        db.create_session(&session).expect("Failed creating session");
+
+        // Update DJ level to 4
+        db.update_session_dj_level("ses_update_test", 4).expect("Failed updating dj level");
+
+        // Update mood to "punjabi_tashan"
+        db.update_session_mood("ses_update_test", "punjabi_tashan").expect("Failed updating mood");
+
+        let recent = db.get_recent_sessions(1).expect("Failed to get recent sessions");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].dj_level, 4);
+        assert_eq!(recent[0].primary_mood_id, "punjabi_tashan");
+    }
 }
 

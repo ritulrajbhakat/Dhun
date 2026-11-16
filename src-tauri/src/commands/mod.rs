@@ -272,3 +272,31 @@ pub fn force_next_request(request_id: String, state: State<'_, AppContext>) -> R
     }
     Ok(())
 }
+
+#[tauri::command]
+pub fn set_dj_level(level: i32, state: State<'_, AppContext>) -> Result<(), String> {
+    let mut sched_lock = state.scheduler.lock().unwrap();
+    if let Some(sched) = sched_lock.as_mut() {
+        sched.level = crate::dj::levels::DjLevel::from_i32(level);
+        sched.session.dj_level = level;
+        let _ = state.db.update_session_dj_level(&sched.session.id, level);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_party_mood(mood_id: String, state: State<'_, AppContext>) -> Result<(), String> {
+    let mut sched_lock = state.scheduler.lock().unwrap();
+    if let Some(sched) = sched_lock.as_mut() {
+        let preset_moods = get_preset_moods();
+        if let Some(m) = preset_moods.into_iter().find(|m| m.id == mood_id) {
+            sched.mood = m;
+            sched.session.primary_mood_id = mood_id.clone();
+            let _ = state.db.update_session_mood(&sched.session.id, &mood_id);
+            // Refresh upcoming queue and preload next deck based on new mood profile
+            let _ = sched.ensure_queue_populated(&state.db);
+            let _ = sched.preload_next_deck(&state.audio);
+        }
+    }
+    Ok(())
+}

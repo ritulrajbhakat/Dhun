@@ -7,8 +7,8 @@ pub fn generate_party_qr_svg(url: &str) -> Result<String> {
     let image = code
         .render::<svg::Color>()
         .min_dimensions(280, 280)
-        .dark_color(svg::Color("#f43f5e")) // DHUN accent crimson
-        .light_color(svg::Color("#12141a")) // Dark surface background
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
         .build();
     Ok(image)
 }

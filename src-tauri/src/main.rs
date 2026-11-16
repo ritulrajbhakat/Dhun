@@ -79,6 +79,8 @@ async fn main() {
             commands::get_guest_requests,
             commands::update_guest_request_status,
             commands::force_next_request,
+            commands::set_dj_level,
+            commands::set_party_mood,
         ])
         .run(tauri::generate_context!())
         .expect("Error while running DHUN application");
