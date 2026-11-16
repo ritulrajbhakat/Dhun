@@ -22,6 +22,7 @@ pub struct LocalPartyServer {
     pub local_ip: String,
     pub qr_svg: String,
     pub guest_url: String,
+    abort_handle: tokio::task::AbortHandle,
 }
 
 impl LocalPartyServer {
@@ -60,7 +61,7 @@ impl LocalPartyServer {
 
         info!("Local DHUN Guest Server listening on {}", guest_url);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
                 tracing::error!("Local party server error: {}", e);
             }
@@ -71,7 +72,19 @@ impl LocalPartyServer {
             local_ip,
             qr_svg,
             guest_url,
+            abort_handle: task.abort_handle(),
         })
+    }
+
+    pub fn stop(&self) {
+        info!("Stopping LocalPartyServer on port {}", self.port);
+        self.abort_handle.abort();
+    }
+}
+
+impl Drop for LocalPartyServer {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
     }
 }
 

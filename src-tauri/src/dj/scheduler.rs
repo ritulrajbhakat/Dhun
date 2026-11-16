@@ -3,6 +3,7 @@ use tracing::info;
 
 use crate::audio::{AudioCommand, AudioEngine};
 use crate::audio::decoder::decode_audio_file;
+use crate::audio::dsp::crossfader::CrossfaderCurve;
 use crate::db::Database;
 use crate::db::models::{PlayableTrackCandidate, PlaybackHistoryItem, PartySession};
 use crate::dj::levels::DjLevel;
@@ -51,6 +52,15 @@ impl DjScheduler {
             playback_history: Vec::new(),
             current_track_started_at_ms: 0,
         }
+    }
+
+    /// Initializes DJ Scheduler restoring any persistent playback history from SQLite
+    pub fn new_with_db(session: PartySession, db: &Database) -> Self {
+        let mut s = Self::new(session);
+        if let Ok(history) = db.get_session_playback_history(&s.session.id) {
+            s.playback_history = history;
+        }
+        s
     }
 
     /// Helper to get IDs of all tracks currently queued or playing to prevent duplicates
@@ -110,18 +120,19 @@ impl DjScheduler {
         Ok(())
     }
 
-    /// Preloads next track into the designated idle deck in 4-deck rotation
+    /// Preloads next track into the designated idle deck in 2-deck or 4-deck rotation
     pub fn preload_next_deck(&mut self, audio: &AudioEngine) -> Result<()> {
         if let Some(next) = &self.next_track {
-            let target_deck = (self.active_deck + 1) % 4; // 4-deck round-robin
-            info!("Preloading next track '{}' into Deck {}", next.track.title, target_deck);
+            let max_decks = self.level.max_decks();
+            let target_deck = (self.active_deck + 1) % max_decks;
+            info!("Preloading next track '{}' into Deck {} (DJ Level: {:?})", next.track.title, target_deck, self.level);
 
             let decoded = decode_audio_file(&next.asset.file_path)?;
 
-            // Adjust tempo rate if Smart Mixing (Level 2+) to beatmatch active deck
+            // Adjust tempo rate if Smart Mixing (Level 2+) to beatmatch active deck within ±8%
             let rate = if let Some(curr) = &self.current_track {
-                if self.level.supports_auto_sync() && next.analysis.bpm > 0.0 {
-                    (curr.analysis.bpm / next.analysis.bpm).clamp(0.85, 1.15)
+                if self.level.supports_auto_sync() && next.analysis.bpm > 0.0 && curr.analysis.bpm > 0.0 {
+                    (curr.analysis.bpm / next.analysis.bpm).clamp(0.92, 1.08)
                 } else {
                     1.0
                 }
@@ -136,6 +147,22 @@ impl DjScheduler {
                 sample_rate: decoded.sample_rate,
                 bpm: next.analysis.bpm,
             })?;
+
+            // Downbeat & phrase alignment: seek to musical mix-in or downbeat point
+            let cue_point_ms = if next.analysis.recommended_mix_in_ms > 0 {
+                next.analysis.recommended_mix_in_ms as u64
+            } else if next.analysis.downbeat_offset_ms > 0 {
+                next.analysis.downbeat_offset_ms as u64
+            } else {
+                0
+            };
+
+            if cue_point_ms > 0 {
+                audio.send_command(AudioCommand::Seek {
+                    deck_id: target_deck,
+                    position_ms: cue_point_ms,
+                })?;
+            }
 
             audio.send_command(AudioCommand::SetTempoRate {
                 deck_id: target_deck,
@@ -160,6 +187,21 @@ impl DjScheduler {
                     sample_rate: decoded.sample_rate,
                     bpm: next.analysis.bpm,
                 })?;
+
+                let cue_point_ms = if next.analysis.recommended_mix_in_ms > 0 {
+                    next.analysis.recommended_mix_in_ms as u64
+                } else if next.analysis.downbeat_offset_ms > 0 {
+                    next.analysis.downbeat_offset_ms as u64
+                } else {
+                    0
+                };
+                if cue_point_ms > 0 {
+                    let _ = audio.send_command(AudioCommand::Seek {
+                        deck_id: self.active_deck,
+                        position_ms: cue_point_ms,
+                    });
+                }
+
                 audio.send_command(AudioCommand::Play { deck_id: self.active_deck })?;
                 
                 // Record history
@@ -205,8 +247,18 @@ impl DjScheduler {
                 audio.send_command(AudioCommand::Stop { deck_id: self.outgoing_deck })?;
                 self.is_transitioning = false;
 
-                // Mark any requests matching the previous track as 'played'
+                // Mark any requests matching the previous track as 'played' and persist history
                 if let Some(prev) = &self.current_track {
+                    let played_duration = now - self.current_track_started_at_ms;
+                    let _ = db.log_playback(
+                        &self.session.id,
+                        &prev.track.id,
+                        self.outgoing_deck as i32,
+                        played_duration,
+                        false,
+                        "phrase_swap",
+                    );
+
                     if let Ok(requests) = db.get_session_requests(&self.session.id) {
                         for req in requests {
                             if req.track_id == prev.track.id && (req.status == "approved" || req.status == "scheduled") {
@@ -216,8 +268,9 @@ impl DjScheduler {
                     }
                 }
 
-                // Promote incoming deck to active
-                self.active_deck = (self.outgoing_deck + 1) % 4;
+                // Promote incoming deck to active (2-deck or 4-deck rotation)
+                let max_decks = self.level.max_decks();
+                self.active_deck = (self.outgoing_deck + 1) % max_decks;
                 self.current_track = self.next_track.take();
 
                 // Repopulate next and preload next deck
@@ -271,21 +324,35 @@ impl DjScheduler {
         Ok(())
     }
 
-    /// Trigger transition across all 4 decks (0 -> 1 -> 2 -> 3 -> 0)
+    /// Trigger transition across active rotation decks with level-specific crossfader curve
     pub fn trigger_transition(&mut self, audio: &AudioEngine, fast_cut: bool) -> Result<()> {
         if self.next_track.is_none() {
             return Ok(());
         }
 
         let from_deck = self.active_deck;
-        let to_deck = (self.active_deck + 1) % 4; // 4-deck rotation
+        let max_decks = self.level.max_decks();
+        let to_deck = (self.active_deck + 1) % max_decks;
 
-        let plan = if fast_cut {
+        let curve = match self.level {
+            crate::dj::levels::DjLevel::Level1TwoDeckMixer => CrossfaderCurve::EqualPower,
+            crate::dj::levels::DjLevel::Level2SmartMixing | crate::dj::levels::DjLevel::Level3AdvancedPerformance => CrossfaderCurve::BassSwap,
+            crate::dj::levels::DjLevel::Level4CreativeTools => {
+                if fast_cut {
+                    CrossfaderCurve::SharpCut
+                } else {
+                    CrossfaderCurve::BassSwap
+                }
+            }
+        };
+
+        let mut plan = if fast_cut {
             TransitionPlan::quick_cut(from_deck, to_deck)
         } else {
             let bpm = self.current_track.as_ref().map(|t| t.analysis.bpm).unwrap_or(128.0);
             TransitionPlan::default_phrase_swap(from_deck, to_deck, bpm)
         };
+        plan.curve = curve;
 
         self.is_transitioning = true;
         self.outgoing_deck = from_deck;

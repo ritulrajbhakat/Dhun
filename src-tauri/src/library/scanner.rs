@@ -76,18 +76,105 @@ fn infer_genre_from_metadata(file_name: &str, bpm: f64) -> String {
     }
 }
 
+struct ProbedTags {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    genre: Option<String>,
+    year: Option<i32>,
+    bit_depth: Option<i32>,
+}
+
+fn probe_audio_tags(path: &Path) -> ProbedTags {
+    let mut tags = ProbedTags {
+        title: None,
+        artist: None,
+        album: None,
+        genre: None,
+        year: None,
+        bit_depth: None,
+    };
+
+    let Ok(file) = File::open(path) else { return tags; };
+    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = symphonia::core::probe::Hint::new();
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    if let Ok(mut probed) = symphonia::default::get_probe().format(
+        &hint,
+        mss,
+        &symphonia::core::formats::FormatOptions::default(),
+        &symphonia::core::meta::MetadataOptions::default(),
+    ) {
+        if let Some(track) = probed.format.tracks().iter().find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL) {
+            tags.bit_depth = track.codec_params.bits_per_sample.or(track.codec_params.bits_per_coded_sample).map(|b| b as i32);
+        }
+
+        if let Some(meta) = probed.format.metadata().current() {
+            for tag in meta.tags() {
+                if let Some(std_key) = tag.std_key {
+                    match std_key {
+                        symphonia::core::meta::StandardTagKey::TrackTitle if tags.title.is_none() => {
+                            tags.title = Some(tag.value.to_string());
+                        }
+                        symphonia::core::meta::StandardTagKey::Artist if tags.artist.is_none() => {
+                            tags.artist = Some(tag.value.to_string());
+                        }
+                        symphonia::core::meta::StandardTagKey::Album if tags.album.is_none() => {
+                            tags.album = Some(tag.value.to_string());
+                        }
+                        symphonia::core::meta::StandardTagKey::Genre if tags.genre.is_none() => {
+                            tags.genre = Some(tag.value.to_string());
+                        }
+                        symphonia::core::meta::StandardTagKey::Date | symphonia::core::meta::StandardTagKey::ReleaseDate if tags.year.is_none() => {
+                            let s = tag.value.to_string();
+                            if let Ok(y) = s.chars().filter(|c| c.is_ascii_digit()).take(4).collect::<String>().parse::<i32>() {
+                                tags.year = Some(y);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    tags
+}
+
 fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
     let file_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown Track");
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp3");
     let metadata = fs::metadata(path)?;
 
-    // Parse "Artist - Title" format if available
-    let (artist, title) = if file_name.contains(" - ") {
-        let parts: Vec<&str> = file_name.splitn(2, " - ").collect();
-        (parts[0].trim().to_string(), parts[1].trim().to_string())
-    } else {
-        ("Various Artists".to_string(), file_name.trim().to_string())
-    };
+    let probed_tags = probe_audio_tags(path);
+
+    // Prefer ID3/container tags; fallback gracefully to "Artist - Title" filename parsing
+    let title = probed_tags.title
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if file_name.contains(" - ") {
+                file_name.splitn(2, " - ").nth(1).unwrap_or(file_name).trim().to_string()
+            } else {
+                file_name.trim().to_string()
+            }
+        });
+
+    let artist = probed_tags.artist
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if file_name.contains(" - ") {
+                file_name.splitn(2, " - ").next().unwrap_or("Various Artists").trim().to_string()
+            } else {
+                "Various Artists".to_string()
+            }
+        });
+
+    let album = probed_tags.album;
+    let year = probed_tags.year;
+    let bit_depth = probed_tags.bit_depth.or(Some(16));
 
     let file_path_str = path.to_string_lossy().to_string();
     let track_id = if let Ok(Some(existing_id)) = db.get_track_id_by_path(&file_path_str) {
@@ -138,15 +225,17 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
         }
     };
 
-    let genre = infer_genre_from_metadata(file_name, analysis.bpm);
+    let genre = probed_tags.genre
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| infer_genre_from_metadata(file_name, analysis.bpm));
 
     let track = Track {
         id: track_id.clone(),
         title,
         artist,
-        album: None,
+        album,
         duration_ms,
-        year: None,
+        year,
         genre,
         subgenre: None,
         created_at: now,
@@ -167,7 +256,7 @@ fn ingest_audio_file(path: &Path, db: &Database) -> Result<()> {
         file_format: ext.to_string(),
         file_size_bytes: metadata.len() as i64,
         sample_rate: sample_rate as i32,
-        bit_depth: Some(16),
+        bit_depth,
         channels: channels as i32,
         sha256_hash,
         verification_status,

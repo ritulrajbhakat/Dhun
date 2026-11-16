@@ -80,9 +80,30 @@ pub async fn submit_request(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<CreateRequestPayload>,
 ) -> Result<Json<GuestRequest>, (StatusCode, String)> {
-    // 1. Check rate limiter using composite key (IP + guest ID) to prevent local storage reset evasion
+    // 1. Validate guest_id and sanitize input strings
+    let clean_guest_id = payload.guest_id.trim();
+    if clean_guest_id.len() < 3 || clean_guest_id.len() > 64 || !clean_guest_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid guest identifier format.".to_string(),
+        ));
+    }
+
+    let clean_name = payload.display_name.trim();
+    if clean_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Guest display name cannot be empty.".to_string(),
+        ));
+    }
+    let sanitized_display_name: String = clean_name.chars().filter(|c| !c.is_control()).take(50).collect();
+    let sanitized_host_note = payload.host_note.map(|n| {
+        n.trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>()
+    });
+
+    // 2. Check rate limiter using composite key (IP + guest ID) to prevent local storage reset evasion
     let client_ip = addr.ip().to_string();
-    let rate_key = format!("{}:{}", client_ip, payload.guest_id);
+    let rate_key = format!("{}:{}", client_ip, clean_guest_id);
     if !state.rate_limiter.check_and_record(&rate_key) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
@@ -90,7 +111,7 @@ pub async fn submit_request(
         ));
     }
 
-    // 2. Validate that track actually exists and is playable in the catalogue
+    // 3. Validate that track actually exists and is playable in the catalogue
     let candidates = state.db.get_playable_candidates()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     
@@ -104,7 +125,7 @@ pub async fn submit_request(
             )
         })?;
 
-    // 3. Prevent duplicate requests in active queue (pending, approved, or scheduled)
+    // 4. Prevent duplicate requests in active queue (pending, approved, or scheduled)
     let existing_requests = state.db.get_session_requests(&state.session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -122,15 +143,15 @@ pub async fn submit_request(
     let req = GuestRequest {
         id: format!("req_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string()),
         session_id: state.session_id.clone(),
-        guest_id: payload.guest_id,
-        guest_name: Some(payload.display_name),
+        guest_id: clean_guest_id.to_string(),
+        guest_name: Some(sanitized_display_name),
         track_id: target.track.id.clone(),
         track_title: Some(target.track.title),
         track_artist: Some(target.track.artist),
         submitted_at: chrono::Utc::now().timestamp_millis(),
         status: "pending".to_string(),
         priority_order: 100, // standard guest priority
-        host_note: payload.host_note,
+        host_note: sanitized_host_note,
         reviewed_at: None,
         scheduled_slot: None,
     };
@@ -143,8 +164,13 @@ pub async fn submit_request(
 pub async fn get_session_requests(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<GuestRequest>>, (StatusCode, String)> {
-    let requests = state.db.get_session_requests(&state.session_id)
+    let mut requests = state.db.get_session_requests(&state.session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    // Mask guest device IDs for public guest privacy
+    for r in requests.iter_mut() {
+        r.guest_id = "anonymized".to_string();
+    }
     Ok(Json(requests))
 }
 

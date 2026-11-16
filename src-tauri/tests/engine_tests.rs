@@ -511,5 +511,70 @@ mod tests {
         assert!(selected_approved.is_some());
         assert_eq!(selected_approved.unwrap().track.id, "t2", "Approved guest request must be prioritized");
     }
+
+    #[test]
+    fn test_persistent_playback_history_restoration() {
+        let db = Database::new_in_memory().expect("Failed in-memory DB");
+        let session = PartySession {
+            id: "ses_history_test".to_string(),
+            party_name: "Test Party".to_string(),
+            start_time: 1000,
+            end_time: None,
+            dj_level: 2,
+            primary_mood_id: "house_party".to_string(),
+            secondary_mood_id: None,
+            output_device_name: "Default".to_string(),
+            status: "active".to_string(),
+            total_tracks_played: 2,
+            config_json: None,
+        };
+        db.create_session(&session).unwrap();
+
+        // Log 2 tracks played
+        db.log_playback("ses_history_test", "trk_01", 0, 180000, false, "phrase_swap").unwrap();
+        db.log_playback("ses_history_test", "trk_02", 1, 190000, false, "phrase_swap").unwrap();
+
+        // Restore scheduler with new_with_db
+        use dhun_lib::dj::scheduler::DjScheduler;
+        let sched = DjScheduler::new_with_db(session, &db);
+        assert_eq!(sched.playback_history.len(), 2);
+        assert_eq!(sched.playback_history[0].track_id, "trk_01");
+        assert_eq!(sched.playback_history[1].track_id, "trk_02");
+    }
+
+    #[test]
+    fn test_dj_levels_deck_limits_and_rotation() {
+        use dhun_lib::dj::levels::DjLevel;
+
+        let lvl1 = DjLevel::from_i32(1);
+        let lvl2 = DjLevel::from_i32(2);
+        let lvl3 = DjLevel::from_i32(3);
+        let lvl4 = DjLevel::from_i32(4);
+
+        assert_eq!(lvl1.max_decks(), 2);
+        assert_eq!(lvl2.max_decks(), 2);
+        assert_eq!(lvl3.max_decks(), 4);
+        assert_eq!(lvl4.max_decks(), 4);
+
+        assert!(!lvl1.supports_auto_sync());
+        assert!(lvl2.supports_auto_sync());
+        assert!(lvl3.supports_performance_pads());
+        assert!(lvl4.supports_creative_mashup());
+    }
+
+    #[test]
+    fn test_hot_recovery_audio_engine() {
+        use dhun_lib::audio::AudioEngine;
+        use std::sync::atomic::Ordering;
+
+        let mut dummy = AudioEngine::new_dummy();
+        // Simulate a hardware disconnect event
+        dummy.has_device_error.store(true, Ordering::SeqCst);
+
+        // check_and_recover_stream catches error and resets without panicking
+        let recovered = dummy.check_and_recover_stream();
+        assert!(recovered.is_ok());
+        assert_eq!(dummy.has_device_error.load(Ordering::SeqCst), false);
+    }
 }
 

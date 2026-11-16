@@ -41,6 +41,7 @@ pub struct AudioEngine {
     pub cmd_tx: Sender<AudioCommand>,
     telemetry_rx: Receiver<MasterTelemetry>,
     latest_telemetry: Arc<std::sync::Mutex<MasterTelemetry>>,
+    pub has_device_error: Arc<AtomicBool>,
     _is_running: Arc<AtomicBool>,
     _stream: Option<Stream>,
 }
@@ -56,6 +57,7 @@ impl AudioEngine {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<AudioCommand>(256);
         let (telemetry_tx, telemetry_rx) = crossbeam_channel::bounded::<MasterTelemetry>(16);
         let is_running = Arc::new(AtomicBool::new(true));
+        let has_device_error = Arc::new(AtomicBool::new(false));
 
         let dev_manager = AudioDeviceManager::new();
         let device = dev_manager
@@ -88,6 +90,12 @@ impl AudioEngine {
         let mut telemetry_counter = 0;
         let mut underrun_counter = 0u64;
 
+        const SCRATCH_CHUNK_SIZE: usize = 4096;
+
+        let err_cb_f32 = has_device_error.clone();
+        let err_cb_i16 = has_device_error.clone();
+        let err_cb_u16 = has_device_error.clone();
+
         let stream = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 &config,
@@ -109,83 +117,84 @@ impl AudioEngine {
                         sample_rate,
                     );
                 },
-                |err| {
-                    error!("Audio stream error: {}", err);
+                move |err| {
+                    error!("Audio stream error / hardware disconnect: {}", err);
+                    err_cb_f32.store(true, std::sync::atomic::Ordering::SeqCst);
                 },
                 None,
             )?,
             SampleFormat::I16 => {
-                // Pre-allocated float scratch buffer: zero allocations during audio callback
-                let mut float_buf = vec![0.0f32; 16384];
+                // Fixed-size scratch buffer: strictly zero heap allocations during real-time callback
+                let mut float_buf = vec![0.0f32; SCRATCH_CHUNK_SIZE];
                 device.build_output_stream(
                     &config,
                     move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        let len = data.len();
-                        if float_buf.len() < len {
-                            float_buf.resize(len, 0.0);
-                        }
-                        let slice = &mut float_buf[..len];
-                        slice.fill(0.0);
-                        process_audio_block(
-                            slice,
-                            channels as usize,
-                            &mut decks,
-                            &mut crossfader,
-                            &mut limiter,
-                            &mut clock,
-                            &cmd_rx,
-                            &telemetry_tx,
-                            &mut master_volume,
-                            &mut emergency_fade_samples_remaining,
-                            &mut emergency_fade_total_samples,
-                            &mut telemetry_counter,
-                            &mut underrun_counter,
-                            sample_rate,
-                        );
-                        for (i, &sample) in slice.iter().enumerate() {
-                            data[i] = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        for chunk in data.chunks_mut(SCRATCH_CHUNK_SIZE) {
+                            let chunk_len = chunk.len();
+                            let slice = &mut float_buf[..chunk_len];
+                            slice.fill(0.0);
+                            process_audio_block(
+                                slice,
+                                channels as usize,
+                                &mut decks,
+                                &mut crossfader,
+                                &mut limiter,
+                                &mut clock,
+                                &cmd_rx,
+                                &telemetry_tx,
+                                &mut master_volume,
+                                &mut emergency_fade_samples_remaining,
+                                &mut emergency_fade_total_samples,
+                                &mut telemetry_counter,
+                                &mut underrun_counter,
+                                sample_rate,
+                            );
+                            for (i, &sample) in slice.iter().enumerate() {
+                                chunk[i] = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                            }
                         }
                     },
-                    |err| {
-                        error!("Audio stream error: {}", err);
+                    move |err| {
+                        error!("Audio stream error / hardware disconnect: {}", err);
+                        err_cb_i16.store(true, std::sync::atomic::Ordering::SeqCst);
                     },
                     None,
                 )?
             }
             SampleFormat::U16 => {
-                // Pre-allocated float scratch buffer: zero allocations during audio callback
-                let mut float_buf = vec![0.0f32; 16384];
+                // Fixed-size scratch buffer: strictly zero heap allocations during real-time callback
+                let mut float_buf = vec![0.0f32; SCRATCH_CHUNK_SIZE];
                 device.build_output_stream(
                     &config,
                     move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                        let len = data.len();
-                        if float_buf.len() < len {
-                            float_buf.resize(len, 0.0);
-                        }
-                        let slice = &mut float_buf[..len];
-                        slice.fill(0.0);
-                        process_audio_block(
-                            slice,
-                            channels as usize,
-                            &mut decks,
-                            &mut crossfader,
-                            &mut limiter,
-                            &mut clock,
-                            &cmd_rx,
-                            &telemetry_tx,
-                            &mut master_volume,
-                            &mut emergency_fade_samples_remaining,
-                            &mut emergency_fade_total_samples,
-                            &mut telemetry_counter,
-                            &mut underrun_counter,
-                            sample_rate,
-                        );
-                        for (i, &sample) in slice.iter().enumerate() {
-                            data[i] = ((sample.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
+                        for chunk in data.chunks_mut(SCRATCH_CHUNK_SIZE) {
+                            let chunk_len = chunk.len();
+                            let slice = &mut float_buf[..chunk_len];
+                            slice.fill(0.0);
+                            process_audio_block(
+                                slice,
+                                channels as usize,
+                                &mut decks,
+                                &mut crossfader,
+                                &mut limiter,
+                                &mut clock,
+                                &cmd_rx,
+                                &telemetry_tx,
+                                &mut master_volume,
+                                &mut emergency_fade_samples_remaining,
+                                &mut emergency_fade_total_samples,
+                                &mut telemetry_counter,
+                                &mut underrun_counter,
+                                sample_rate,
+                            );
+                            for (i, &sample) in slice.iter().enumerate() {
+                                chunk[i] = ((sample.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
+                            }
                         }
                     },
-                    |err| {
-                        error!("Audio stream error: {}", err);
+                    move |err| {
+                        error!("Audio stream error / hardware disconnect: {}", err);
+                        err_cb_u16.store(true, std::sync::atomic::Ordering::SeqCst);
                     },
                     None,
                 )?
@@ -199,6 +208,7 @@ impl AudioEngine {
             cmd_tx,
             telemetry_rx,
             latest_telemetry: Arc::new(std::sync::Mutex::new(MasterTelemetry::empty())),
+            has_device_error,
             _is_running: is_running,
             _stream: Some(stream),
         })
@@ -212,8 +222,36 @@ impl AudioEngine {
             cmd_tx,
             telemetry_rx,
             latest_telemetry: Arc::new(std::sync::Mutex::new(MasterTelemetry::empty())),
+            has_device_error: Arc::new(AtomicBool::new(false)),
             _is_running: Arc::new(AtomicBool::new(true)),
             _stream: None,
+        }
+    }
+
+    /// Checks if a hardware disconnect or stream error was reported, and attempts hot-recovery
+    pub fn check_and_recover_stream(&mut self) -> Result<bool> {
+        if self.has_device_error.load(std::sync::atomic::Ordering::SeqCst) {
+            self.has_device_error.store(false, std::sync::atomic::Ordering::SeqCst);
+            if self._stream.is_none() {
+                // Headless or dummy fallback mode: reset flag safely without invoking WASAPI handles
+                return Ok(false);
+            }
+
+            tracing::warn!("Audio hardware error detected. Hot-recovering CPAL output stream to system default...");
+            match AudioEngine::new(None) {
+                Ok(recovered) => {
+                    *self = recovered;
+                    tracing::info!("Audio engine stream successfully recovered to system default hardware.");
+                    Ok(true)
+                }
+                Err(e) => {
+                    tracing::error!("Automatic stream recovery failed ({}). Maintaining dummy mode.", e);
+                    *self = AudioEngine::new_dummy();
+                    Ok(false)
+                }
+            }
+        } else {
+            Ok(false)
         }
     }
 

@@ -57,6 +57,18 @@ pub async fn start_party(
     let server_arc = state.server.clone();
     let scheduler_arc = state.scheduler.clone();
 
+    // Stage 0: Cleanly terminate any active party session and silence existing playback
+    *scheduler_arc.lock().unwrap() = None;
+    if let Some(old_server) = server_arc.lock().unwrap().take() {
+        old_server.stop();
+    }
+    {
+        let audio = audio_arc.lock().unwrap();
+        for d in 0..4 {
+            let _ = audio.send_command(AudioCommand::Stop { deck_id: d });
+        }
+    }
+
     // Stage 1: Validate library & mood profile
     let candidates = db.get_playable_candidates().map_err(|e| e.to_string())?;
     if candidates.is_empty() {
@@ -94,15 +106,7 @@ pub async fn start_party(
         config_json: None,
     };
 
-    // Stage 3: Pre-decode and test start playback
-    let mut scheduler = DjScheduler::new(session.clone());
-    {
-        let audio_guard = audio_arc.lock().unwrap();
-        scheduler.start_playback(&*audio_guard, &db)
-            .map_err(|e| format!("Failed to initialize audio playback: {}", e))?;
-    }
-
-    // Stage 4: Start local guest server on port 3000
+    // Stage 3: Start local guest server on port 3000 FIRST (fail-fast if port is unavailable)
     let server = LocalPartyServer::start(
         3000,
         session_id.clone(),
@@ -114,8 +118,30 @@ pub async fn start_party(
     let qr_svg = server.qr_svg.clone();
     let guest_url = server.guest_url.clone();
 
-    // Stage 5: Commit to database & update state
-    db.create_session(&session).map_err(|e| e.to_string())?;
+    // Stage 4: Initialize DJ Scheduler with persistent database history
+    let mut scheduler = DjScheduler::new_with_db(session.clone(), &db);
+
+    // Stage 5: Pre-decode and start playback (with complete rollback on failure)
+    {
+        let audio_guard = audio_arc.lock().unwrap();
+        if let Err(e) = scheduler.start_playback(&*audio_guard, &db) {
+            server.stop();
+            for d in 0..4 {
+                let _ = audio_guard.send_command(AudioCommand::Stop { deck_id: d });
+            }
+            return Err(format!("Failed to initialize audio playback: {}", e));
+        }
+    }
+
+    // Stage 6: Commit session to database (with rollback on failure)
+    if let Err(e) = db.create_session(&session) {
+        server.stop();
+        let audio_guard = audio_arc.lock().unwrap();
+        for d in 0..4 {
+            let _ = audio_guard.send_command(AudioCommand::Stop { deck_id: d });
+        }
+        return Err(format!("Failed to record party session: {}", e));
+    }
 
     let now_playing = scheduler.current_track.clone();
     let next_track = scheduler.next_track.clone();
@@ -124,7 +150,7 @@ pub async fn start_party(
     *server_arc.lock().unwrap() = Some(server);
     *scheduler_arc.lock().unwrap() = Some(scheduler);
 
-    // Continuous autonomous background DJ ticker (every 500ms)
+    // Continuous autonomous background DJ ticker (every 500ms) with hardware hot-recovery
     {
         let sched_bg = scheduler_arc.clone();
         let audio_bg = audio_arc.clone();
@@ -135,7 +161,8 @@ pub async fn start_party(
                 interval.tick().await;
                 let mut guard = sched_bg.lock().unwrap();
                 if let Some(sched) = guard.as_mut() {
-                    let audio_lock = audio_bg.lock().unwrap();
+                    let mut audio_lock = audio_bg.lock().unwrap();
+                    let _ = audio_lock.check_and_recover_stream();
                     if let Err(e) = sched.check_and_auto_transition(&*audio_lock, &db_bg) {
                         tracing::error!("Auto-transition tick error: {}", e);
                     }

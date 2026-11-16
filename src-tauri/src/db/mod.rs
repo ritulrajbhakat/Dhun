@@ -408,5 +408,35 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn get_session_playback_history(&self, session_id: &str) -> Result<Vec<PlaybackHistoryItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT h.id, h.session_id, h.track_id, COALESCE(t.title, 'Unknown Track'), COALESCE(t.artist, 'Various Artists'),
+                    h.deck_id, h.played_at, h.duration_played_ms, h.was_skipped, h.transition_type
+             FROM playback_history h
+             LEFT JOIN tracks t ON h.track_id = t.id
+             WHERE h.session_id = ?1 ORDER BY h.played_at ASC"
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(PlaybackHistoryItem {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                track_id: row.get(2)?,
+                track_title: row.get(3)?,
+                track_artist: row.get(4)?,
+                deck_id: row.get(5)?,
+                played_at: row.get(6)?,
+                duration_played_ms: row.get(7)?,
+                was_skipped: row.get(8)?,
+                transition_type: row.get(9)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
 }
 
