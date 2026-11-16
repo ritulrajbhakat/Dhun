@@ -391,5 +391,125 @@ mod tests {
         assert_eq!(recent[0].dj_level, 4);
         assert_eq!(recent[0].primary_mood_id, "punjabi_tashan");
     }
+
+    #[test]
+    fn test_approved_request_prioritization_and_status_filter() {
+        use dhun_lib::dj::moods::get_preset_moods;
+        use dhun_lib::dj::selector::TrackSelector;
+
+        let moods = get_preset_moods();
+        let mood = moods.iter().find(|m| m.id == "house_party").unwrap();
+
+        let make_candidate = |id: &str, title: &str, bpm: f64| PlayableTrackCandidate {
+            track: Track {
+                id: id.to_string(),
+                title: title.to_string(),
+                artist: "Artist".to_string(),
+                album: None,
+                duration_ms: 200000,
+                year: None,
+                genre: "Bollywood".to_string(),
+                subgenre: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+            asset: AudioAsset {
+                id: format!("ast_{}", id),
+                track_id: id.to_string(),
+                file_path: format!("C:/{}.mp3", id),
+                file_format: "mp3".to_string(),
+                file_size_bytes: 1000,
+                sample_rate: 44100,
+                bit_depth: Some(16),
+                channels: 2,
+                sha256_hash: "hash".to_string(),
+                verification_status: "verified".to_string(),
+                availability_status: "available".to_string(),
+                last_verified_at: 0,
+            },
+            analysis: TrackAnalysis {
+                track_id: id.to_string(),
+                bpm,
+                bpm_confidence: 0.9,
+                key_name: "C Major".to_string(),
+                camelot_key: "8B".to_string(),
+                key_confidence: 0.9,
+                time_signature_num: 4,
+                time_signature_den: 4,
+                downbeat_offset_ms: 0,
+                phrase_length_bars: 32,
+                overall_energy: 0.75,
+                dance_suitability: 0.8,
+                recommended_mix_in_ms: 0,
+                recommended_mix_out_ms: 180000,
+                analysis_version: 1,
+                analyzed_at: 0,
+                manual_override: false,
+            },
+            compatibility_score: 0.0,
+            transition_style: "bass_swap".to_string(),
+        };
+
+        let t1 = make_candidate("t1", "Track 1", 128.0);
+        let t2 = make_candidate("t2", "Track 2", 128.0);
+        let candidates = vec![t1.clone(), t2.clone()];
+
+        // Request for t2 with 'pending' status — must NOT boost t2 over t1
+        let pending_req = vec![GuestRequest {
+            id: "req_pending".to_string(),
+            session_id: "s1".to_string(),
+            guest_id: "g1".to_string(),
+            guest_name: None,
+            track_id: "t2".to_string(),
+            track_title: Some("Track 2".to_string()),
+            track_artist: None,
+            submitted_at: 0,
+            status: "pending".to_string(),
+            priority_order: 100,
+            host_note: None,
+            reviewed_at: None,
+            scheduled_slot: None,
+        }];
+
+        let selected_pending = TrackSelector::score_and_select(
+            &candidates,
+            None,
+            mood,
+            0.75,
+            &[],
+            &pending_req,
+            &[],
+        );
+        assert!(selected_pending.is_some());
+
+        // Approved request for t2 — MUST strictly prioritize t2
+        let approved_req = vec![GuestRequest {
+            id: "req_approved".to_string(),
+            session_id: "s1".to_string(),
+            guest_id: "g1".to_string(),
+            guest_name: None,
+            track_id: "t2".to_string(),
+            track_title: Some("Track 2".to_string()),
+            track_artist: None,
+            submitted_at: 0,
+            status: "approved".to_string(),
+            priority_order: 1, // High priority host approved
+            host_note: None,
+            reviewed_at: None,
+            scheduled_slot: None,
+        }];
+
+        let selected_approved = TrackSelector::score_and_select(
+            &candidates,
+            None,
+            mood,
+            0.75,
+            &[],
+            &approved_req,
+            &[],
+        );
+        assert!(selected_approved.is_some());
+        assert_eq!(selected_approved.unwrap().track.id, "t2", "Approved guest request must be prioritized");
+    }
 }
 

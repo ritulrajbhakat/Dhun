@@ -20,6 +20,8 @@ pub struct DjScheduler {
     pub following_track: Option<PlayableTrackCandidate>,
     pub is_transitioning: bool,
     pub transition_progress: f32, // 0.0 to 1.0
+    pub transition_end_time_ms: i64,
+    pub outgoing_deck: usize,
     pub playback_history: Vec<PlaybackHistoryItem>,
     pub current_track_started_at_ms: i64,
 }
@@ -44,6 +46,8 @@ impl DjScheduler {
             following_track: None,
             is_transitioning: false,
             transition_progress: 0.0,
+            transition_end_time_ms: 0,
+            outgoing_deck: 0,
             playback_history: Vec::new(),
             current_track_started_at_ms: 0,
         }
@@ -64,10 +68,14 @@ impl DjScheduler {
         ids
     }
 
-    /// Selects upcoming tracks with strict history and queue reservation
+    /// Selects upcoming tracks with strict history, queue reservation, and approved-only request boosting
     pub fn ensure_queue_populated(&mut self, db: &Database) -> Result<()> {
         let candidates = db.get_playable_candidates()?;
         let requests = db.get_session_requests(&self.session.id)?;
+        let approved_requests: Vec<_> = requests
+            .into_iter()
+            .filter(|r| r.status == "approved")
+            .collect();
 
         if self.next_track.is_none() {
             let reserved = self.get_reserved_track_ids();
@@ -77,7 +85,7 @@ impl DjScheduler {
                 &self.mood,
                 self.mood.target_energy,
                 &self.playback_history,
-                &requests,
+                &approved_requests,
                 &reserved,
             ) {
                 self.next_track = Some(next);
@@ -92,7 +100,7 @@ impl DjScheduler {
                 &self.mood,
                 self.mood.target_energy,
                 &self.playback_history,
-                &requests,
+                &approved_requests,
                 &reserved,
             ) {
                 self.following_track = Some(following);
@@ -188,21 +196,50 @@ impl DjScheduler {
 
     /// Periodic autonomous tick: monitors real audio clock & playhead, track mix-out points, and auto-transitions
     pub fn check_and_auto_transition(&mut self, audio: &AudioEngine, db: &Database) -> Result<()> {
-        if self.is_transitioning || self.current_track.is_none() {
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // 1. If currently in a transition, check whether the crossfader ramp has completed
+        if self.is_transitioning {
+            if now >= self.transition_end_time_ms {
+                info!("Auto-DJ: Transition ramp complete. Stopping outgoing deck {}", self.outgoing_deck);
+                audio.send_command(AudioCommand::Stop { deck_id: self.outgoing_deck })?;
+                self.is_transitioning = false;
+
+                // Mark any requests matching the previous track as 'played'
+                if let Some(prev) = &self.current_track {
+                    if let Ok(requests) = db.get_session_requests(&self.session.id) {
+                        for req in requests {
+                            if req.track_id == prev.track.id && (req.status == "approved" || req.status == "scheduled") {
+                                let _ = db.update_request_status(&req.id, "played", None);
+                            }
+                        }
+                    }
+                }
+
+                // Promote incoming deck to active
+                self.active_deck = (self.outgoing_deck + 1) % 4;
+                self.current_track = self.next_track.take();
+
+                // Repopulate next and preload next deck
+                self.ensure_queue_populated(db)?;
+                let _ = self.preload_next_deck(audio);
+            }
+            return Ok(());
+        }
+
+        if self.current_track.is_none() {
             return Ok(());
         }
 
         let curr = self.current_track.as_ref().unwrap();
 
-        // 1. Query the actual playhead and playback status from the active virtual deck
-        let (position_ms, is_playing) = if let Some(status) = audio.get_deck_playhead(self.active_deck) {
-            status
-        } else {
-            let elapsed = (chrono::Utc::now().timestamp_millis() - self.current_track_started_at_ms).max(0) as u64;
-            (elapsed, true)
+        // 2. Query the actual playhead and playback status from the active virtual deck
+        let Some((position_ms, is_playing)) = audio.get_deck_playhead(self.active_deck) else {
+            // Strictly wait for authoritative audio-clock telemetry tick, NEVER guess with wall-clock time
+            return Ok(());
         };
 
-        // 2. If the active deck is paused, pause the transition countdown completely
+        // If the active deck is paused, pause the transition countdown completely
         if !is_playing {
             return Ok(());
         }
@@ -220,8 +257,6 @@ impl DjScheduler {
                 curr.track.title, position_ms, mix_out_ms
             );
             self.trigger_transition(audio, false)?;
-            self.ensure_queue_populated(db)?;
-            let _ = self.preload_next_deck(audio);
         }
 
         Ok(())
@@ -242,7 +277,6 @@ impl DjScheduler {
             return Ok(());
         }
 
-        self.is_transitioning = true;
         let from_deck = self.active_deck;
         let to_deck = (self.active_deck + 1) % 4; // 4-deck rotation
 
@@ -252,6 +286,10 @@ impl DjScheduler {
             let bpm = self.current_track.as_ref().map(|t| t.analysis.bpm).unwrap_or(128.0);
             TransitionPlan::default_phrase_swap(from_deck, to_deck, bpm)
         };
+
+        self.is_transitioning = true;
+        self.outgoing_deck = from_deck;
+        self.transition_end_time_ms = chrono::Utc::now().timestamp_millis() + plan.duration_ms as i64;
 
         // Start playback on incoming deck
         audio.send_command(AudioCommand::Play { deck_id: to_deck })?;
@@ -268,20 +306,6 @@ impl DjScheduler {
         if let Some(incoming) = self.next_track.clone() {
             self.record_track_start(&incoming);
         }
-
-        // Stop outgoing deck after transition duration
-        let outgoing_deck = from_deck;
-        let audio_cmd_tx = audio.cmd_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(plan.duration_ms)).await;
-            let _ = audio_cmd_tx.try_send(AudioCommand::Stop { deck_id: outgoing_deck });
-        });
-
-        // Swap state
-        self.active_deck = to_deck;
-        self.current_track = self.next_track.take();
-        self.next_track = self.following_track.take();
-        self.is_transitioning = false;
 
         Ok(())
     }

@@ -61,7 +61,7 @@ impl LocalPartyServer {
         info!("Local DHUN Guest Server listening on {}", guest_url);
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
                 tracing::error!("Local party server error: {}", e);
             }
         });

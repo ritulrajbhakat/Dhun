@@ -1,7 +1,8 @@
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, Json};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -76,10 +77,13 @@ pub async fn search_catalog(
 
 pub async fn submit_request(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<CreateRequestPayload>,
 ) -> Result<Json<GuestRequest>, (StatusCode, String)> {
-    // 1. Check rate limiter
-    if !state.rate_limiter.check_and_record(&payload.guest_id) {
+    // 1. Check rate limiter using composite key (IP + guest ID) to prevent local storage reset evasion
+    let client_ip = addr.ip().to_string();
+    let rate_key = format!("{}:{}", client_ip, payload.guest_id);
+    if !state.rate_limiter.check_and_record(&rate_key) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "Request limit reached. Please wait a few minutes before submitting another song.".to_string(),
@@ -99,6 +103,21 @@ pub async fn submit_request(
                 "Requested track is not found or not available in the active catalogue.".to_string(),
             )
         })?;
+
+    // 3. Prevent duplicate requests in active queue (pending, approved, or scheduled)
+    let existing_requests = state.db.get_session_requests(&state.session_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let is_already_queued = existing_requests.iter().any(|r| {
+        r.track_id == payload.track_id && (r.status == "pending" || r.status == "approved" || r.status == "scheduled")
+    });
+
+    if is_already_queued {
+        return Err((
+            StatusCode::CONFLICT,
+            "This track has already been requested and is currently in the party queue!".to_string(),
+        ));
+    }
 
     let req = GuestRequest {
         id: format!("req_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string()),

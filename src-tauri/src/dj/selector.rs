@@ -83,9 +83,17 @@ impl TrackSelector {
             // 5. Repetition Penalty
             let repetition_penalty = if was_artist_played_recently { 0.35 } else { 0.0 };
 
-            // 6. Guest Request Boost
-            let is_approved_request = approved_requests.iter().any(|r| r.track_id == candidate.track.id);
-            let request_boost = if is_approved_request { 1.5 } else { 0.0 };
+            // 6. Guest Request Boost (STRICT: only applies if status is 'approved')
+            let matching_approved = approved_requests.iter().find(|r| r.track_id == candidate.track.id && r.status == "approved");
+            let request_boost = if let Some(req) = matching_approved {
+                if req.priority_order <= 1 {
+                    2.5
+                } else {
+                    1.5
+                }
+            } else {
+                0.0
+            };
 
             // Deterministic Weighted Sum
             let total_score = (genre_score * 0.25)

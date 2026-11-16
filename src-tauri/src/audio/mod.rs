@@ -115,13 +115,19 @@ impl AudioEngine {
                 None,
             )?,
             SampleFormat::I16 => {
-                let mut float_buf = Vec::new();
+                // Pre-allocated float scratch buffer: zero allocations during audio callback
+                let mut float_buf = vec![0.0f32; 16384];
                 device.build_output_stream(
                     &config,
                     move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        float_buf.resize(data.len(), 0.0);
+                        let len = data.len();
+                        if float_buf.len() < len {
+                            float_buf.resize(len, 0.0);
+                        }
+                        let slice = &mut float_buf[..len];
+                        slice.fill(0.0);
                         process_audio_block(
-                            &mut float_buf,
+                            slice,
                             channels as usize,
                             &mut decks,
                             &mut crossfader,
@@ -136,7 +142,7 @@ impl AudioEngine {
                             &mut underrun_counter,
                             sample_rate,
                         );
-                        for (i, &sample) in float_buf.iter().enumerate() {
+                        for (i, &sample) in slice.iter().enumerate() {
                             data[i] = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                         }
                     },
@@ -147,13 +153,19 @@ impl AudioEngine {
                 )?
             }
             SampleFormat::U16 => {
-                let mut float_buf = Vec::new();
+                // Pre-allocated float scratch buffer: zero allocations during audio callback
+                let mut float_buf = vec![0.0f32; 16384];
                 device.build_output_stream(
                     &config,
                     move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                        float_buf.resize(data.len(), 0.0);
+                        let len = data.len();
+                        if float_buf.len() < len {
+                            float_buf.resize(len, 0.0);
+                        }
+                        let slice = &mut float_buf[..len];
+                        slice.fill(0.0);
                         process_audio_block(
-                            &mut float_buf,
+                            slice,
                             channels as usize,
                             &mut decks,
                             &mut crossfader,
@@ -168,7 +180,7 @@ impl AudioEngine {
                             &mut underrun_counter,
                             sample_rate,
                         );
-                        for (i, &sample) in float_buf.iter().enumerate() {
+                        for (i, &sample) in slice.iter().enumerate() {
                             data[i] = ((sample.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
                         }
                     },
@@ -190,6 +202,19 @@ impl AudioEngine {
             _is_running: is_running,
             _stream: Some(stream),
         })
+    }
+
+    /// Creates a safe fallback audio engine when no hardware output device is connected.
+    pub fn new_dummy() -> Self {
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::bounded::<AudioCommand>(256);
+        let (_telemetry_tx, telemetry_rx) = crossbeam_channel::bounded::<MasterTelemetry>(16);
+        Self {
+            cmd_tx,
+            telemetry_rx,
+            latest_telemetry: Arc::new(std::sync::Mutex::new(MasterTelemetry::empty())),
+            _is_running: Arc::new(AtomicBool::new(true)),
+            _stream: None,
+        }
     }
 
     pub fn send_command(&self, cmd: AudioCommand) -> Result<()> {

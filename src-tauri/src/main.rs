@@ -39,13 +39,12 @@ async fn main() {
     info!("SQLite database path: {:?}", db_path);
     let db = Database::new(&db_path).expect("Failed to initialize DHUN SQLite database with migrations");
 
-    // Initialize CPAL Dedicated Audio Engine
+    // Initialize CPAL Dedicated Audio Engine with graceful recovery (never crash on launch)
     let audio = match AudioEngine::new(None) {
-        Ok(engine) => Arc::new(engine),
+        Ok(engine) => Arc::new(Mutex::new(engine)),
         Err(e) => {
-            tracing::warn!("Could not immediately open hardware audio stream ({}), retrying or using virtual mock", e);
-            // In systems with virtual audio endpoints, provide graceful recovery
-            panic!("Critical audio engine failure: {}", e);
+            tracing::warn!("Could not immediately open audio hardware stream ({}). Starting in on-demand mode.", e);
+            Arc::new(Mutex::new(AudioEngine::new_dummy()))
         }
     };
 

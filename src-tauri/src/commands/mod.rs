@@ -16,7 +16,7 @@ use crate::network::LocalPartyServer;
 #[derive(Clone)]
 pub struct AppContext {
     pub db: Database,
-    pub audio: Arc<AudioEngine>,
+    pub audio: Arc<Mutex<AudioEngine>>,
     pub scheduler: Arc<Mutex<Option<DjScheduler>>>,
     pub server: Arc<Mutex<Option<LocalPartyServer>>>,
 }
@@ -52,6 +52,34 @@ pub async fn start_party(
     let session_id = format!("ses_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
     let now = chrono::Utc::now().timestamp_millis();
 
+    let db = state.db.clone();
+    let audio_arc = state.audio.clone();
+    let server_arc = state.server.clone();
+    let scheduler_arc = state.scheduler.clone();
+
+    // Stage 1: Validate library & mood profile
+    let candidates = db.get_playable_candidates().map_err(|e| e.to_string())?;
+    if candidates.is_empty() {
+        return Err("No playable audio tracks found in library. Please scan an audio folder before starting the party.".to_string());
+    }
+    let preset_moods = get_preset_moods();
+    if !preset_moods.iter().any(|m| m.id == payload.primary_mood_id) {
+        return Err(format!("Unknown mood profile ID: '{}'", payload.primary_mood_id));
+    }
+
+    // Stage 2: Hardware audio stream verification and device selection
+    if !payload.output_device_name.is_empty() && payload.output_device_name != "Default" {
+        match AudioEngine::new(Some(&payload.output_device_name)) {
+            Ok(new_engine) => {
+                let mut audio_lock = audio_arc.lock().unwrap();
+                *audio_lock = new_engine;
+            }
+            Err(e) => {
+                return Err(format!("Failed to initialize selected audio device '{}': {}", payload.output_device_name, e));
+            }
+        }
+    }
+
     let session = PartySession {
         id: session_id.clone(),
         party_name: payload.party_name.clone(),
@@ -66,42 +94,40 @@ pub async fn start_party(
         config_json: None,
     };
 
-    let db = state.db.clone();
-    let audio = state.audio.clone();
-    let server_arc = state.server.clone();
-    let scheduler_arc = state.scheduler.clone();
-
-    // 1. Initialize DJ Scheduler and start playback first (verifies audio pipeline)
+    // Stage 3: Pre-decode and test start playback
     let mut scheduler = DjScheduler::new(session.clone());
-    scheduler.start_playback(&audio, &db).map_err(|e| format!("Failed to initialize audio playback: {}", e))?;
+    {
+        let audio_guard = audio_arc.lock().unwrap();
+        scheduler.start_playback(&*audio_guard, &db)
+            .map_err(|e| format!("Failed to initialize audio playback: {}", e))?;
+    }
 
-    // 2. Playback started successfully! Record session in database
-    state.db.create_session(&session).map_err(|e| e.to_string())?;
-
-    // 3. Start local guest server on port 3000
+    // Stage 4: Start local guest server on port 3000
     let server = LocalPartyServer::start(
         3000,
         session_id.clone(),
         session.party_name.clone(),
         session.primary_mood_id.clone(),
         db.clone(),
-    ).await.map_err(|e| e.to_string())?;
+    ).await.map_err(|e| format!("Failed to start guest server: {}", e))?;
 
     let qr_svg = server.qr_svg.clone();
     let guest_url = server.guest_url.clone();
 
-    *server_arc.lock().unwrap() = Some(server);
+    // Stage 5: Commit to database & update state
+    db.create_session(&session).map_err(|e| e.to_string())?;
 
     let now_playing = scheduler.current_track.clone();
     let next_track = scheduler.next_track.clone();
     let following_track = scheduler.following_track.clone();
 
+    *server_arc.lock().unwrap() = Some(server);
     *scheduler_arc.lock().unwrap() = Some(scheduler);
 
     // Continuous autonomous background DJ ticker (every 500ms)
     {
         let sched_bg = scheduler_arc.clone();
-        let audio_bg = audio.clone();
+        let audio_bg = audio_arc.clone();
         let db_bg = db.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
@@ -109,7 +135,8 @@ pub async fn start_party(
                 interval.tick().await;
                 let mut guard = sched_bg.lock().unwrap();
                 if let Some(sched) = guard.as_mut() {
-                    if let Err(e) = sched.check_and_auto_transition(&audio_bg, &db_bg) {
+                    let audio_lock = audio_bg.lock().unwrap();
+                    if let Err(e) = sched.check_and_auto_transition(&*audio_lock, &db_bg) {
                         tracing::error!("Auto-transition tick error: {}", e);
                     }
                 } else {
@@ -168,47 +195,48 @@ pub fn get_party_status(state: State<'_, AppContext>) -> Result<PartyStatusRespo
 
 #[tauri::command]
 pub fn get_telemetry(state: State<'_, AppContext>) -> MasterTelemetry {
-    state.audio.poll_telemetry().unwrap_or_else(MasterTelemetry::empty)
+    let audio = state.audio.lock().unwrap();
+    audio.poll_telemetry().unwrap_or_else(MasterTelemetry::empty)
 }
 
 #[tauri::command]
 pub fn emergency_fade(duration_ms: u32, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::EmergencyFade { duration_ms }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::EmergencyFade { duration_ms }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn deck_play(deck_id: usize, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::Play { deck_id }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::Play { deck_id }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn deck_pause(deck_id: usize, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::Pause { deck_id }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::Pause { deck_id }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn deck_seek(deck_id: usize, position_ms: u64, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::Seek { deck_id, position_ms }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::Seek { deck_id, position_ms }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn deck_set_tempo(deck_id: usize, rate: f64, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::SetTempoRate { deck_id, rate }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::SetTempoRate { deck_id, rate }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn deck_set_gain(deck_id: usize, gain: f32, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::SetGain { deck_id, gain }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::SetGain { deck_id, gain }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn deck_set_eq(deck_id: usize, low_db: f32, mid_db: f32, high_db: f32, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::SetEq { deck_id, low_db, mid_db, high_db }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::SetEq { deck_id, low_db, mid_db, high_db }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn deck_set_filter(deck_id: usize, position: f32, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::SetFilter { deck_id, position }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::SetFilter { deck_id, position }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -219,12 +247,12 @@ pub fn set_crossfader(position: f32, curve: String, state: State<'_, AppContext>
         "bass_swap" => CrossfaderCurve::BassSwap,
         _ => CrossfaderCurve::EqualPower,
     };
-    state.audio.send_command(AudioCommand::SetCrossfader { position, curve: cf_curve }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::SetCrossfader { position, curve: cf_curve }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn set_master_volume(volume: f32, state: State<'_, AppContext>) -> Result<(), String> {
-    state.audio.send_command(AudioCommand::SetMasterVolume { volume }).map_err(|e| e.to_string())
+    state.audio.lock().unwrap().send_command(AudioCommand::SetMasterVolume { volume }).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -266,12 +294,26 @@ pub fn update_guest_request_status(
 pub fn force_next_request(request_id: String, state: State<'_, AppContext>) -> Result<(), String> {
     let mut sched_lock = state.scheduler.lock().unwrap();
     if let Some(sched) = sched_lock.as_mut() {
-        let candidates = state.db.get_playable_candidates().map_err(|e| e.to_string())?;
-        if let Some(target) = candidates.into_iter().find(|c| c.track.id == request_id) {
-            sched.force_next_override(target, &state.audio).map_err(|e| e.to_string())?;
+        let requests = state.db.get_session_requests(&sched.session.id).map_err(|e| e.to_string())?;
+        if let Some(req) = requests.into_iter().find(|r| r.id == request_id) {
+            let candidates = state.db.get_playable_candidates().map_err(|e| e.to_string())?;
+            if let Some(target) = candidates.into_iter().find(|c| c.track.id == req.track_id) {
+                let audio = state.audio.lock().unwrap();
+                sched.force_next_override(target, &*audio).map_err(|e| e.to_string())?;
+                let _ = state.db.update_request_status(&request_id, "scheduled", Some(1));
+                return Ok(());
+            }
+        } else {
+            // Check if request_id directly references a track in candidates
+            let candidates = state.db.get_playable_candidates().map_err(|e| e.to_string())?;
+            if let Some(target) = candidates.into_iter().find(|c| c.track.id == request_id) {
+                let audio = state.audio.lock().unwrap();
+                sched.force_next_override(target, &*audio).map_err(|e| e.to_string())?;
+                return Ok(());
+            }
         }
     }
-    Ok(())
+    Err("Could not find request or schedule track".to_string())
 }
 
 #[tauri::command]
@@ -297,7 +339,8 @@ pub fn set_party_mood(mood_id: String, state: State<'_, AppContext>) -> Result<(
             state.db.update_session_mood(&sched.session.id, &mood_id).map_err(|e| e.to_string())?;
             // Refresh upcoming queue and preload next deck based on new mood profile
             sched.ensure_queue_populated(&state.db).map_err(|e| e.to_string())?;
-            sched.preload_next_deck(&state.audio).map_err(|e| e.to_string())?;
+            let audio = state.audio.lock().unwrap();
+            sched.preload_next_deck(&*audio).map_err(|e| e.to_string())?;
             return Ok(());
         } else {
             return Err(format!("Unknown mood profile ID: '{}'", mood_id));
