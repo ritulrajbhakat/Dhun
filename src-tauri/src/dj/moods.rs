@@ -239,3 +239,9 @@ pub fn get_preset_moods() -> Vec<MoodDefinition> {
     ]
 }
 
+pub fn get_mood_by_id(id: &str) -> Option<MoodDefinition> {
+    get_preset_moods()
+        .into_iter()
+        .find(|m| m.id.eq_ignore_ascii_case(id))
+}
+

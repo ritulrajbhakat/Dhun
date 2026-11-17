@@ -1,463 +1,338 @@
-// WebAudio Real-Time DJ Synthesizer & Audio Engine for Browser Mode
-// Provides real audio playback in browser tabs (Brave, Chrome, Edge, Firefox)
+// DHUN 4-Deck Web Audio Real-Time Mixing Engine
+// Architected for 4-deck capability across all 4 DJ levels (Levels 1-2 expose 2 decks; Levels 3-4 expose 4 decks).
+// Real-time audio processing is strictly isolated from React rendering, network I/O, and database operations.
 
-class BrowserAudioEngine {
+export type TransitionStyle = 'bass_swap' | 'quick_cut' | 'phrase_sync' | 'filter_sweep';
+
+interface WebAudioDeckChain {
+  deckId: number;
+  channelGain: GainNode;
+  eqLow: BiquadFilterNode;
+  eqMid: BiquadFilterNode;
+  eqHigh: BiquadFilterNode;
+  filter: BiquadFilterNode;
+  crossfadeGain: GainNode;
+  buffer: AudioBuffer | null;
+  sourceNode: AudioBufferSourceNode | null;
+  trackId: string | null;
+  bpm: number;
+  keyName: string;
+  isPlaying: boolean;
+  startedAtCtxTime: number;
+  offsetSec: number;
+}
+
+export interface WebAudioDeckStatus {
+  deckId: number;
+  trackId: string | null;
+  isLoaded: boolean;
+  isPlaying: boolean;
+  positionSec: number;
+  durationSec: number;
+  bpm: number;
+  keyName: string;
+}
+
+class FourDeckWebAudioEngine {
   private ctx: AudioContext | null = null;
   private masterGain: GainNode | null = null;
+  private limiter: DynamicsCompressorNode | null = null;
   private analyser: AnalyserNode | null = null;
-  private currentKeyName: string = 'D Major';
-  
-  // Deck A nodes
-  private deckAGain: GainNode | null = null;
-  private deckALow: BiquadFilterNode | null = null;
-  private deckAMid: BiquadFilterNode | null = null;
-  private deckAHigh: BiquadFilterNode | null = null;
-  private deckAFilter: BiquadFilterNode | null = null;
-  private crossfaderAGain: GainNode | null = null;
+  private decks: WebAudioDeckChain[] = [];
+  private crossfaderPos = -1.0; // -1.0 = Left group (Decks 0,2), +1.0 = Right group (Decks 1,3)
 
-  // Deck B nodes
-  private deckBGain: GainNode | null = null;
-  private deckBLow: BiquadFilterNode | null = null;
-  private deckBMid: BiquadFilterNode | null = null;
-  private deckBHigh: BiquadFilterNode | null = null;
-  private deckBFilter: BiquadFilterNode | null = null;
-  private crossfaderBGain: GainNode | null = null;
-
-  // Sequencer state
-  private isPlaying = false;
-  private activeDeck = 0; // 0 = Deck A, 1 = Deck B
-  private currentBpm = 128;
-  private currentRootFreq = 146.83; // D3 for Gallan Goodiyaan (D Major)
-  private stepIndex = 0;
-  private nextStepTime = 0;
-  private timerId: number | null = null;
-
-  // Custom Audio Buffer Sources
-  private deckABufferSource: AudioBufferSourceNode | null = null;
-  private deckBBufferSource: AudioBufferSourceNode | null = null;
-
-  public init() {
+  public init(): void {
     if (this.ctx) return;
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (typeof window === 'undefined') return;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) return;
-    
+
     this.ctx = new AudioCtx();
 
-    // Master bus & Analyser
+    // Master bus -> Brickwall Limiter -> Analyser -> System Speakers
     this.masterGain = this.ctx.createGain();
-    this.masterGain.gain.setValueAtTime(0.8, this.ctx.currentTime);
+    this.masterGain.gain.setValueAtTime(0.85, this.ctx.currentTime);
+
+    this.limiter = this.ctx.createDynamicsCompressor();
+    this.limiter.threshold.setValueAtTime(-1.0, this.ctx.currentTime);
+    this.limiter.knee.setValueAtTime(0.0, this.ctx.currentTime);
+    this.limiter.ratio.setValueAtTime(20.0, this.ctx.currentTime);
+    this.limiter.attack.setValueAtTime(0.002, this.ctx.currentTime);
+    this.limiter.release.setValueAtTime(0.05, this.ctx.currentTime);
 
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 256;
     this.analyser.smoothingTimeConstant = 0.8;
 
-    this.masterGain.connect(this.analyser);
+    this.masterGain.connect(this.limiter);
+    this.limiter.connect(this.analyser);
     this.analyser.connect(this.ctx.destination);
 
-    // Deck A Chain
-    this.deckAGain = this.ctx.createGain();
-    this.deckALow = this.ctx.createBiquadFilter();
-    this.deckALow.type = 'lowshelf';
-    this.deckALow.frequency.value = 250;
+    // Build all 4 independent deck DSP chains (Decks 0, 1, 2, 3)
+    this.decks = [0, 1, 2, 3].map((deckId) => {
+      const ctx = this.ctx!;
+      const channelGain = ctx.createGain();
+      channelGain.gain.setValueAtTime(1.0, ctx.currentTime);
 
-    this.deckAMid = this.ctx.createBiquadFilter();
-    this.deckAMid.type = 'peaking';
-    this.deckAMid.frequency.value = 1000;
-    this.deckAMid.Q.value = 1.0;
+      const eqLow = ctx.createBiquadFilter();
+      eqLow.type = 'lowshelf';
+      eqLow.frequency.value = 250;
 
-    this.deckAHigh = this.ctx.createBiquadFilter();
-    this.deckAHigh.type = 'highshelf';
-    this.deckAHigh.frequency.value = 4000;
+      const eqMid = ctx.createBiquadFilter();
+      eqMid.type = 'peaking';
+      eqMid.frequency.value = 1000;
+      eqMid.Q.value = 1.0;
 
-    this.deckAFilter = this.ctx.createBiquadFilter();
-    this.deckAFilter.type = 'allpass'; // neutral by default
+      const eqHigh = ctx.createBiquadFilter();
+      eqHigh.type = 'highshelf';
+      eqHigh.frequency.value = 4000;
 
-    this.crossfaderAGain = this.ctx.createGain();
-    this.crossfaderAGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'allpass';
 
-    // Connect Deck A
-    this.deckAGain.connect(this.deckALow);
-    this.deckALow.connect(this.deckAMid);
-    this.deckAMid.connect(this.deckAHigh);
-    this.deckAHigh.connect(this.deckAFilter);
-    this.deckAFilter.connect(this.crossfaderAGain);
-    this.crossfaderAGain.connect(this.masterGain);
+      const crossfadeGain = ctx.createGain();
+      // Default Deck 0 active on left side
+      crossfadeGain.gain.setValueAtTime(deckId === 0 ? 1.0 : 0.0, ctx.currentTime);
 
-    // Deck B Chain
-    this.deckBGain = this.ctx.createGain();
-    this.deckBLow = this.ctx.createBiquadFilter();
-    this.deckBLow.type = 'lowshelf';
-    this.deckBLow.frequency.value = 250;
+      channelGain.connect(eqLow);
+      eqLow.connect(eqMid);
+      eqMid.connect(eqHigh);
+      eqHigh.connect(filter);
+      filter.connect(crossfadeGain);
+      crossfadeGain.connect(this.masterGain!);
 
-    this.deckBMid = this.ctx.createBiquadFilter();
-    this.deckBMid.type = 'peaking';
-    this.deckBMid.frequency.value = 1000;
-    this.deckBMid.Q.value = 1.0;
-
-    this.deckBHigh = this.ctx.createBiquadFilter();
-    this.deckBHigh.type = 'highshelf';
-    this.deckBHigh.frequency.value = 4000;
-
-    this.deckBFilter = this.ctx.createBiquadFilter();
-    this.deckBFilter.type = 'allpass';
-
-    this.crossfaderBGain = this.ctx.createGain();
-    this.crossfaderBGain.gain.setValueAtTime(0.0, this.ctx.currentTime);
-
-    // Connect Deck B
-    this.deckBGain.connect(this.deckBLow);
-    this.deckBLow.connect(this.deckBMid);
-    this.deckBMid.connect(this.deckBHigh);
-    this.deckBHigh.connect(this.deckBFilter);
-    this.deckBFilter.connect(this.crossfaderBGain);
-    this.crossfaderBGain.connect(this.masterGain);
+      return {
+        deckId,
+        channelGain,
+        eqLow,
+        eqMid,
+        eqHigh,
+        filter,
+        crossfadeGain,
+        buffer: null,
+        sourceNode: null,
+        trackId: null,
+        bpm: 124,
+        keyName: 'C Major',
+        isPlaying: false,
+        startedAtCtxTime: 0,
+        offsetSec: 0,
+      };
+    });
   }
 
-  public async ensureRunning() {
+  public async ensureRunning(): Promise<void> {
     this.init();
     if (this.ctx && this.ctx.state === 'suspended') {
       await this.ctx.resume();
     }
   }
 
-  public startPlayback(bpm = 128, keyName = 'D Major') {
-    this.ensureRunning();
-    this.currentBpm = bpm;
-    this.currentKeyName = keyName;
-    this.currentRootFreq = this.parseKeyFrequency(keyName);
-    this.isPlaying = true;
-
-    if (!this.timerId && this.ctx) {
-      this.nextStepTime = this.ctx.currentTime + 0.05;
-      this.stepIndex = 0;
-      this.scheduler();
-    }
+  public getDeckCount(): number {
+    return 4;
   }
 
-  public getWaveformData(outputArray?: Uint8Array): Uint8Array {
-    if (!this.analyser) {
-      return outputArray || new Uint8Array(128).fill(128);
+  /// Prepares an authorized cached audio buffer onto an idle deck without interrupting
+  /// any currently playing deck.
+  public async prepareAuthorizedDeckBuffer(
+    deckId: number,
+    audioBytes: ArrayBuffer,
+    meta: { trackId: string; bpm?: number; keyName?: string }
+  ): Promise<boolean> {
+    await this.ensureRunning();
+    if (!this.ctx || deckId < 0 || deckId >= this.decks.length) return false;
+    const deck = this.decks[deckId];
+    if (deck.isPlaying) {
+      // Never interrupt a currently playing deck during preparation
+      return false;
     }
-    const arr = outputArray || new Uint8Array(this.analyser.frequencyBinCount);
-    this.analyser.getByteTimeDomainData(arr as any);
-    return arr;
+
+    const decoded = await this.ctx.decodeAudioData(audioBytes.slice(0));
+    deck.buffer = decoded;
+    deck.trackId = meta.trackId;
+    deck.bpm = meta.bpm || 124;
+    deck.keyName = meta.keyName || 'C Major';
+    deck.offsetSec = 0;
+    return true;
   }
 
-  public stopPlayback() {
-    this.isPlaying = false;
-    if (this.timerId) {
-      window.clearTimeout(this.timerId);
-      this.timerId = null;
+  public startDeck(deckId: number, playbackRate: number = 1.0): boolean {
+    if (!this.ctx || deckId < 0 || deckId >= this.decks.length) return false;
+    const deck = this.decks[deckId];
+    if (!deck.buffer) return false;
+
+    if (deck.sourceNode) {
+      try {
+        deck.sourceNode.stop();
+        deck.sourceNode.disconnect();
+      } catch {}
     }
-    if (this.deckABufferSource) {
-      try { this.deckABufferSource.stop(); } catch {}
-      this.deckABufferSource = null;
-    }
-    if (this.deckBBufferSource) {
-      try { this.deckBBufferSource.stop(); } catch {}
-      this.deckBBufferSource = null;
-    }
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = deck.buffer;
+    src.playbackRate.setValueAtTime(playbackRate, this.ctx.currentTime);
+    src.connect(deck.channelGain);
+    src.onended = () => {
+      if (deck.sourceNode === src) {
+        deck.isPlaying = false;
+        deck.sourceNode = null;
+      }
+    };
+
+    src.start(0, deck.offsetSec);
+    deck.sourceNode = src;
+    deck.startedAtCtxTime = this.ctx.currentTime - deck.offsetSec;
+    deck.isPlaying = true;
+    return true;
   }
 
-  public emergencyFade(durationMs = 300) {
-    if (!this.ctx || !this.masterGain) return;
+  public stopDeck(deckId: number): void {
+    if (deckId < 0 || deckId >= this.decks.length) return;
+    const deck = this.decks[deckId];
+    if (deck.sourceNode) {
+      try {
+        deck.sourceNode.stop();
+        deck.sourceNode.disconnect();
+      } catch {}
+      deck.sourceNode = null;
+    }
+    deck.isPlaying = false;
+    deck.offsetSec = 0;
+  }
+
+  /// Sample-accurate Web Audio automated transition (equal-power / bass-swap / quick-cut / filter-sweep)
+  /// executed completely inside the Web Audio native parameter timeline.
+  public triggerAutomatedTransition(
+    fromDeckId: number,
+    toDeckId: number,
+    durationSec: number,
+    style: TransitionStyle
+  ): boolean {
+    if (!this.ctx) return false;
+    const fromDeck = this.decks[fromDeckId];
+    const toDeck = this.decks[toDeckId];
+    if (!fromDeck || !toDeck || !toDeck.buffer) return false;
+
     const now = this.ctx.currentTime;
-    this.masterGain.gain.cancelScheduledValues(now);
-    this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-    this.masterGain.gain.linearRampToValueAtTime(0.0001, now + durationMs / 1000);
+    const dur = style === 'quick_cut' ? 0.25 : Math.max(0.5, durationSec);
+    const mid = now + dur * 0.5;
+
+    if (!toDeck.isPlaying) {
+      this.startDeck(toDeckId, 1.0);
+    }
+
+    // Crossfade gain ramps
+    fromDeck.crossfadeGain.gain.cancelScheduledValues(now);
+    toDeck.crossfadeGain.gain.cancelScheduledValues(now);
+    fromDeck.crossfadeGain.gain.setValueAtTime(fromDeck.crossfadeGain.gain.value, now);
+    toDeck.crossfadeGain.gain.setValueAtTime(0.0, now);
+
+    fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);
+    toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, now + dur);
+
+    // Style-specific DSP automation
+    if (style === 'bass_swap') {
+      toDeck.eqLow.gain.setValueAtTime(-24, now);
+      toDeck.eqLow.gain.setValueAtTime(-24, mid - 0.05);
+      toDeck.eqLow.gain.linearRampToValueAtTime(0, mid + 0.1);
+      fromDeck.eqLow.gain.setValueAtTime(0, now);
+      fromDeck.eqLow.gain.setValueAtTime(0, mid - 0.05);
+      fromDeck.eqLow.gain.linearRampToValueAtTime(-24, mid + 0.1);
+    } else if (style === 'filter_sweep') {
+      fromDeck.filter.type = 'highpass';
+      fromDeck.filter.frequency.setValueAtTime(80, now);
+      fromDeck.filter.frequency.exponentialRampToValueAtTime(4200, now + dur);
+    }
+
+    return true;
+  }
+
+  public setMasterVolume(vol: number): void {
+    if (!this.masterGain || !this.ctx) return;
+    const clamped = Math.max(0, Math.min(1.2, vol));
+    this.masterGain.gain.setTargetAtTime(clamped, this.ctx.currentTime, 0.03);
+  }
+
+  public setCrossfader(pos: number): void {
+    this.crossfaderPos = Math.max(-1, Math.min(1, pos));
+    if (!this.ctx || this.decks.length < 4) return;
+
+    const norm = (this.crossfaderPos + 1) / 2;
+    const gainLeft = Math.cos(norm * Math.PI * 0.5);
+    const gainRight = Math.sin(norm * Math.PI * 0.5);
+    const t = this.ctx.currentTime;
+
+    this.decks[0].crossfadeGain.gain.setTargetAtTime(gainLeft, t, 0.02);
+    this.decks[2].crossfadeGain.gain.setTargetAtTime(gainLeft, t, 0.02);
+    this.decks[1].crossfadeGain.gain.setTargetAtTime(gainRight, t, 0.02);
+    this.decks[3].crossfadeGain.gain.setTargetAtTime(gainRight, t, 0.02);
+  }
+
+  public setDeckEq(deckId: number, lowDb: number, midDb: number, highDb: number): void {
+    if (!this.ctx || !this.decks[deckId]) return;
+    const d = this.decks[deckId];
+    const t = this.ctx.currentTime;
+    d.eqLow.gain.setTargetAtTime(lowDb, t, 0.03);
+    d.eqMid.gain.setTargetAtTime(midDb, t, 0.03);
+    d.eqHigh.gain.setTargetAtTime(highDb, t, 0.03);
+  }
+
+  public setDeckGain(deckId: number, gain: number): void {
+    if (!this.ctx || !this.decks[deckId]) return;
+    this.decks[deckId].channelGain.gain.setTargetAtTime(gain, this.ctx.currentTime, 0.03);
+  }
+
+  public setDeckFilter(deckId: number, pos: number): void {
+    if (!this.ctx || !this.decks[deckId]) return;
+    const f = this.decks[deckId].filter;
+    const t = this.ctx.currentTime;
+    if (Math.abs(pos) < 0.05) {
+      f.type = 'allpass';
+    } else if (pos < 0) {
+      f.type = 'lowpass';
+      const freq = 20000 * Math.pow(200 / 20000, Math.abs(pos));
+      f.frequency.setTargetAtTime(freq, t, 0.03);
+    } else {
+      f.type = 'highpass';
+      const freq = 20 * Math.pow(8000 / 20, pos);
+      f.frequency.setTargetAtTime(freq, t, 0.03);
+    }
+  }
+
+  public emergencyFade(durationMs: number = 300): void {
+    if (!this.masterGain || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    this.masterGain.gain.cancelScheduledValues(t);
+    this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, t);
+    this.masterGain.gain.linearRampToValueAtTime(0.0001, t + durationMs / 1000);
     setTimeout(() => {
-      this.stopPlayback();
-      if (this.masterGain && this.ctx) {
-        this.masterGain.gain.setValueAtTime(0.8, this.ctx.currentTime);
-      }
-    }, durationMs + 50);
+      this.decks.forEach((d) => this.stopDeck(d.deckId));
+    }, durationMs + 40);
   }
 
-  public setMasterVolume(vol: number) {
-    if (!this.ctx || !this.masterGain) return;
-    this.masterGain.gain.setTargetAtTime(Math.max(0, Math.min(1.5, vol)), this.ctx.currentTime, 0.02);
-  }
-
-  public setCrossfader(pos: number) { // -1.0 (Deck A) to +1.0 (Deck B)
-    if (!this.ctx || !this.crossfaderAGain || !this.crossfaderBGain) return;
-    const clamped = Math.max(-1, Math.min(1, pos));
-    const normalized = (clamped + 1) / 2; // 0.0 to 1.0
-
-    // Equal power curves
-    const gainA = Math.cos(normalized * 0.5 * Math.PI);
-    const gainB = Math.sin(normalized * 0.5 * Math.PI);
-
-    this.crossfaderAGain.gain.setTargetAtTime(gainA, this.ctx.currentTime, 0.02);
-    this.crossfaderBGain.gain.setTargetAtTime(gainB, this.ctx.currentTime, 0.02);
-  }
-
-  public setDeckEq(deckId: number, lowDb: number, midDb: number, highDb: number) {
-    if (!this.ctx) return;
-    const lowNode = deckId === 0 ? this.deckALow : this.deckBLow;
-    const midNode = deckId === 0 ? this.deckAMid : this.deckBMid;
-    const highNode = deckId === 0 ? this.deckAHigh : this.deckBHigh;
-
-    if (lowNode) lowNode.gain.setTargetAtTime(lowDb, this.ctx.currentTime, 0.02);
-    if (midNode) midNode.gain.setTargetAtTime(midDb, this.ctx.currentTime, 0.02);
-    if (highNode) highNode.gain.setTargetAtTime(highDb, this.ctx.currentTime, 0.02);
-  }
-
-  public setDeckFilter(deckId: number, position: number) { // -1.0 (LPF) to +1.0 (HPF)
-    if (!this.ctx) return;
-    const filterNode = deckId === 0 ? this.deckAFilter : this.deckBFilter;
-    if (!filterNode) return;
-
-    if (Math.abs(position) < 0.05) {
-      filterNode.type = 'allpass';
-      filterNode.frequency.setTargetAtTime(1000, this.ctx.currentTime, 0.02);
-    } else if (position > 0) {
-      // HPF sweep from 20Hz up to 10kHz
-      filterNode.type = 'highpass';
-      const freq = 20 + Math.pow(position, 2) * 10000;
-      filterNode.frequency.setTargetAtTime(freq, this.ctx.currentTime, 0.02);
-      filterNode.Q.value = 2.0;
-    } else {
-      // LPF sweep from 20kHz down to 100Hz
-      filterNode.type = 'lowpass';
-      const freq = 20000 - Math.pow(-position, 2) * 19900;
-      filterNode.frequency.setTargetAtTime(freq, this.ctx.currentTime, 0.02);
-      filterNode.Q.value = 2.0;
+  public getWaveformData(targetArray: Uint8Array<ArrayBuffer>): void {
+    if (!this.analyser) {
+      targetArray.fill(128);
+      return;
     }
+    this.analyser.getByteTimeDomainData(targetArray);
   }
 
-  public setDeckGain(deckId: number, gain: number) {
-    if (!this.ctx) return;
-    const gainNode = deckId === 0 ? this.deckAGain : this.deckBGain;
-    if (gainNode) gainNode.gain.setTargetAtTime(gain, this.ctx.currentTime, 0.02);
-  }
-
-  // Load and play a real local audio file in the browser
-  public async loadUserAudioFile(deckId: number, file: File) {
-    this.ensureRunning();
-    if (!this.ctx) return;
-
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await this.ctx.decodeAudioData(arrayBuffer);
-
-    const source = this.ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.loop = true;
-
-    const targetGain = deckId === 0 ? this.deckAGain : this.deckBGain;
-    if (targetGain) {
-      source.connect(targetGain);
-    }
-
-    source.start(0);
-
-    if (deckId === 0) {
-      if (this.deckABufferSource) {
-        try { this.deckABufferSource.stop(); } catch {}
-      }
-      this.deckABufferSource = source;
-    } else {
-      if (this.deckBBufferSource) {
-        try { this.deckBBufferSource.stop(); } catch {}
-      }
-      this.deckBBufferSource = source;
-    }
-  }
-
-  // High-precision WebAudio Beat Scheduler
-  private scheduler = () => {
-    if (!this.isPlaying || !this.ctx) return;
-
-    const scheduleAheadTime = 0.1; // 100ms lookahead
-    const stepDuration = 60 / this.currentBpm / 4; // 16th note duration
-
-    while (this.nextStepTime < this.ctx.currentTime + scheduleAheadTime) {
-      this.playStep(this.stepIndex, this.nextStepTime);
-      this.nextStepTime += stepDuration;
-      this.stepIndex = (this.stepIndex + 1) % 16;
-    }
-
-    this.timerId = window.setTimeout(this.scheduler, 25);
-  };
-
-  private playStep(step: number, time: number) {
-    if (!this.ctx) return;
-    const targetGain = this.activeDeck === 0 ? this.deckAGain : this.deckBGain;
-    if (!targetGain) return;
-
-    // 1. Kick Drum: 4-on-the-floor (steps 0, 4, 8, 12)
-    if (step % 4 === 0) {
-      this.triggerKick(time, targetGain);
-    }
-
-    // 2. Off-beat Open/Closed Hi-hats (steps 2, 6, 10, 14 and 16th accents)
-    if (step % 2 === 0) {
-      const isOffbeat = step % 4 === 2;
-      this.triggerHat(time, isOffbeat ? 0.08 : 0.03, targetGain);
-    }
-
-    // 3. Indian Dholak / Snare Tap (steps 4 and 12, plus syncopated step 14)
-    if (step === 4 || step === 12 || step === 14) {
-      this.triggerSnareDhol(time, step === 14 ? 0.6 : 1.0, targetGain);
-    }
-
-    // 4. Punchy Punjabi Synth Bassline (root notes and energetic octaves)
-    if (step % 2 === 0 || step === 7 || step === 15) {
-      const freqMultiplier = step === 0 || step === 8 ? 1.0 : (step === 4 || step === 12 ? 1.334 : 1.5);
-      const freq = this.currentRootFreq * 0.5 * freqMultiplier;
-      this.triggerBassNote(time, freq, targetGain);
-    }
-
-    // 5. Festive Chord Stab (on bar downbeat and phrase transitions)
-    if (step === 0 || step === 6 || step === 10) {
-      this.triggerChordStab(time, this.currentRootFreq, targetGain);
-    }
-  }
-
-  private triggerKick(time: number, target: GainNode) {
-    if (!this.ctx) return;
-    const osc = this.ctx.createOscillator();
-    const gain = this.ctx.createGain();
-
-    osc.frequency.setValueAtTime(150, time);
-    osc.frequency.exponentialRampToValueAtTime(38, time + 0.12);
-
-    gain.gain.setValueAtTime(1.0, time);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.22);
-
-    osc.connect(gain);
-    gain.connect(target);
-
-    osc.start(time);
-    osc.stop(time + 0.25);
-  }
-
-  private triggerHat(time: number, duration: number, target: GainNode) {
-    if (!this.ctx) return;
-    const bufferSize = this.ctx.sampleRate * duration;
-    const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) {
-      data[i] = (Math.random() * 2 - 1) * 0.6;
-    }
-
-    const noise = this.ctx.createBufferSource();
-    noise.buffer = buffer;
-
-    const filter = this.ctx.createBiquadFilter();
-    filter.type = 'highpass';
-    filter.frequency.setValueAtTime(7000, time);
-
-    const gain = this.ctx.createGain();
-    gain.gain.setValueAtTime(0.35, time);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + duration);
-
-    noise.connect(filter);
-    filter.connect(gain);
-    gain.connect(target);
-
-    noise.start(time);
-    noise.stop(time + duration);
-  }
-
-  private triggerSnareDhol(time: number, volume: number, target: GainNode) {
-    if (!this.ctx) return;
-    
-    // Skin 1: Resonant high rim-slap (tilli/dayan snap)
-    const highOsc = this.ctx.createOscillator();
-    const highGain = this.ctx.createGain();
-    highOsc.type = 'triangle';
-    highOsc.frequency.setValueAtTime(460, time);
-    highOsc.frequency.exponentialRampToValueAtTime(180, time + 0.08);
-    highGain.gain.setValueAtTime(0.55 * volume, time);
-    highGain.gain.exponentialRampToValueAtTime(0.001, time + 0.10);
-    highOsc.connect(highGain);
-    highGain.connect(target);
-    highOsc.start(time);
-    highOsc.stop(time + 0.11);
-
-    // Skin 2: Low dholak bass resonance (dagga boom)
-    const lowOsc = this.ctx.createOscillator();
-    const lowGain = this.ctx.createGain();
-    lowOsc.type = 'sine';
-    lowOsc.frequency.setValueAtTime(140, time);
-    lowOsc.frequency.exponentialRampToValueAtTime(65, time + 0.12);
-    lowGain.gain.setValueAtTime(0.75 * volume, time);
-    lowGain.gain.exponentialRampToValueAtTime(0.001, time + 0.15);
-    lowOsc.connect(lowGain);
-    lowGain.connect(target);
-    lowOsc.start(time);
-    lowOsc.stop(time + 0.16);
-  }
-
-  private triggerBassNote(time: number, freq: number, target: GainNode) {
-    if (!this.ctx) return;
-    const osc = this.ctx.createOscillator();
-    const filter = this.ctx.createBiquadFilter();
-    const gain = this.ctx.createGain();
-
-    osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(freq, time);
-
-    filter.type = 'lowpass';
-    filter.frequency.setValueAtTime(750, time);
-    filter.frequency.exponentialRampToValueAtTime(180, time + 0.16);
-
-    gain.gain.setValueAtTime(0.55, time);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.18);
-
-    osc.connect(filter);
-    filter.connect(gain);
-    gain.connect(target);
-
-    osc.start(time);
-    osc.stop(time + 0.2);
-  }
-
-  private triggerChordStab(time: number, rootFreq: number, target: GainNode) {
-    if (!this.ctx) return;
-    const isMinor = this.currentKeyName.toLowerCase().includes('minor') || 
-                    (this.currentKeyName.toLowerCase().includes('m') && !this.currentKeyName.toLowerCase().includes('major'));
-    // Minor Triad: root, minor 3rd (1.189), 5th (1.498); Major Triad: root, major 3rd (1.259), 5th (1.498)
-    const thirdMult = isMinor ? 1.1892 : 1.2599;
-    const freqs = [rootFreq, rootFreq * thirdMult, rootFreq * 1.4983];
-    const gain = this.ctx.createGain();
-    gain.gain.setValueAtTime(0.25, time);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.28);
-
-    const filter = this.ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.setValueAtTime(2600, time);
-    filter.frequency.exponentialRampToValueAtTime(500, time + 0.28);
-
-    freqs.forEach((f) => {
-      if (!this.ctx) return;
-      const osc = this.ctx.createOscillator();
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(f, time);
-      osc.connect(filter);
-      osc.start(time);
-      osc.stop(time + 0.30);
-    });
-
-    filter.connect(gain);
-    gain.connect(target);
-  }
-
-  private parseKeyFrequency(keyName: string): number {
-    if (keyName.includes('C#') || keyName.includes('Db')) return 138.59;
-    if (keyName.includes('D')) return 146.83;
-    if (keyName.includes('Eb') || keyName.includes('D#')) return 155.56;
-    if (keyName.includes('E')) return 164.81;
-    if (keyName.includes('F#')) return 185.00;
-    if (keyName.includes('F')) return 174.61;
-    if (keyName.includes('Ab') || keyName.includes('G#')) return 207.65;
-    if (keyName.includes('A')) return 220.00;
-    if (keyName.includes('Bb') || keyName.includes('A#')) return 233.08;
-    if (keyName.includes('B')) return 246.94;
-    if (keyName.includes('G')) return 196.00;
-    return 130.81; // C3
+  public getDeckSnapshots(): WebAudioDeckStatus[] {
+    const now = this.ctx?.currentTime ?? 0;
+    return this.decks.map((d) => ({
+      deckId: d.deckId,
+      trackId: d.trackId,
+      isLoaded: d.buffer !== null,
+      isPlaying: d.isPlaying,
+      positionSec: d.isPlaying ? Math.max(0, now - d.startedAtCtxTime) : d.offsetSec,
+      durationSec: d.buffer ? d.buffer.duration : 0,
+      bpm: d.bpm,
+      keyName: d.keyName,
+    }));
   }
 }
 
-export const webAudioEngine = new BrowserAudioEngine();
-
+export const webAudioEngine = new FourDeckWebAudioEngine();

@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 
 export const WizardScreen: React.FC = () => {
-  const { moodProfiles, startParty } = useDhunStore();
+  const { moodProfiles, createLocalRoom, startLocalRoom, setCurrentView } = useDhunStore();
 
   const [step, setStep] = useState<number>(1);
   const [partyName, setPartyName] = useState('My Wedding Sangeet');
@@ -22,8 +22,7 @@ export const WizardScreen: React.FC = () => {
   const [primaryMood, setPrimaryMood] = useState('shaadi');
   const [secondaryMood, setSecondaryMood] = useState<string | undefined>('punjabi_tashan');
   const [outputDevice] = useState('Host Browser Audio Output');
-  const [requireApproval, setRequireApproval] = useState(true);
-  const [maxRequests, setMaxRequests] = useState(3);
+  const [maxRequests, setMaxRequests] = useState(5);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const djLevels = [
@@ -52,7 +51,9 @@ export const WizardScreen: React.FC = () => {
   const handleLaunchParty = async () => {
     setIsSubmitting(true);
     try {
-      await startParty(partyName, djLevel, primaryMood, secondaryMood);
+      await createLocalRoom(partyName, djLevel as 1 | 2 | 3 | 4, primaryMood, secondaryMood);
+      await startLocalRoom();
+      setCurrentView('live');
     } catch (err) {
       console.error(err);
     } finally {
@@ -222,7 +223,7 @@ export const WizardScreen: React.FC = () => {
                   <div>
                     <div className="text-sm font-bold">{outputDevice}</div>
                     <div className="text-xs text-slate-400 font-mono">
-                      Managed by Host OS &bull; Prepared for Phase 2 YouTube IFrame Player
+                      Managed by Host OS &bull; Local 4-Deck Web Audio Engine
                     </div>
                   </div>
                 </div>
@@ -234,42 +235,42 @@ export const WizardScreen: React.FC = () => {
           </div>
         )}
 
-        {/* Step 5: Guest Requests & Moderation */}
+        {/* Step 5: Guest LAN Requests & Automated DJ Policy */}
         {step === 5 && (
           <div className="space-y-4 animate-in fade-in duration-200">
             <div>
-              <h2 className="text-lg font-bold text-white">Guest QR Code &amp; Request Policy</h2>
-              <p className="text-xs text-slate-400">Configure phone requests over local Wi-Fi without internet requirement.</p>
+              <h2 className="text-lg font-bold text-white">Local Wi-Fi Guest QR &amp; Automated DJ Policy</h2>
+              <p className="text-xs text-slate-400">
+                Guests on the same Wi-Fi/LAN submit YouTube / YouTube Music links directly into the private DJ candidate pool — zero manual host approval queue.
+              </p>
             </div>
 
             <div className="space-y-4 bg-dhun-card border border-dhun-border p-5 rounded-2xl">
               <div className="flex items-center justify-between">
                 <div>
-                  <div className="font-bold text-sm text-white">Require Host Approval</div>
-                  <div className="text-xs text-slate-400">Requests wait in pending list until approved by host</div>
+                  <div className="font-bold text-sm text-white">Automated DJ Evaluation</div>
+                  <div className="text-xs text-slate-400">
+                    The DJ automatically evaluates mood, energy, BPM, and Camelot harmony without interrupting the active track.
+                  </div>
                 </div>
-                <input
-                  type="checkbox"
-                  checked={requireApproval}
-                  onChange={(e) => setRequireApproval(e.target.checked)}
-                  className="w-5 h-5 accent-dhun-primary rounded cursor-pointer"
-                />
+                <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold uppercase">
+                  Always Active
+                </span>
               </div>
 
               <div className="border-t border-slate-800 pt-3 flex items-center justify-between">
                 <div>
-                  <div className="font-bold text-sm text-white">Max Requests Per Guest</div>
-                  <div className="text-xs text-slate-400">Rate limit to prevent request spamming</div>
+                  <div className="font-bold text-sm text-white">Guest Rate Limit Window</div>
+                  <div className="text-xs text-slate-400">Prevents spam on the local Wi-Fi room</div>
                 </div>
                 <select
                   value={maxRequests}
                   onChange={(e) => setMaxRequests(parseInt(e.target.value))}
                   className="bg-dhun-surface border border-dhun-border rounded-lg px-3 py-1.5 text-xs text-white"
                 >
-                  <option value={1}>1 song</option>
-                  <option value={3}>3 songs (Recommended)</option>
-                  <option value={5}>5 songs</option>
-                  <option value={10}>10 songs</option>
+                  <option value={3}>3 submissions / window</option>
+                  <option value={5}>5 submissions / window (Recommended)</option>
+                  <option value={10}>10 submissions / window</option>
                 </select>
               </div>
             </div>
@@ -281,7 +282,7 @@ export const WizardScreen: React.FC = () => {
           <div className="space-y-4 animate-in fade-in duration-200">
             <div>
               <h2 className="text-lg font-bold text-white">Setup Summary</h2>
-              <p className="text-xs text-slate-400">Review settings and launch party.</p>
+              <p className="text-xs text-slate-400">Review settings and launch private local party room.</p>
             </div>
 
             <div className="bg-dhun-card border border-dhun-border p-6 rounded-2xl space-y-3 text-xs">
@@ -303,7 +304,7 @@ export const WizardScreen: React.FC = () => {
               </div>
               <div className="flex justify-between py-1">
                 <span className="text-slate-400">Guest Requests:</span>
-                <span className="font-bold text-white">{requireApproval ? 'Host Moderated' : 'Auto-Approve'} ({maxRequests} per guest)</span>
+                <span className="font-bold text-white">Direct to Automated DJ Pool (Private LAN Only)</span>
               </div>
             </div>
           </div>

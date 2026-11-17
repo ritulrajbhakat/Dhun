@@ -19,11 +19,31 @@ impl DjLevel {
         }
     }
 
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            DjLevel::Level1TwoDeckMixer => "Professional 2-Deck Mixer",
+            DjLevel::Level2SmartMixing => "Smart Mixing",
+            DjLevel::Level3AdvancedPerformance => "Advanced Performance",
+            DjLevel::Level4CreativeTools => "Creative DJ Tools",
+        }
+    }
+
+    /// Number of decks exposed in the UI for this DJ level (2 for Levels 1-2, 4 for Levels 3-4).
     pub fn max_decks(&self) -> usize {
         match self {
             DjLevel::Level1TwoDeckMixer | DjLevel::Level2SmartMixing => 2,
             DjLevel::Level3AdvancedPerformance | DjLevel::Level4CreativeTools => 4,
         }
+    }
+
+    /// The underlying audio/DJ engine is always architected for 4-deck capability.
+    pub fn internal_deck_capacity(&self) -> usize {
+        4
+    }
+
+    /// All four DJ levels support automatic party playback once the host starts the party.
+    pub fn supports_auto_dj(&self) -> bool {
+        true
     }
 
     pub fn supports_auto_sync(&self) -> bool {
@@ -42,4 +62,3 @@ impl DjLevel {
         *self >= DjLevel::Level4CreativeTools
     }
 }
-

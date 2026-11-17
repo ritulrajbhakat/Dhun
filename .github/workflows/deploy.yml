@@ -25,10 +25,17 @@ jobs:
       - name: Run Backend Engine Tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --tests
 
-      - name: Build Release Binaries (Cloud Server & Backend)
+      - name: Build Release Binaries (Local Helper, Metadata Service & Backend)
         run: cargo build --manifest-path src-tauri/Cargo.toml --release --bins
 
-      - name: Upload Cloud Server Executable
+      - name: Upload Local Helper Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhun-local-helper-windows-x86_64
+          path: target/release/dhun-local-helper.exe
+          if-no-files-found: error
+
+      - name: Upload Global Metadata Catalogue Executable
         uses: actions/upload-artifact@v4
         with:
           name: dhun-server-windows-x86_64

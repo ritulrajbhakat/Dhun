@@ -1,20 +1,18 @@
 import { create } from 'zustand';
 import {
-  CloudParty,
   DjLevel,
-  GuestRequest,
-  MasterTelemetry,
+  LocalPartyRoom,
+  LocalRoomEvent,
+  LocalRoomSubmission,
+  LocalTempCacheStats,
   MoodProfile,
-  PartyConfiguration,
-  PartyEventMessage,
-  PartySongRequest,
-  PartySourceReference,
-  PartyStatus,
-  Track,
+  SyncStatusOverview,
+  UnifiedSongSubmissionResponse,
 } from '../types';
 import { CURATED_MOODS } from '../api/ipc';
-import { apiClient } from '../api/client';
-import { partyWsClient } from '../api/websocket';
+import { localHelperClient } from '../api/client';
+import { localRoomWsClient } from '../api/websocket';
+import { webAudioEngine } from '../audio/WebAudioEngine';
 
 export type ScreenView =
   | 'home'
@@ -27,524 +25,401 @@ export type ScreenView =
   | 'settings'
   | 'diagnostics';
 
-interface DeckState {
+interface DeckControlState {
   eqLow: number;
   eqMid: number;
   eqHigh: number;
   gain: number;
   filter: number;
   tempo: number;
-  loopBeats: number;
-  loopActive: boolean;
-  hotCues: (number | null)[];
 }
-
-const DJ_LEVEL_TO_STR: Record<number, string> = {
-  1: 'hands_off',
-  2: 'balanced',
-  3: 'curated',
-  4: 'manual',
-};
-
-const STR_TO_DJ_LEVEL: Record<string, DjLevel> = {
-  hands_off: 1,
-  balanced: 2,
-  curated: 3,
-  manual: 4,
-};
 
 interface DhunState {
   currentView: ScreenView;
   setCurrentView: (view: ScreenView) => void;
 
-  // Real Backend & WebSocket Connectivity State
-  apiBaseUrl: string;
-  backendConnected: boolean;
-  backendVersion: string | null;
-  backendError: string | null;
+  // Local DHUN Helper Connection & LAN State
+  helperUrl: string;
+  helperConnected: boolean;
+  helperVersion: string | null;
+  helperError: string | null;
   wsConnected: boolean;
+  lanReachable: boolean;
+  detectedLanIp: string | null;
+  lanNotice: string | null;
 
-  // Active Cloud Party State (Zero Mock Fallbacks)
-  cloudParty: CloudParty | null;
-  partyConfig: PartyConfiguration | null;
-  hostToken: string | null;
+  // Private Local Party Room State (Zero Cloud Parties, Zero Approval Queue)
+  activeRoom: LocalPartyRoom | null;
+  djLevelName: string;
+  exposedDecks: 2 | 4;
+  internalDeckCapacity: 4;
+  autoDjEnabled: boolean;
   guestUrl: string | null;
   qrSvg: string | null;
-  registeredSources: PartySourceReference[];
-  songRequests: PartySongRequest[];
+  submissions: LocalRoomSubmission[];
+  cacheStats: LocalTempCacheStats;
+  syncOverview: SyncStatusOverview;
 
-  // Derived / UI state
-  partyStatus: PartyStatus;
-  telemetry: MasterTelemetry | null;
+  // All 14 Curated Moods & 4-Deck Web Audio Controls
   moodProfiles: MoodProfile[];
-  tracks: Track[];
-  guestRequests: GuestRequest[];
-
+  selectedMoodId: string;
+  selectedDjLevel: DjLevel;
   masterVolume: number;
   crossfader: number;
-  crossfaderCurve: string;
-  selectedDeckCount: 2 | 4;
-  decks: DeckState[];
+  decks: DeckControlState[];
 
   // Actions
-  setApiBaseUrl: (url: string) => Promise<void>;
-  checkBackendHealth: () => Promise<boolean>;
+  setHelperUrl: (url: string) => Promise<void>;
+  checkHelperHealth: () => Promise<boolean>;
   refreshAll: () => Promise<void>;
-  createCloudParty: (
+  refreshRoomDashboard: () => Promise<void>;
+  createLocalRoom: (
     partyName: string,
-    moodId: string,
-    djLevel: string
+    djLevel: DjLevel,
+    primaryMoodId: string,
+    secondaryMoodId?: string
   ) => Promise<void>;
-  startCloudParty: () => Promise<void>;
-  endCloudParty: () => Promise<void>;
-  clearActiveParty: () => void;
-  registerYouTubeSource: (url: string) => Promise<PartySourceReference>;
-  refreshPartyData: () => Promise<void>;
-  approveSongRequest: (requestId: string) => Promise<void>;
-  rejectSongRequest: (requestId: string, reason?: string) => Promise<void>;
-  updatePartyConfig: (updates: Partial<PartyConfiguration>) => Promise<void>;
-  setDjLevel: (level: number) => Promise<void>;
+  startLocalRoom: () => Promise<void>;
+  closeLocalRoom: () => Promise<{ invalidated_guests: number; purged_cache_files: number } | null>;
+  clearLocalRoomSession: () => void;
+  submitSong: (url: string) => Promise<UnifiedSongSubmissionResponse>;
+  evaluateDjPool: () => Promise<void>;
+  setDjLevel: (level: DjLevel) => Promise<void>;
   setPartyMood: (moodId: string) => Promise<void>;
+
+  // 4-Deck Web Audio Controls (Isolated from network/DB callbacks)
   setCrossfaderPos: (pos: number) => void;
   updateDeckEq: (deckId: number, low: number, mid: number, high: number) => void;
   updateDeckGain: (deckId: number, gain: number) => void;
   updateDeckFilter: (deckId: number, filter: number) => void;
   updateDeckTempo: (deckId: number, tempo: number) => void;
   setMasterVolume: (vol: number) => void;
-  setDeckCount: (count: 2 | 4) => void;
-
-  // Compatibility wrappers for auxiliary screens
-  startParty: (
-    name: string,
-    level: number,
-    primaryMood: string,
-    secondaryMood?: string
-  ) => Promise<void>;
-  emergencyFade: () => Promise<void>;
-  approveRequest: (requestId: string) => Promise<void>;
-  rejectRequest: (requestId: string) => Promise<void>;
-  forceNextRequest: (requestId: string) => Promise<void>;
-  toggleDeckPlay: (deckId: number) => Promise<void>;
-  pollTelemetry: () => Promise<void>;
+  emergencyFade: () => void;
 }
 
-const defaultDeckState = (): DeckState => ({
+const defaultDeck = (): DeckControlState => ({
   eqLow: 0,
   eqMid: 0,
   eqHigh: 0,
   gain: 1.0,
   filter: 0.0,
   tempo: 1.0,
-  loopBeats: 4,
-  loopActive: false,
-  hotCues: [null, null, null, null, null, null, null, null],
 });
 
-let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-
-function stopHeartbeat() {
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-    heartbeatInterval = null;
-  }
-}
-
-function derivePartyStatus(
-  party: CloudParty | null,
-  config: PartyConfiguration | null,
-  guestUrl: string | null,
-  qrSvg: string | null
-): PartyStatus {
-  if (!party) {
-    return { is_active: false };
-  }
-  const djLvl = config ? STR_TO_DJ_LEVEL[config.dj_level] || 2 : 2;
-  return {
-    is_active: party.status === 'live',
-    session_id: party.id,
-    party_name: party.party_name,
-    primary_mood_id: config?.primary_mood_id || 'house_party',
-    dj_level: djLvl,
-    guest_url: guestUrl || undefined,
-    qr_svg: qrSvg || undefined,
-  };
-}
-
-function mapRequests(requests: PartySongRequest[]): GuestRequest[] {
-  return requests.map((r) => ({
-    id: r.id,
-    session_id: r.party_id,
-    guest_id: r.guest_id,
-    guest_name: r.guest_name,
-    track_id: r.source_id,
-    track_title: r.source_title,
-    track_artist: r.source_artist,
-    submitted_at: r.created_at,
-    status: r.status as any,
-    priority_order: Math.round(r.priority_score),
-    host_note: r.custom_note,
-  }));
-}
+const DJ_LEVEL_NAMES: Record<DjLevel, string> = {
+  1: 'Professional 2-Deck Mixer',
+  2: 'Smart Mixing',
+  3: 'Advanced Performance',
+  4: 'Creative DJ Tools',
+};
 
 export const useDhunStore = create<DhunState>((set, get) => {
-  const handleWsEvent = (event: PartyEventMessage) => {
-    const { cloudParty } = get();
-    if (!cloudParty || event.party_id !== cloudParty.id) return;
-
+  const handleLocalRoomEvent = (evt: LocalRoomEvent) => {
+    const { activeRoom } = get();
+    if (!activeRoom || evt.room_id !== activeRoom.room_id) return;
     if (
-      event.event_type === 'party.status_changed' ||
-      event.event_type === 'party.config_updated' ||
-      event.event_type === 'party.source_added' ||
-      event.event_type === 'request.created' ||
-      event.event_type === 'request.status_changed'
+      evt.event_type === 'room.status_changed' ||
+      evt.event_type === 'room.config_updated' ||
+      evt.event_type === 'room.closed' ||
+      evt.event_type === 'dj.submission_received' ||
+      evt.event_type === 'dj.evaluated'
     ) {
-      get().refreshPartyData();
+      get().refreshRoomDashboard();
     }
-  };
-
-  const startHeartbeatForParty = (partyId: string) => {
-    stopHeartbeat();
-    heartbeatInterval = setInterval(() => {
-      const { cloudParty, hostToken } = get();
-      if (cloudParty && cloudParty.id === partyId && cloudParty.status === 'live' && hostToken) {
-        apiClient.sendHeartbeat(partyId).catch(() => {});
-      }
-    }, 25000);
   };
 
   return {
     currentView: 'home',
     setCurrentView: (view) => set({ currentView: view }),
 
-    apiBaseUrl: apiClient.getBaseUrl(),
-    backendConnected: false,
-    backendVersion: null,
-    backendError: null,
+    helperUrl: localHelperClient.getBaseUrl(),
+    helperConnected: false,
+    helperVersion: null,
+    helperError: null,
     wsConnected: false,
+    lanReachable: false,
+    detectedLanIp: null,
+    lanNotice: null,
 
-    cloudParty: null,
-    partyConfig: null,
-    hostToken: apiClient.getHostToken(),
+    activeRoom: null,
+    djLevelName: DJ_LEVEL_NAMES[2],
+    exposedDecks: 2,
+    internalDeckCapacity: 4,
+    autoDjEnabled: true,
     guestUrl: null,
     qrSvg: null,
-    registeredSources: [],
-    songRequests: [],
+    submissions: [],
+    cacheStats: { track_count: 0, max_tracks: 15, total_bytes: 0, locked_tracks: 0 },
+    syncOverview: { pending_count: 0, in_flight_count: 0, synced_count: 0, failed_count: 0 },
 
-    partyStatus: { is_active: false },
-    telemetry: null,
     moodProfiles: CURATED_MOODS,
-    tracks: [],
-    guestRequests: [],
+    selectedMoodId: 'house_party',
+    selectedDjLevel: 2,
+    masterVolume: 0.85,
+    crossfader: -1.0,
+    decks: [defaultDeck(), defaultDeck(), defaultDeck(), defaultDeck()],
 
-    masterVolume: 1.0,
-    crossfader: 0.0,
-    crossfaderCurve: 'bass_swap',
-    selectedDeckCount: 2,
-    decks: [defaultDeckState(), defaultDeckState(), defaultDeckState(), defaultDeckState()],
-
-    setApiBaseUrl: async (url: string) => {
-      apiClient.setBaseUrl(url);
-      set({ apiBaseUrl: apiClient.getBaseUrl() });
+    setHelperUrl: async (url: string) => {
+      localHelperClient.setBaseUrl(url);
+      set({ helperUrl: localHelperClient.getBaseUrl() });
       await get().refreshAll();
     },
 
-    checkBackendHealth: async () => {
-      const res = await apiClient.checkHealth();
+    checkHelperHealth: async () => {
+      const res = await localHelperClient.checkHealth();
+      if (res.connected && res.health) {
+        set({
+          helperConnected: true,
+          helperVersion: res.health.version,
+          helperError: null,
+          lanReachable: res.health.lan_reachable,
+          detectedLanIp: res.health.detected_lan_ip,
+          cacheStats: res.health.cache_stats,
+          syncOverview: res.health.sync_overview,
+        });
+        return true;
+      }
       set({
-        backendConnected: res.connected,
-        backendVersion: res.version || null,
-        backendError: res.error || null,
+        helperConnected: false,
+        helperVersion: null,
+        helperError: res.error || 'Local DHUN helper unreachable',
+        lanReachable: false,
+        detectedLanIp: null,
       });
-      return res.connected;
+      return false;
     },
 
     refreshAll: async () => {
-      const isHealthy = await get().checkBackendHealth();
-      if (!isHealthy) {
-        return;
-      }
+      const ok = await get().checkHelperHealth();
+      if (!ok) return;
 
-      const savedPartyId = apiClient.getSavedPartyId();
-      if (savedPartyId) {
-        try {
-          const details = await apiClient.getParty(savedPartyId);
-          const [sources, requests] = await Promise.all([
-            apiClient.listSources(savedPartyId),
-            apiClient.listRequests(savedPartyId).catch(() => []),
-          ]);
+      const savedRoomId = localHelperClient.getSavedRoomId();
+      if (!savedRoomId || !localHelperClient.getHostToken()) return;
 
-          const derived = derivePartyStatus(
-            details.party,
-            details.config || null,
-            details.guest_url,
-            details.qr_svg
-          );
+      try {
+        const dash = await localHelperClient.getRoomDashboard(savedRoomId);
+        const savedQr = localHelperClient.getSavedGuestQr();
+        set({
+          activeRoom: dash.room,
+          djLevelName: dash.dj_level_name,
+          exposedDecks: dash.exposed_decks >= 4 ? 4 : 2,
+          autoDjEnabled: dash.auto_dj_enabled,
+          lanReachable: dash.lan_reachable,
+          detectedLanIp: dash.detected_lan_ip,
+          submissions: dash.submissions,
+          cacheStats: dash.cache_stats,
+          syncOverview: dash.sync_overview,
+          selectedMoodId: dash.room.primary_mood_id,
+          selectedDjLevel: dash.room.dj_level,
+          guestUrl: dash.room.status === 'closed' ? null : savedQr.guestUrl,
+          qrSvg: dash.room.status === 'closed' ? null : savedQr.qrSvg,
+        });
 
-          set({
-            cloudParty: details.party,
-            partyConfig: details.config || null,
-            guestUrl: details.guest_url,
-            qrSvg: details.qr_svg,
-            registeredSources: sources,
-            songRequests: requests,
-            guestRequests: mapRequests(requests),
-            partyStatus: derived,
-            selectedDeckCount: derived.dj_level && derived.dj_level >= 3 ? 4 : 2,
-          });
-
-          partyWsClient.connect(savedPartyId, handleWsEvent, (connected) => {
+        if (dash.room.status !== 'closed') {
+          localRoomWsClient.connect(savedRoomId, handleLocalRoomEvent, (connected) => {
             set({ wsConnected: connected });
           });
-
-          if (details.party.status === 'live') {
-            startHeartbeatForParty(savedPartyId);
-          }
-        } catch (err) {
-          // Saved party no longer exists on this backend
-          apiClient.setSavedPartyId(null);
-          set({
-            cloudParty: null,
-            partyConfig: null,
-            guestUrl: null,
-            qrSvg: null,
-            registeredSources: [],
-            songRequests: [],
-            guestRequests: [],
-            partyStatus: { is_active: false },
-          });
         }
+      } catch {
+        localHelperClient.setSavedRoomSession(null);
+        localHelperClient.setHostToken(null);
+        set({
+          activeRoom: null,
+          guestUrl: null,
+          qrSvg: null,
+          submissions: [],
+        });
       }
     },
 
-    refreshPartyData: async () => {
-      const { cloudParty } = get();
-      if (!cloudParty) return;
+    refreshRoomDashboard: async () => {
+      const { activeRoom } = get();
+      if (!activeRoom) return;
       try {
-        const [details, sources, requests] = await Promise.all([
-          apiClient.getParty(cloudParty.id),
-          apiClient.listSources(cloudParty.id),
-          apiClient.listRequests(cloudParty.id).catch(() => []),
-        ]);
-
-        const derived = derivePartyStatus(
-          details.party,
-          details.config || null,
-          details.guest_url,
-          details.qr_svg
-        );
-
+        const dash = await localHelperClient.getRoomDashboard(activeRoom.room_id);
         set({
-          cloudParty: details.party,
-          partyConfig: details.config || null,
-          guestUrl: details.guest_url,
-          qrSvg: details.qr_svg,
-          registeredSources: sources,
-          songRequests: requests,
-          guestRequests: mapRequests(requests),
-          partyStatus: derived,
+          activeRoom: dash.room,
+          djLevelName: dash.dj_level_name,
+          exposedDecks: dash.exposed_decks >= 4 ? 4 : 2,
+          autoDjEnabled: dash.auto_dj_enabled,
+          lanReachable: dash.lan_reachable,
+          detectedLanIp: dash.detected_lan_ip,
+          submissions: dash.submissions,
+          cacheStats: dash.cache_stats,
+          syncOverview: dash.sync_overview,
+          selectedMoodId: dash.room.primary_mood_id,
+          selectedDjLevel: dash.room.dj_level,
         });
       } catch (err) {
-        console.error('Failed to refresh party data:', err);
+        console.error('Failed refreshing local party room dashboard:', err);
       }
     },
 
-    createCloudParty: async (partyName: string, moodId: string, djLevel: string) => {
-      const created = await apiClient.createParty({
+    createLocalRoom: async (partyName, djLevel, primaryMoodId, secondaryMoodId) => {
+      const res = await localHelperClient.createLocalRoom({
         party_name: partyName,
-        primary_mood_id: moodId,
         dj_level: djLevel,
-        allow_guest_requests: true,
-        max_requests_per_guest: 5,
+        primary_mood_id: primaryMoodId,
+        secondary_mood_id: secondaryMoodId,
       });
-
-      const partyObj: CloudParty = {
-        id: created.party_id,
-        party_name: created.party_name,
-        status: created.status,
-        created_at: created.created_at,
-        updated_at: created.created_at,
-        last_heartbeat_at: created.created_at,
-      };
-
-      const derived = derivePartyStatus(
-        partyObj,
-        created.config,
-        created.guest_url,
-        created.qr_svg
-      );
 
       set({
-        cloudParty: partyObj,
-        partyConfig: created.config,
-        hostToken: created.host_token,
-        guestUrl: created.guest_url,
-        qrSvg: created.qr_svg,
-        registeredSources: [],
-        songRequests: [],
-        guestRequests: [],
-        partyStatus: derived,
-        backendConnected: true,
-        backendError: null,
+        activeRoom: res.room,
+        selectedDjLevel: res.room.dj_level,
+        selectedMoodId: res.room.primary_mood_id,
+        djLevelName: DJ_LEVEL_NAMES[res.room.dj_level] || DJ_LEVEL_NAMES[2],
+        exposedDecks: res.room.dj_level >= 3 ? 4 : 2,
+        lanReachable: res.lan_reachable,
+        detectedLanIp: res.detected_lan_ip,
+        guestUrl: res.guest_url,
+        qrSvg: res.qr_svg,
+        lanNotice: res.lan_notice,
+        submissions: [],
+        helperConnected: true,
+        helperError: null,
       });
 
-      partyWsClient.connect(created.party_id, handleWsEvent, (connected) => {
+      localRoomWsClient.connect(res.room.room_id, handleLocalRoomEvent, (connected) => {
         set({ wsConnected: connected });
       });
     },
 
-    startCloudParty: async () => {
-      const { cloudParty } = get();
-      if (!cloudParty) throw new Error('No party created yet.');
-      const updated = await apiClient.startParty(cloudParty.id);
-      const { partyConfig, guestUrl, qrSvg } = get();
-      set({
-        cloudParty: updated,
-        partyStatus: derivePartyStatus(updated, partyConfig, guestUrl, qrSvg),
-      });
-      startHeartbeatForParty(updated.id);
+    startLocalRoom: async () => {
+      const { activeRoom } = get();
+      if (!activeRoom) throw new Error('Create a local party room first.');
+      await webAudioEngine.ensureRunning();
+      const updated = await localHelperClient.startLocalRoom(activeRoom.room_id);
+      set({ activeRoom: updated });
+      await get().refreshRoomDashboard();
     },
 
-    endCloudParty: async () => {
-      const { cloudParty } = get();
-      if (!cloudParty) return;
-      const updated = await apiClient.endParty(cloudParty.id);
-      stopHeartbeat();
-      const { partyConfig, guestUrl, qrSvg } = get();
-      set({
-        cloudParty: updated,
-        partyStatus: derivePartyStatus(updated, partyConfig, guestUrl, qrSvg),
-      });
-    },
-
-    clearActiveParty: () => {
-      stopHeartbeat();
-      partyWsClient.disconnect();
-      apiClient.setSavedPartyId(null);
-      apiClient.setHostToken(null);
-      set({
-        cloudParty: null,
-        partyConfig: null,
-        hostToken: null,
+    closeLocalRoom: async () => {
+      const { activeRoom } = get();
+      if (!activeRoom) return null;
+      webAudioEngine.emergencyFade(250);
+      const res = await localHelperClient.closeLocalRoom(activeRoom.room_id);
+      localRoomWsClient.disconnect();
+      set((state) => ({
+        activeRoom: state.activeRoom
+          ? { ...state.activeRoom, status: 'closed', closed_at: res.closed_at }
+          : null,
         guestUrl: null,
         qrSvg: null,
-        registeredSources: [],
-        songRequests: [],
-        guestRequests: [],
-        partyStatus: { is_active: false },
+        wsConnected: false,
+      }));
+      await get().checkHelperHealth();
+      return {
+        invalidated_guests: res.invalidated_guests,
+        purged_cache_files: res.purged_cache_files,
+      };
+    },
+
+    clearLocalRoomSession: () => {
+      localRoomWsClient.disconnect();
+      localHelperClient.setSavedRoomSession(null);
+      localHelperClient.setHostToken(null);
+      set({
+        activeRoom: null,
+        guestUrl: null,
+        qrSvg: null,
+        lanNotice: null,
+        submissions: [],
         wsConnected: false,
       });
     },
 
-    registerYouTubeSource: async (url: string) => {
-      const { cloudParty } = get();
-      if (!cloudParty) {
-        throw new Error('Create a party first before registering music sources.');
+    submitSong: async (url: string) => {
+      const { activeRoom } = get();
+      if (!activeRoom) {
+        throw new Error('Create a local party room before submitting a song.');
       }
-      const source = await apiClient.registerSource(cloudParty.id, url);
-      set((state) => {
-        const exists = state.registeredSources.some((s) => s.id === source.id);
-        return {
-          registeredSources: exists
-            ? state.registeredSources
-            : [...state.registeredSources, source],
-        };
-      });
-      return source;
+      const res = await localHelperClient.submitSong(activeRoom.room_id, url);
+      await get().refreshRoomDashboard();
+      return res;
     },
 
-    approveSongRequest: async (requestId: string) => {
-      const { cloudParty } = get();
-      if (!cloudParty) return;
-      await apiClient.approveRequest(cloudParty.id, requestId);
-      await get().refreshPartyData();
+    evaluateDjPool: async () => {
+      const { activeRoom } = get();
+      if (!activeRoom) return;
+      await localHelperClient.evaluateDjPool(activeRoom.room_id);
+      await get().refreshRoomDashboard();
     },
 
-    rejectSongRequest: async (requestId: string, reason?: string) => {
-      const { cloudParty } = get();
-      if (!cloudParty) return;
-      await apiClient.rejectRequest(cloudParty.id, requestId, reason);
-      await get().refreshPartyData();
-    },
-
-    updatePartyConfig: async (updates: Partial<PartyConfiguration>) => {
-      const { cloudParty } = get();
-      if (!cloudParty) return;
-      const updated = await apiClient.updateConfig(cloudParty.id, updates);
-      const { guestUrl, qrSvg } = get();
+    setDjLevel: async (level: DjLevel) => {
       set({
-        partyConfig: updated,
-        partyStatus: derivePartyStatus(cloudParty, updated, guestUrl, qrSvg),
-        selectedDeckCount: (STR_TO_DJ_LEVEL[updated.dj_level] || 2) >= 3 ? 4 : 2,
+        selectedDjLevel: level,
+        djLevelName: DJ_LEVEL_NAMES[level],
+        exposedDecks: level >= 3 ? 4 : 2,
       });
-    },
-
-    setDjLevel: async (level: number) => {
-      const levelStr = DJ_LEVEL_TO_STR[level] || 'balanced';
-      set({ selectedDeckCount: level >= 3 ? 4 : 2 });
-      const { cloudParty } = get();
-      if (cloudParty) {
-        await get().updatePartyConfig({ dj_level: levelStr });
+      const { activeRoom } = get();
+      if (activeRoom && activeRoom.status !== 'closed') {
+        const updated = await localHelperClient.updateRoomConfig(activeRoom.room_id, {
+          dj_level: level,
+        });
+        set({ activeRoom: updated });
       }
     },
 
     setPartyMood: async (moodId: string) => {
-      const { cloudParty } = get();
-      if (cloudParty) {
-        await get().updatePartyConfig({ primary_mood_id: moodId });
-      } else {
-        set((state) => ({
-          partyStatus: { ...state.partyStatus, primary_mood_id: moodId },
-        }));
+      set({ selectedMoodId: moodId });
+      const { activeRoom } = get();
+      if (activeRoom && activeRoom.status !== 'closed') {
+        const updated = await localHelperClient.updateRoomConfig(activeRoom.room_id, {
+          primary_mood_id: moodId,
+        });
+        set({ activeRoom: updated });
+        await localHelperClient.evaluateDjPool(activeRoom.room_id).catch(() => {});
+        await get().refreshRoomDashboard();
       }
     },
 
-    setCrossfaderPos: (pos) => set({ crossfader: pos }),
-    updateDeckEq: (deckId, low, mid, high) =>
+    setCrossfaderPos: (pos) => {
+      set({ crossfader: pos });
+      webAudioEngine.setCrossfader(pos);
+    },
+
+    updateDeckEq: (deckId, low, mid, high) => {
       set((state) => {
         const decks = [...state.decks];
         decks[deckId] = { ...decks[deckId], eqLow: low, eqMid: mid, eqHigh: high };
         return { decks };
-      }),
-    updateDeckGain: (deckId, gain) =>
+      });
+      webAudioEngine.setDeckEq(deckId, low, mid, high);
+    },
+
+    updateDeckGain: (deckId, gain) => {
       set((state) => {
         const decks = [...state.decks];
         decks[deckId] = { ...decks[deckId], gain };
         return { decks };
-      }),
-    updateDeckFilter: (deckId, filter) =>
+      });
+      webAudioEngine.setDeckGain(deckId, gain);
+    },
+
+    updateDeckFilter: (deckId, filter) => {
       set((state) => {
         const decks = [...state.decks];
         decks[deckId] = { ...decks[deckId], filter };
         return { decks };
-      }),
-    updateDeckTempo: (deckId, tempo) =>
+      });
+      webAudioEngine.setDeckFilter(deckId, filter);
+    },
+
+    updateDeckTempo: (deckId, tempo) => {
       set((state) => {
         const decks = [...state.decks];
         decks[deckId] = { ...decks[deckId], tempo };
         return { decks };
-      }),
-    setMasterVolume: (vol) => set({ masterVolume: vol }),
-    setDeckCount: (count) => set({ selectedDeckCount: count }),
+      });
+    },
 
-    // Compatibility wrappers mapping directly to cloud party operations
-    startParty: async (name, level, primaryMood) => {
-      const levelStr = DJ_LEVEL_TO_STR[level] || 'balanced';
-      await get().createCloudParty(name, primaryMood, levelStr);
-      await get().startCloudParty();
+    setMasterVolume: (vol) => {
+      set({ masterVolume: vol });
+      webAudioEngine.setMasterVolume(vol);
     },
-    emergencyFade: async () => {
-      await get().endCloudParty();
+
+    emergencyFade: () => {
+      webAudioEngine.emergencyFade(300);
     },
-    approveRequest: async (requestId) => {
-      await get().approveSongRequest(requestId);
-    },
-    rejectRequest: async (requestId) => {
-      await get().rejectSongRequest(requestId);
-    },
-    forceNextRequest: async (requestId) => {
-      await get().approveSongRequest(requestId);
-    },
-    toggleDeckPlay: async () => {},
-    pollTelemetry: async () => {},
   };
 });

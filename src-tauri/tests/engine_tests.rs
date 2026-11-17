@@ -2360,190 +2360,843 @@ mod tests {
         assert_eq!(rejected_requests[0].rejection_reason.as_deref(), Some("Not suitable for dinner time"));
     }
 
+    /// In-process handler test: verifies local party room creation, hashed secrets (zero raw storage),
+    /// genuine LAN QR generation (and honest lan_reachable=false when offline), explicit-only closure,
+    /// guest token invalidation, and post-party temporary cache cleanup.
     #[tokio::test]
-    async fn test_cloud_http_api_full_lifecycle_end_to_end() {
+    async fn test_local_party_creation_qr_and_explicit_closure_in_process() {
         use axum::extract::{ConnectInfo, Path, State};
-        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use axum::http::{HeaderMap, HeaderValue};
         use axum::Json;
-        use dhun_lib::network::cloud_routes::{
-            approve_request, create_party, create_request, end_party, guest_auth, health_check,
-            list_requests, list_sources, register_source, start_party, CloudServerState,
-            CreatePartyRequest, CreateSongRequestPayload, GuestAuthRequest, RegisterSourceRequest,
+        use dhun_lib::library::cache::{CACHE_PRIORITY_PLAYING, DEFAULT_MAX_TEMP_TRACKS};
+        use dhun_lib::network::local_helper_routes::{
+            close_local_room, create_local_room, get_host_room_dashboard, local_health,
+            start_local_room, CreateLocalRoomRequest, LocalHelperState,
         };
+        use dhun_lib::sync::MetadataSyncManager;
         use std::net::SocketAddr;
         use std::sync::Arc;
 
         let db = Database::new_in_memory().expect("Failed to init DB");
-        let state = Arc::new(CloudServerState::new(
-            db,
-            "https://ritulrajbhakat.github.io/Dhun".to_string(),
-            "*".to_string(),
+        let temp_cache = std::env::temp_dir().join(format!("dhun_p2_room_{}", uuid::Uuid::new_v4()));
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+
+        // 1. With real reachable RFC1918 LAN IP
+        let state = Arc::new(LocalHelperState::new(
+            db.clone(),
+            47821,
+            temp_cache.clone(),
+            sync_mgr.clone(),
+            Some(Some("192.168.10.25".to_string())),
+            vec!["https://dhun.vercel.app".to_string()],
         ));
-        let mut ws_rx = state.ws_broadcaster.subscribe();
-        let client_addr: SocketAddr = "127.0.0.1:45000".parse().unwrap();
+        let host_addr: SocketAddr = "127.0.0.1:52000".parse().unwrap();
+        let mut ws_rx = state.ws_tx.subscribe();
 
-        // 1. Health Check
-        let Json(health_json) = health_check().await;
-        assert_eq!(health_json["status"], "ok");
-        assert_eq!(health_json["service"], "dhun-server");
+        let Json(health) = local_health(State(state.clone())).await;
+        assert_eq!(health["service"], "dhun-local-helper");
+        assert_eq!(health["lan_reachable"], true);
+        assert_eq!(health["detected_lan_ip"], "192.168.10.25");
 
-        // 2. Create Party
-        let Json(created) = create_party(
+        let Json(created) = create_local_room(
             State(state.clone()),
-            Json(CreatePartyRequest {
-                party_name: "E2E Cloud Test Party".to_string(),
-                dj_level: Some("balanced".to_string()),
-                primary_mood_id: Some("shaadi".to_string()),
-                secondary_mood_id: None,
-                energy_progression: Some("buildup".to_string()),
-                allow_guest_requests: Some(true),
-                max_requests_per_guest: Some(5),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Sharma Wedding Sangeet".to_string(),
+                dj_level: Some(3),
+                primary_mood_id: Some("sangeet".to_string()),
+                secondary_mood_id: Some("punjabi_tashan".to_string()),
             }),
         )
         .await
-        .expect("Create party must succeed");
+        .expect("Local room creation must succeed");
 
-        let party_id = created.party_id.clone();
-        let host_token = created.host_token.clone();
-        assert_eq!(created.status, "created");
-        assert!(created.qr_svg.contains("<svg"));
-        assert!(created.guest_url.contains(&party_id));
+        assert!(created.lan_reachable);
+        let guest_url = created.guest_url.as_ref().expect("Real LAN guest URL must be present");
+        assert!(guest_url.starts_with("http://192.168.10.25:47821/join/"));
+        assert!(guest_url.contains(&created.room.room_id));
+        assert!(guest_url.contains(&created.room_access_token));
+        assert!(created.qr_svg.as_ref().unwrap().contains("<svg"));
 
-        // 3. Unauthenticated start must fail with 401
-        let unauth_start = start_party(
-            State(state.clone()),
-            Path(party_id.clone()),
+        // Verify stored tokens in DB are SHA-256 hashed (NEVER raw plaintext!)
+        let stored_room = db.get_local_party_room(&created.room.room_id).unwrap().unwrap();
+        assert_ne!(stored_room.host_token_hash, created.host_token);
+        assert_ne!(stored_room.room_access_token_hash, created.room_access_token);
+        assert_eq!(stored_room.host_token_hash.len(), 64);
+        assert_eq!(stored_room.room_access_token_hash.len(), 64);
+
+        // 2. Without reachable LAN IP -> MUST NOT fabricate fake LAN IP or QR code!
+        let offline_lan_state = Arc::new(LocalHelperState::new(
+            db.clone(),
+            47821,
+            temp_cache.clone(),
+            sync_mgr,
+            Some(None),
+            vec![],
+        ));
+        let Json(no_lan_room) = create_local_room(
+            State(offline_lan_state),
+            ConnectInfo(host_addr),
             HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Offline Host Only".to_string(),
+                dj_level: Some(1),
+                primary_mood_id: Some("shaadi".to_string()),
+                secondary_mood_id: None,
+            }),
         )
-        .await;
-        assert_eq!(unauth_start.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        .await
+        .unwrap();
+        assert!(!no_lan_room.lan_reachable);
+        assert!(no_lan_room.guest_url.is_none(), "Must not fabricate guest URL without LAN IP");
+        assert!(no_lan_room.qr_svg.is_none(), "Must not fabricate QR without LAN IP");
+        assert!(no_lan_room.lan_notice.is_some());
 
-        // 4. Host starts party & broadcasts WebSocket event
+        // 3. Start party & attach a temporary cached audio file to the room
         let mut host_headers = HeaderMap::new();
         host_headers.insert(
             "authorization",
-            HeaderValue::from_str(&format!("Bearer {}", host_token)).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", created.host_token)).unwrap(),
         );
 
-        let Json(started) = start_party(
+        let Json(started) = start_local_room(
             State(state.clone()),
-            Path(party_id.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
             host_headers.clone(),
         )
         .await
-        .expect("Host start must succeed");
+        .expect("Host must start local room");
         assert_eq!(started.status, "live");
 
-        let ws_evt = ws_rx.try_recv().expect("WebSocket broadcast expected on party start");
-        assert_eq!(ws_evt.event_type, "party.status_changed");
-        assert_eq!(ws_evt.payload["status"], "live");
+        let evt_live = ws_rx.try_recv().expect("WS broadcast expected on start");
+        assert_eq!(evt_live.event_type, "room.status_changed");
 
-        // 5. Register valid YouTube source
-        let Json(source) = register_source(
-            State(state.clone()),
-            Path(party_id.clone()),
-            host_headers.clone(),
-            Json(RegisterSourceRequest {
-                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
-            }),
-        )
-        .await
-        .expect("Valid YouTube link must register");
-
-        assert_eq!(source.provider, "youtube");
-        assert_eq!(source.provider_video_id, "dQw4w9WgXcQ");
-        assert_eq!(source.playability_status, "playback_unverified");
-        assert_eq!(source.playback_method, "youtube_iframe_embed");
-
-        let Json(all_sources) = list_sources(State(state.clone()), Path(party_id.clone()))
-            .await
+        let dummy_temp_audio = temp_cache.join("temp_party_track.wav");
+        std::fs::write(&dummy_temp_audio, vec![1u8; 2048]).unwrap();
+        state
+            .cache_manager
+            .register_temp_track(
+                &created.room.room_id,
+                None,
+                "gsng_temp_01",
+                &dummy_temp_audio,
+                CACHE_PRIORITY_PLAYING,
+                true,
+                None,
+                DEFAULT_MAX_TEMP_TRACKS,
+                &db,
+            )
             .unwrap();
-        assert_eq!(all_sources.len(), 1);
+        assert!(dummy_temp_audio.exists());
 
-        // 6. Reject unauthorized non-YouTube domain with 400 Bad Request
-        let bad_src_res = register_source(
+        // Verify dashboard reports live status (no auto-expiry)
+        let Json(dash) = get_host_room_dashboard(
             State(state.clone()),
-            Path(party_id.clone()),
-            host_headers.clone(),
-            Json(RegisterSourceRequest {
-                url: "https://vimeo.com/12345678901".to_string(),
-            }),
-        )
-        .await;
-        assert_eq!(bad_src_res.unwrap_err().0, StatusCode::BAD_REQUEST);
-
-        // 7. Guest Auth & Request Submission
-        let Json(guest) = guest_auth(
-            State(state.clone()),
-            Path(party_id.clone()),
-            ConnectInfo(client_addr),
-            Json(GuestAuthRequest {
-                nickname: "Aarav".to_string(),
-                fingerprint: Some("mobile_browser_1".to_string()),
-            }),
-        )
-        .await
-        .expect("Guest auth must succeed");
-
-        let mut guest_headers = HeaderMap::new();
-        guest_headers.insert(
-            "authorization",
-            HeaderValue::from_str(&format!("Bearer {}", guest.token)).unwrap(),
-        );
-
-        let Json(req) = create_request(
-            State(state.clone()),
-            Path(party_id.clone()),
-            guest_headers.clone(),
-            ConnectInfo(client_addr),
-            Json(CreateSongRequestPayload {
-                source_id: source.id.clone(),
-                custom_note: Some("Dance floor banger!".to_string()),
-            }),
-        )
-        .await
-        .expect("Guest request submission must succeed");
-        assert_eq!(req.status, "pending");
-
-        // 8. Privilege separation: Guest token MUST be rejected with 403 on host approve endpoint
-        let guest_approve_attempt = approve_request(
-            State(state.clone()),
-            Path((party_id.clone(), req.id.clone())),
-            guest_headers.clone(),
-        )
-        .await;
-        assert_eq!(guest_approve_attempt.unwrap_err().0, StatusCode::FORBIDDEN);
-
-        // 9. Host approves request & verifies list
-        let Json(approved) = approve_request(
-            State(state.clone()),
-            Path((party_id.clone(), req.id.clone())),
-            host_headers.clone(),
-        )
-        .await
-        .expect("Host approve must succeed");
-        assert_eq!(approved["status"], "approved");
-
-        let Json(host_requests) = list_requests(
-            State(state.clone()),
-            Path(party_id.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
             host_headers.clone(),
         )
         .await
         .unwrap();
-        assert_eq!(host_requests.len(), 1);
-        assert_eq!(host_requests[0].status, "approved");
-        assert_eq!(host_requests[0].guest_name.as_deref(), Some("Aarav"));
+        assert_eq!(dash.room.status, "live");
+        assert_eq!(dash.exposed_decks, 4);
+        assert_eq!(dash.internal_deck_capacity, 4);
+        assert!(dash.auto_dj_enabled);
 
-        // 10. Host ends party
-        let Json(ended) = end_party(
+        // 4. Explicit host closure invalidates room and purges temporary cached audio file
+        let Json(closed) = close_local_room(
             State(state.clone()),
-            Path(party_id.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
             host_headers,
         )
         .await
-        .expect("Host end must succeed");
-        assert_eq!(ended.status, "ended");
+        .expect("Explicit close must succeed");
+        assert_eq!(closed["status"], "closed");
+        assert_eq!(closed["purged_cache_files"], 1);
+        assert!(!dummy_temp_audio.exists(), "Temporary audio must be deleted on explicit party close");
+
+        let evt_closed = ws_rx.try_recv().expect("WS broadcast expected on close");
+        assert_eq!(evt_closed.event_type, "room.closed");
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
+    /// In-process handler + router test: verifies LAN guest auth (room_id alone rejected),
+    /// cross-room isolation, strict guest privacy (cannot see playlist or other guests' requests),
+    /// unified host & guest song submission, host-only control protection, and absence of approval/rejection routes.
+    #[tokio::test]
+    async fn test_lan_guest_isolation_privacy_unified_submission_and_no_approval_workflow_in_process() {
+        use axum::body::Body;
+        use axum::extract::{ConnectInfo, Path, State};
+        use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+        use axum::Json;
+        use dhun_lib::network::local_helper_routes::{
+            create_local_helper_router, create_local_room, get_guest_own_submissions,
+            get_host_room_dashboard, guest_join_local_room, submit_song_to_local_room,
+            CreateLocalRoomRequest, GuestJoinRoomRequest, LocalHelperState,
+            UnifiedSongSubmissionRequest,
+        };
+        use dhun_lib::sync::MetadataSyncManager;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tower_service::Service;
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_p2_iso_{}", uuid::Uuid::new_v4()));
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let state = Arc::new(LocalHelperState::new(
+            db,
+            47821,
+            temp_cache.clone(),
+            sync_mgr,
+            Some(Some("192.168.1.50".to_string())),
+            vec![],
+        ));
+        let lan_guest_addr: SocketAddr = "192.168.1.88:55123".parse().unwrap();
+
+        // Create Room A and Room B
+        let Json(room_a) = create_local_room(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:50000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Room A".to_string(),
+                dj_level: Some(2),
+                primary_mood_id: Some("shaadi".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(room_b) = create_local_room(
+            State(state.clone()),
+            ConnectInfo("127.0.0.1:50000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Room B".to_string(),
+                dj_level: Some(2),
+                primary_mood_id: Some("baraat".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // 1. Bare room_id alone WITHOUT access token or room code MUST be rejected (401)
+        let bare_join = guest_join_local_room(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo(lan_guest_addr),
+            HeaderMap::new(),
+            Json(GuestJoinRoomRequest {
+                nickname: "Intruder".to_string(),
+                room_access_token: None,
+                room_code: None,
+            }),
+        )
+        .await;
+        assert_eq!(bare_join.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // 2. Guest 1 joins Room A using QR access token; Guest 2 joins Room A using Room Code
+        let Json(g1) = guest_join_local_room(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo(lan_guest_addr),
+            HeaderMap::new(),
+            Json(GuestJoinRoomRequest {
+                nickname: "Riya".to_string(),
+                room_access_token: Some(room_a.room_access_token.clone()),
+                room_code: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(g2) = guest_join_local_room(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo("192.168.1.99:55124".parse().unwrap()),
+            HeaderMap::new(),
+            Json(GuestJoinRoomRequest {
+                nickname: "Kabir".to_string(),
+                room_access_token: None,
+                room_code: Some(room_a.room.room_code.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut g1_headers = HeaderMap::new();
+        g1_headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {}", g1.guest_token)).unwrap());
+        let mut g2_headers = HeaderMap::new();
+        g2_headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {}", g2.guest_token)).unwrap());
+        let mut host_a_headers = HeaderMap::new();
+        host_a_headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {}", room_a.host_token)).unwrap());
+
+        // 3. Cross-room isolation: Guest 1 from Room A MUST be rejected on Room B
+        let cross_room = submit_song_to_local_room(
+            State(state.clone()),
+            Path(room_b.room.room_id.clone()),
+            ConnectInfo(lan_guest_addr),
+            g1_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await;
+        assert_eq!(cross_room.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // 4. Host-only operations MUST reject guest tokens (403 Forbidden)
+        let guest_dashboard_attempt = get_host_room_dashboard(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo(lan_guest_addr),
+            g1_headers.clone(),
+        )
+        .await;
+        assert_eq!(guest_dashboard_attempt.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // 5. Unified submission: Guest 1, Guest 2, AND Host all use the exact same endpoint (zero approval queue)
+        let Json(sub_g1) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo(lan_guest_addr),
+            g1_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sub_g1.submitted_by_type, "guest");
+        assert_eq!(sub_g1.status, "received_by_dj");
+        assert!(!sub_g1.interrupted_current_track);
+
+        let Json(sub_g2) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo("192.168.1.99:55124".parse().unwrap()),
+            g2_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://youtu.be/9bZkp7q19f0".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sub_g2.submitted_by_type, "guest");
+
+        let Json(sub_host) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo("127.0.0.1:50000".parse().unwrap()),
+            host_a_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://music.youtube.com/watch?v=kJQP7kiw5Fk".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sub_host.submitted_by_type, "host");
+
+        // 6. Strict Guest Privacy: Guest 1 sees ONLY Guest 1's own song (NEVER Guest 2's or Host's!)
+        let Json(g1_mine) = get_guest_own_submissions(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo(lan_guest_addr),
+            g1_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(g1_mine.len(), 1);
+        assert_eq!(g1_mine[0].id, sub_g1.id);
+
+        // Host sees all 3 private candidate pool entries
+        let Json(host_dash) = get_host_room_dashboard(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo("127.0.0.1:50000".parse().unwrap()),
+            host_a_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(host_dash.submissions.len(), 3);
+
+        // 7. Verify absence of approval/rejection routes on the Local Helper Router (404 Not Found)
+        let mut router = create_local_helper_router(state);
+        for removed_path in [
+            format!("/api/local/rooms/{}/requests/{}/approve", room_a.room.room_id, sub_g1.id),
+            format!("/api/local/rooms/{}/requests/{}/reject", room_a.room.room_id, sub_g1.id),
+            format!("/api/parties/{}/requests/{}/approve", room_a.room.room_id, sub_g1.id),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(&removed_path)
+                .header("host", "127.0.0.1:47821")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.call(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "Approval/rejection route '{}' must not exist",
+                removed_path
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
+    /// In-process security test: enforces LAN-only peer IP filtering (blocks external non-LAN IPs)
+    /// and Host-header DNS rebinding protection.
+    #[test]
+    fn test_local_helper_lan_ip_and_dns_rebinding_security_boundaries() {
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use dhun_lib::network::local_helper_routes::verify_lan_and_host_headers;
+        use std::net::IpAddr;
+
+        let lan_ip = Some("192.168.1.42");
+
+        // 1. External public IP outside LAN MUST be blocked (403)
+        let public_ip: IpAddr = "203.0.113.55".parse().unwrap();
+        let res_public = verify_lan_and_host_headers(public_ip, &HeaderMap::new(), lan_ip);
+        assert_eq!(res_public.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // 2. DNS rebinding Host header MUST be blocked (403) even from 127.0.0.1
+        let mut rebind_headers = HeaderMap::new();
+        rebind_headers.insert("host", HeaderValue::from_static("evil.rebind.attacker.com:47821"));
+        let res_rebind = verify_lan_and_host_headers("127.0.0.1".parse().unwrap(), &rebind_headers, lan_ip);
+        assert_eq!(res_rebind.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // 3. Legitimate LAN peer + matching LAN Host header is permitted
+        let mut valid_lan_headers = HeaderMap::new();
+        valid_lan_headers.insert("host", HeaderValue::from_static("192.168.1.42:47821"));
+        assert!(verify_lan_and_host_headers("192.168.1.91".parse().unwrap(), &valid_lan_headers, lan_ip).is_ok());
+
+        // 4. Legitimate host loopback + localhost Host header is permitted
+        let mut valid_local_headers = HeaderMap::new();
+        valid_local_headers.insert("host", HeaderValue::from_static("localhost:47821"));
+        assert!(verify_lan_and_host_headers("127.0.0.1".parse().unwrap(), &valid_local_headers, lan_ip).is_ok());
+    }
+
+    /// In-process service test: verifies Global Shared Song Metadata Catalogue isolation
+    /// (zero party tables), HMAC-SHA256 engine-only auth (browser blocked), forbidden audio/party field rejection,
+    /// duplicate URL merging, and distinct identities for remixes/live/original versions.
+    #[tokio::test]
+    async fn test_global_metadata_catalogue_isolation_dedup_and_engine_auth_in_process() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use axum::Json;
+        use dhun_lib::metadata_service::{
+            catalogue_lookup, catalogue_upsert, extract_version_tag, GlobalCatalogueState,
+        };
+        use dhun_lib::sync::sign_request;
+        use std::sync::Arc;
+
+        // 1. Isolated cloud DB MUST contain ZERO party or guest tables
+        let cloud_db = Database::new_global_catalogue_in_memory().unwrap();
+        {
+            let conn = cloud_db.conn();
+            let guard = conn.lock().unwrap();
+            let party_tables: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('parties', 'local_party_rooms', 'party_guests', 'local_room_submissions')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(party_tables, 0, "Global metadata database must contain ZERO party or guest tables");
+        }
+
+        let service_key = "dhun_engine_hmac_secret_2026".to_string();
+        let state = Arc::new(GlobalCatalogueState::new(cloud_db, service_key.clone()));
+
+        let make_signed_headers = |path: &str, body: &str| {
+            let ts = chrono::Utc::now().timestamp();
+            let sig = sign_request(&service_key, "POST", path, ts, body);
+            let mut h = HeaderMap::new();
+            h.insert("x-dhun-timestamp", HeaderValue::from_str(&ts.to_string()).unwrap());
+            h.insert("x-dhun-signature", HeaderValue::from_str(&format!("sha256={}", sig)).unwrap());
+            h
+        };
+
+        // 2. Unauthenticated browser request MUST fail with 401 Unauthorized
+        let unauth_lookup = catalogue_lookup(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"provider_video_id":"dQw4w9WgXcQ"}"#),
+        )
+        .await;
+        assert_eq!(unauth_lookup.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // 3. Forbidden audio/party fields MUST be rejected with 400 Bad Request
+        let bad_body = r#"{"source_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","title":"Test","artist":"Artist","audio_base64":"AAAA"}"#;
+        let bad_res = catalogue_upsert(
+            State(state.clone()),
+            make_signed_headers("/api/v1/catalogue/upsert", bad_body),
+            Bytes::from(bad_body),
+        )
+        .await;
+        assert_eq!(bad_res.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        // 4. Upsert Original Song with BPM -> verifies half-time & double-time BPM calculation
+        let orig_body = serde_json::json!({
+            "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "title": "Chaiyya Chaiyya (Official Video)",
+            "artist": "Sukhwinder Singh",
+            "duration_ms": 296000,
+            "original_bpm": 128.0,
+            "bpm_confidence": 0.97,
+            "musical_key": "D Major",
+            "camelot_key": "10B",
+            "key_confidence": 0.94,
+            "overall_energy": 0.89,
+            "danceability": 0.95,
+            "genre_tags": ["Bollywood", "Wedding"],
+            "mood_tags": ["shaadi", "sangeet"],
+            "processing_status": "analyzed"
+        })
+        .to_string();
+
+        let Json(saved_orig) = catalogue_upsert(
+            State(state.clone()),
+            make_signed_headers("/api/v1/catalogue/upsert", &orig_body),
+            Bytes::from(orig_body),
+        )
+        .await
+        .expect("Valid signed engine metadata upsert must succeed");
+        assert_eq!(saved_orig.version_tag, "original");
+        assert_eq!(saved_orig.original_bpm, Some(128.0));
+        assert_eq!(saved_orig.half_time_bpm, Some(64.0));
+        assert_eq!(saved_orig.double_time_bpm, Some(256.0));
+
+        // 5. Duplicate YouTube Music URL for same video ID resolves to SAME song_id
+        let dup_body = serde_json::json!({
+            "source_url": "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+            "title": "Chaiyya Chaiyya",
+            "artist": "Sukhwinder Singh",
+            "duration_ms": 296000
+        })
+        .to_string();
+        let Json(saved_dup) = catalogue_upsert(
+            State(state.clone()),
+            make_signed_headers("/api/v1/catalogue/upsert", &dup_body),
+            Bytes::from(dup_body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved_dup.song_id, saved_orig.song_id, "Duplicate URLs must deduplicate to same song_id");
+
+        // 6. Remix & Live recordings MUST remain distinct song identities!
+        assert_eq!(extract_version_tag("Chaiyya Chaiyya (DJ Remix)"), "remix");
+        assert_eq!(extract_version_tag("Chaiyya Chaiyya (Live Concert)"), "live");
+
+        let remix_body = serde_json::json!({
+            "source_url": "https://www.youtube.com/watch?v=9bZkp7q19f0",
+            "title": "Chaiyya Chaiyya (DJ Remix)",
+            "artist": "Sukhwinder Singh",
+            "duration_ms": 240000,
+            "original_bpm": 134.0
+        })
+        .to_string();
+        let Json(saved_remix) = catalogue_upsert(
+            State(state.clone()),
+            make_signed_headers("/api/v1/catalogue/upsert", &remix_body),
+            Bytes::from(remix_body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved_remix.version_tag, "remix");
+        assert_ne!(saved_remix.song_id, saved_orig.song_id, "Remix must have distinct song identity");
+
+        // 7. Reusable engine lookup by video ID
+        let lookup_body = r#"{"provider_video_id":"dQw4w9WgXcQ"}"#;
+        let Json(lookup_res) = catalogue_lookup(
+            State(state.clone()),
+            make_signed_headers("/api/v1/catalogue/lookup", lookup_body),
+            Bytes::from_static(lookup_body.as_bytes()),
+        )
+        .await
+        .unwrap();
+        assert!(lookup_res.found);
+        assert_eq!(lookup_res.metadata.unwrap().camelot_key.as_deref(), Some("10B"));
+
+        // 8. Verify ZERO party routes and ZERO user-facing catalogue browse/search routes exist on cloud router
+        use axum::body::Body;
+        use axum::http::Request;
+        use dhun_lib::metadata_service::create_global_catalogue_router;
+        use tower_service::Service;
+        let mut cloud_router = create_global_catalogue_router(state);
+        for (method, forbidden_path) in [
+            ("POST", "/api/parties"),
+            ("GET", "/api/v1/catalogue/search"),
+            ("GET", "/api/v1/catalogue/browse"),
+            ("GET", "/api/v1/catalogue"),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(forbidden_path)
+                .body(Body::empty())
+                .unwrap();
+            let resp = cloud_router.call(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "Cloud metadata router must not expose '{} {}'",
+                method,
+                forbidden_path
+            );
+        }
+    }
+
+    /// In-process pipeline test: verifies the 6-stage local processing pipeline including
+    /// honest RestrictedByProvider status for standard YouTube URLs, local Symphonia DSP analysis
+    /// on locally cached authorized audio, and offline metadata-only sync outbox queueing.
+    #[tokio::test]
+    async fn test_local_6_stage_pipeline_analysis_and_offline_metadata_sync_queue() {
+        use dhun_lib::library::cache::{RollingCacheManager, DEFAULT_MAX_CACHE_BYTES};
+        use dhun_lib::library::downloader::AudioDownloader;
+        use dhun_lib::library::pipeline::{run_local_song_pipeline, AcquisitionStatus};
+        use dhun_lib::sync::MetadataSyncManager;
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_p2_pipe_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_cache).unwrap();
+
+        let cache_mgr = RollingCacheManager::new(&temp_cache, DEFAULT_MAX_CACHE_BYTES);
+        let downloader = AudioDownloader::new(&temp_cache);
+        let offline_sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let client = reqwest::Client::new();
+
+        // 1. Standard YouTube URL without unauthorized extraction -> RestrictedByProvider
+        let restricted = run_local_song_pipeline(
+            "rm_pipe_1",
+            "sub_pipe_1",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            None,
+            None,
+            &db,
+            &cache_mgr,
+            &downloader,
+            &offline_sync_mgr,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restricted.acquisition_status, AcquisitionStatus::RestrictedByProvider);
+        assert!(restricted.cached_entry.is_none());
+        assert!(restricted.sync_outbox_id.is_some());
+
+        // 2. Authorized locally cached WAV audio -> full Stage 4 cache + Stage 5 local DSP analysis + Stage 6 offline sync queue
+        let wav_path = temp_cache.join("authorized_cached_track.wav");
+        let wav_bytes = create_test_wav_bytes(44100, 2, 132_300, 132_300); // 3.0 seconds valid stereo WAV
+        std::fs::write(&wav_path, wav_bytes).unwrap();
+
+        let analyzed = run_local_song_pipeline(
+            "rm_pipe_1",
+            "sub_pipe_2",
+            "https://music.youtube.com/watch?v=9bZkp7q19f0",
+            None,
+            Some(&wav_path),
+            &db,
+            &cache_mgr,
+            &downloader,
+            &offline_sync_mgr,
+            &client,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(analyzed.acquisition_status, AcquisitionStatus::CachedAuthorized);
+        assert!(analyzed.cached_entry.is_some());
+        let local_analysis = analyzed.local_analysis.expect("Stage 5 local audio analysis must succeed");
+        assert!(local_analysis.original_bpm > 0.0);
+        assert!((local_analysis.half_time_bpm - (local_analysis.original_bpm / 2.0)).abs() < 0.1);
+        assert!((local_analysis.double_time_bpm - (local_analysis.original_bpm * 2.0)).abs() < 0.1);
+        assert!(!local_analysis.camelot_key.is_empty());
+
+        // Verify offline outbox queued strictly metadata-only items (zero audio bytes in payload)
+        let pending = db.get_pending_sync_items(10).unwrap();
+        assert!(pending.iter().any(|i| i.entity_type == "global_song_metadata" && i.entity_id == "9bZkp7q19f0"));
+        for item in &pending {
+            assert!(!item.payload_json.contains("audio_bytes"));
+            assert!(!item.payload_json.contains("audio_base64"));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
+    /// In-process cache test: verifies 10-15 track rolling cap, priority locks for playing/upcoming tracks,
+    /// launch-time expired cache file cleanup, and explicit room purge.
+    #[test]
+    fn test_local_temp_cache_15_track_cap_priority_and_expiry_cleanup() {
+        use dhun_lib::library::cache::{
+            RollingCacheManager, CACHE_PRIORITY_EVICTABLE, CACHE_PRIORITY_NEXT_DECK,
+            CACHE_PRIORITY_PLAYING, CACHE_PRIORITY_UPCOMING, DEFAULT_MAX_CACHE_BYTES,
+            DEFAULT_MAX_TEMP_TRACKS,
+        };
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_p2_cache_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_cache).unwrap();
+        let cache_mgr = RollingCacheManager::new(&temp_cache, DEFAULT_MAX_CACHE_BYTES);
+
+        // Register 18 temporary files: first 3 are locked (playing, next_deck, upcoming)
+        let mut locked_paths = Vec::new();
+        for i in 0..18 {
+            let p = temp_cache.join(format!("track_{:02}.wav", i));
+            std::fs::write(&p, vec![0u8; 512]).unwrap();
+            let (tier, locked) = match i {
+                0 => (CACHE_PRIORITY_PLAYING, true),
+                1 => (CACHE_PRIORITY_NEXT_DECK, true),
+                2 => (CACHE_PRIORITY_UPCOMING, true),
+                _ => (CACHE_PRIORITY_EVICTABLE, false),
+            };
+            if locked {
+                locked_paths.push(p.clone());
+            }
+            cache_mgr
+                .register_temp_track(
+                    "rm_cache_test",
+                    None,
+                    &format!("gsng_{}", i),
+                    &p,
+                    tier,
+                    locked,
+                    None,
+                    DEFAULT_MAX_TEMP_TRACKS,
+                    &db,
+                )
+                .unwrap();
+        }
+
+        let stats = cache_mgr.get_temp_cache_stats(DEFAULT_MAX_TEMP_TRACKS, &db).unwrap();
+        assert_eq!(stats.track_count, 15, "Rolling temp cache must cap at 15 tracks");
+        assert_eq!(stats.locked_tracks, 3);
+        for lp in &locked_paths {
+            assert!(lp.exists(), "Priority-locked playing/upcoming track {:?} must never be evicted", lp);
+        }
+
+        // Insert an already-expired file and verify launch-time expiry sweep deletes it
+        let expired_path = temp_cache.join("stale_expired_track.wav");
+        std::fs::write(&expired_path, vec![0u8; 256]).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.upsert_local_temp_cache(&LocalTempCacheEntry {
+            id: "lcache_expired_1".to_string(),
+            room_id: "rm_old_crashed_room".to_string(),
+            submission_id: None,
+            song_id: "gsng_old".to_string(),
+            file_path: expired_path.to_string_lossy().to_string(),
+            size_bytes: 256,
+            priority_tier: 0,
+            is_locked: false,
+            created_at: now - 100_000,
+            last_accessed_at: now - 100_000,
+            expires_at: now - 5_000,
+        })
+        .unwrap();
+
+        let expired_deleted = cache_mgr.cleanup_expired_on_launch(&db).unwrap();
+        assert_eq!(expired_deleted, 1);
+        assert!(!expired_path.exists(), "Expired cache file must be deleted on service launch");
+
+        // Explicit room close purge removes all 15 remaining files for rm_cache_test
+        let purged = cache_mgr.purge_room_cache("rm_cache_test", &db).unwrap();
+        assert_eq!(purged, 15);
+        assert_eq!(
+            cache_mgr.get_temp_cache_stats(DEFAULT_MAX_TEMP_TRACKS, &db).unwrap().track_count,
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
+    /// In-process DJ engine test: verifies all 14 moods, all 4 DJ levels (with 4-deck internal capacity
+    /// and universal automatic DJ support), and non-interrupting candidate evaluation.
+    #[test]
+    fn test_all_14_moods_4_dj_levels_and_non_interrupting_dj_evaluation() {
+        use dhun_lib::dj::levels::DjLevel;
+        use dhun_lib::dj::moods::{get_mood_by_id, get_preset_moods};
+        use dhun_lib::dj::selector::select_next_submission_without_interrupting;
+
+        // 1. Verify all 14 mandatory moods
+        let moods = get_preset_moods();
+        assert_eq!(moods.len(), 14);
+        for required_id in [
+            "shaadi", "baraat", "mehendi", "haldi", "sangeet", "desi_club",
+            "punjabi_tashan", "garba", "dandiya", "retro_bollywood", "house_party",
+            "cocktail_night", "festival_mode", "international_party",
+        ] {
+            let m = get_mood_by_id(required_id).expect("Required mood must exist");
+            assert!(m.min_bpm < m.max_bpm);
+            assert!(!m.genre_weights.is_empty());
+        }
+
+        // 2. Verify all 4 DJ levels support automatic DJ playback & 4-deck internal architecture
+        for (lvl_num, expected_exposed) in [(1, 2), (2, 2), (3, 4), (4, 4)] {
+            let lvl = DjLevel::from_i32(lvl_num);
+            assert!(lvl.supports_auto_dj(), "Level {} must support automatic party playback", lvl_num);
+            assert_eq!(lvl.internal_deck_capacity(), 4, "Internal architecture must always support 4 decks");
+            assert_eq!(lvl.max_decks(), expected_exposed);
+        }
+
+        // 3. Non-interrupting evaluation: currently playing track is preserved while best mood/BPM/key candidate is chosen
+        let shaadi = get_mood_by_id("shaadi").unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let make_sub = |id: &str, status: &str, bpm: f64, camelot: &str, mood_tags: &str, acq: &str| LocalRoomSubmission {
+            id: id.to_string(),
+            room_id: "rm_dj".to_string(),
+            submitted_by_type: "guest".to_string(),
+            submitted_by_id: "g1".to_string(),
+            submitted_by_name: "Guest".to_string(),
+            provider: "youtube".to_string(),
+            source_url: format!("https://www.youtube.com/watch?v={:0<11}", id),
+            provider_video_id: format!("{:0<11}", id),
+            song_id: None,
+            title: id.to_string(),
+            artist: "Artist".to_string(),
+            version_tag: "original".to_string(),
+            thumbnail_url: None,
+            duration_ms: Some(210_000),
+            bpm: Some(bpm),
+            half_time_bpm: Some(bpm / 2.0),
+            double_time_bpm: Some(bpm * 2.0),
+            musical_key: Some("C Major".to_string()),
+            camelot_key: Some(camelot.to_string()),
+            overall_energy: Some(0.76),
+            danceability: Some(0.90),
+            genre_tags_json: r#"["Bollywood"]"#.to_string(),
+            mood_tags_json: mood_tags.to_string(),
+            metadata_source: "local_analysis".to_string(),
+            acquisition_status: acq.to_string(),
+            acquisition_note: None,
+            dj_status: status.to_string(),
+            dj_score: 0.0,
+            local_cache_path: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let pool = vec![
+            make_sub("playing_now", "playing", 124.0, "8B", r#"["shaadi"]"#, "cached_authorized"),
+            make_sub("clash_track", "queued_for_dj", 92.0, "2A", r#"["cocktail_night"]"#, "restricted_by_provider"),
+            make_sub("perfect_fit", "queued_for_dj", 125.0, "9B", r#"["shaadi"]"#, "cached_authorized"),
+        ];
+
+        let (scored, best_next) = select_next_submission_without_interrupting(&pool, &shaadi, None, shaadi.target_energy);
+        assert!(
+            scored.iter().all(|(id, _)| id != "playing_now"),
+            "Currently playing track must NEVER be interrupted or re-queued during evaluation"
+        );
+        assert_eq!(best_next.as_deref(), Some("perfect_fit"));
     }
 }
 

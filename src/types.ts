@@ -7,68 +7,134 @@ export interface MoodProfile {
   min_bpm: number;
   max_bpm: number;
   target_energy: number;
-  transition_style: string;
+  transition_style: 'bass_swap' | 'quick_cut' | 'phrase_sync' | 'filter_sweep' | string;
   repetition_cooldown_mins: number;
   artist_cooldown_mins: number;
+  preferred_fx_index?: number;
   genre_weights?: [string, number][];
 }
 
-export interface Track {
+export interface LocalPartyRoom {
+  room_id: string;
+  room_code: string;
+  party_name: string;
+  status: 'created' | 'live' | 'closed';
+  dj_level: DjLevel;
+  primary_mood_id: string;
+  secondary_mood_id?: string | null;
+  created_at: number;
+  started_at?: number | null;
+  closed_at?: number | null;
+  updated_at: number;
+}
+
+export interface LocalRoomSubmission {
   id: string;
+  room_id: string;
+  submitted_by_type: 'guest' | 'host';
+  submitted_by_id: string;
+  submitted_by_name: string;
+  provider: string; // 'youtube' | 'youtube_music'
+  source_url: string;
+  provider_video_id: string;
+  song_id?: string | null;
   title: string;
   artist: string;
-  album?: string;
-  duration_ms: number;
-  year?: number;
-  genre: string;
-  subgenre?: string;
+  version_tag: string;
+  thumbnail_url?: string | null;
+  duration_ms?: number | null;
+  bpm?: number | null;
+  half_time_bpm?: number | null;
+  double_time_bpm?: number | null;
+  musical_key?: string | null;
+  camelot_key?: string | null;
+  overall_energy?: number | null;
+  danceability?: number | null;
+  metadata_source: string;
+  acquisition_status: 'restricted_by_provider' | 'cached_authorized' | 'pending' | 'failed' | string;
+  acquisition_note?: string | null;
+  dj_status: 'queued_for_dj' | 'prepared' | 'playing' | 'played' | 'skipped_unplayable' | string;
+  dj_score: number;
+  local_cache_path?: string | null;
   created_at: number;
   updated_at: number;
 }
 
-export interface TrackAnalysis {
-  track_id: string;
-  bpm: number;
-  bpm_confidence: number;
-  key_name: string;
-  camelot_key: string;
-  key_confidence: number;
-  downbeat_offset_ms: number;
-  phrase_length_bars: number;
-  overall_energy: number;
-  dance_suitability: number;
-  recommended_mix_in_ms: number;
-  recommended_mix_out_ms: number;
+export interface LocalTempCacheStats {
+  track_count: number;
+  max_tracks: number;
+  total_bytes: number;
+  locked_tracks: number;
 }
 
-export interface PlayableTrackCandidate {
-  track: Track;
-  asset: {
-    id: string;
-    file_path: string;
-    file_format: string;
-    verification_status: string;
-    availability_status: string;
-  };
-  analysis: TrackAnalysis;
-  compatibility_score: number;
-  transition_style: string;
+export interface SyncStatusOverview {
+  pending_count: number;
+  in_flight_count: number;
+  synced_count: number;
+  failed_count: number;
 }
 
-export interface GuestRequest {
+export interface LocalHelperHealth {
+  status: string;
+  service: string;
+  version: string;
+  port: number;
+  lan_reachable: boolean;
+  detected_lan_ip: string | null;
+  cache_stats: LocalTempCacheStats;
+  sync_overview: SyncStatusOverview;
+  timestamp: number;
+}
+
+export interface CreateLocalRoomResponse {
+  room: LocalPartyRoom;
+  host_token: string;
+  room_access_token: string;
+  lan_reachable: boolean;
+  detected_lan_ip: string | null;
+  guest_url: string | null;
+  qr_svg: string | null;
+  lan_notice: string | null;
+}
+
+export interface HostRoomDashboardResponse {
+  room: LocalPartyRoom;
+  dj_level_name: string;
+  exposed_decks: number;
+  internal_deck_capacity: number;
+  auto_dj_enabled: boolean;
+  lan_reachable: boolean;
+  detected_lan_ip: string | null;
+  submissions: LocalRoomSubmission[];
+  cache_stats: LocalTempCacheStats;
+  sync_overview: SyncStatusOverview;
+}
+
+export interface UnifiedSongSubmissionResponse {
   id: string;
-  session_id: string;
-  guest_id: string;
-  guest_name?: string;
-  track_id: string;
-  track_title?: string;
-  track_artist?: string;
-  submitted_at: number;
-  status: 'pending' | 'approved' | 'rejected' | 'scheduled' | 'playing' | 'played' | 'deferred';
-  priority_order: number;
-  host_note?: string;
+  submitted_by_type: string;
+  title: string;
+  artist: string;
+  version_tag: string;
+  provider: string;
+  status: string;
+  metadata_source: string;
+  acquisition_status: string;
+  acquisition_note: string;
+  dj_score: number;
+  interrupted_current_track: boolean;
 }
 
+export interface LocalRoomEvent {
+  room_id: string;
+  event_type: string;
+  target_guest_id?: string | null;
+  host_only: boolean;
+  payload: any;
+  timestamp: number;
+}
+
+// Legacy compatibility shapes for auxiliary screens
 export interface DeckTelemetry {
   deck_id: number;
   track_id?: string;
@@ -90,116 +156,3 @@ export interface MasterTelemetry {
   timestamp_ms: number;
   decks: DeckTelemetry[];
 }
-
-export interface PartyStatus {
-  is_active: boolean;
-  session_id?: string;
-  party_name?: string;
-  primary_mood_id?: string;
-  dj_level?: DjLevel;
-  guest_url?: string;
-  qr_svg?: string;
-  now_playing?: PlayableTrackCandidate;
-  next_track?: PlayableTrackCandidate;
-  following_track?: PlayableTrackCandidate;
-}
-
-export interface AudioDeviceInfo {
-  name: string;
-  is_default: boolean;
-  default_sample_rate: number;
-  channels: number;
-}
-
-// ========================================================================
-// Cloud Party Foundation Types (Phase 1)
-// ========================================================================
-
-export interface CloudParty {
-  id: string;
-  party_name: string;
-  status: 'created' | 'live' | 'paused' | 'ended';
-  created_at: number;
-  updated_at: number;
-  started_at?: number;
-  ended_at?: number;
-  last_heartbeat_at: number;
-}
-
-export interface PartyConfiguration {
-  party_id: string;
-  dj_level: string; // 'hands_off' | 'balanced' | 'curated' | 'manual'
-  primary_mood_id: string;
-  secondary_mood_id?: string;
-  energy_progression: string;
-  allow_guest_requests: boolean;
-  max_requests_per_guest: number;
-  request_cooldown_mins: number;
-  require_host_approval: boolean;
-  updated_at: number;
-}
-
-export interface PartySourceReference {
-  id: string;
-  party_id: string;
-  provider: string; // 'youtube' | 'youtube_music'
-  original_url: string;
-  provider_video_id: string;
-  title: string;
-  artist: string;
-  thumbnail_url?: string;
-  duration_seconds?: number;
-  verification_status: string;
-  playback_method: string;
-  playability_status: string; // 'playback_unverified' | 'playable' | 'unavailable'
-  metadata_status: string;
-  error_reason?: string;
-  registered_at: number;
-  updated_at: number;
-}
-
-export interface PartySongRequest {
-  id: string;
-  party_id: string;
-  guest_id: string;
-  guest_name?: string;
-  source_id: string;
-  source_title?: string;
-  source_artist?: string;
-  thumbnail_url?: string;
-  custom_note?: string;
-  status: 'pending' | 'approved' | 'rejected' | 'played' | 'cancelled';
-  rejection_reason?: string;
-  priority_score: number;
-  created_at: number;
-  updated_at: number;
-}
-
-export interface CreatePartyResponse {
-  party_id: string;
-  party_name: string;
-  status: 'created' | 'live' | 'paused' | 'ended';
-  host_token: string;
-  guest_url: string;
-  qr_svg: string;
-  config: PartyConfiguration;
-  created_at: number;
-}
-
-export interface PartyDetailsResponse {
-  party: CloudParty;
-  config?: PartyConfiguration;
-  guest_url: string;
-  qr_svg: string;
-  sources_count: number;
-  pending_requests_count: number;
-}
-
-export interface PartyEventMessage {
-  party_id: string;
-  event_type: string;
-  payload: any;
-  timestamp: number;
-}
-
-

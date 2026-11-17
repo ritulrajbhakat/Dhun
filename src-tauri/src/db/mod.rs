@@ -33,6 +33,26 @@ impl Database {
         })
     }
 
+    /// Opens an isolated SQLite database containing ONLY the Global Shared Song Metadata Catalogue tables.
+    /// Guarantees zero party rooms, playlists, guest requests, or audio file records exist in cloud storage.
+    pub fn new_global_catalogue_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+        migrations::run_global_catalogue_migrations(&mut conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    pub fn new_global_catalogue_in_memory() -> Result<Self> {
+        let mut conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        migrations::run_global_catalogue_migrations(&mut conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
     pub fn conn(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
     }
@@ -1440,6 +1460,648 @@ impl Database {
             params![id, party_id, action, actor, details_json, now],
         )?;
         Ok(())
+    }
+
+    // ========================================================================
+    // Local Party Helper Operations (Host Machine Only — Zero Cloud Parties)
+    // ========================================================================
+
+    pub fn create_local_party_room(&self, room: &LocalPartyRoom) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO local_party_rooms (
+                room_id, room_code, party_name, status, dj_level, primary_mood_id, secondary_mood_id,
+                host_token_hash, room_access_token_hash, created_at, started_at, closed_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                room.room_id, room.room_code, room.party_name, room.status, room.dj_level,
+                room.primary_mood_id, room.secondary_mood_id, room.host_token_hash,
+                room.room_access_token_hash, room.created_at, room.started_at, room.closed_at, room.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn map_local_party_room(row: &rusqlite::Row) -> Result<LocalPartyRoom> {
+        Ok(LocalPartyRoom {
+            room_id: row.get(0)?,
+            room_code: row.get(1)?,
+            party_name: row.get(2)?,
+            status: row.get(3)?,
+            dj_level: row.get(4)?,
+            primary_mood_id: row.get(5)?,
+            secondary_mood_id: row.get(6)?,
+            host_token_hash: row.get(7)?,
+            room_access_token_hash: row.get(8)?,
+            created_at: row.get(9)?,
+            started_at: row.get(10)?,
+            closed_at: row.get(11)?,
+            updated_at: row.get(12)?,
+        })
+    }
+
+    pub fn get_local_party_room(&self, room_id: &str) -> Result<Option<LocalPartyRoom>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT room_id, room_code, party_name, status, dj_level, primary_mood_id, secondary_mood_id,
+                    host_token_hash, room_access_token_hash, created_at, started_at, closed_at, updated_at
+             FROM local_party_rooms WHERE room_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![room_id], Self::map_local_party_room)?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_local_party_room_by_code(&self, room_code: &str) -> Result<Option<LocalPartyRoom>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT room_id, room_code, party_name, status, dj_level, primary_mood_id, secondary_mood_id,
+                    host_token_hash, room_access_token_hash, created_at, started_at, closed_at, updated_at
+             FROM local_party_rooms WHERE UPPER(room_code) = UPPER(?1)"
+        )?;
+        let mut rows = stmt.query_map(params![room_code], Self::map_local_party_room)?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_local_room_status(&self, room_id: &str, status: &str, ts: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if status == "live" {
+            conn.execute(
+                "UPDATE local_party_rooms SET status = 'live', started_at = COALESCE(started_at, ?1), updated_at = ?1 WHERE room_id = ?2",
+                params![ts, room_id],
+            )?;
+        } else if status == "closed" {
+            conn.execute(
+                "UPDATE local_party_rooms SET status = 'closed', closed_at = ?1, updated_at = ?1 WHERE room_id = ?2",
+                params![ts, room_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE local_party_rooms SET status = ?1, updated_at = ?2 WHERE room_id = ?3",
+                params![status, ts, room_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn update_local_room_config(
+        &self,
+        room_id: &str,
+        dj_level: i32,
+        primary_mood_id: &str,
+        secondary_mood_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE local_party_rooms SET dj_level = ?1, primary_mood_id = ?2, secondary_mood_id = ?3, updated_at = ?4 WHERE room_id = ?5",
+            params![dj_level.clamp(1, 4), primary_mood_id, secondary_mood_id, now, room_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn register_local_room_guest(&self, guest: &LocalRoomGuest) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO local_room_guests (id, room_id, nickname, token_hash, client_ip, submission_count, created_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                guest.id, guest.room_id, guest.nickname, guest.token_hash,
+                guest.client_ip, guest.submission_count, guest.created_at, guest.last_seen_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn lookup_local_room_guest(&self, room_id: &str, token_hash: &str) -> Result<Option<LocalRoomGuest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, room_id, nickname, token_hash, client_ip, submission_count, created_at, last_seen_at
+             FROM local_room_guests WHERE room_id = ?1 AND token_hash = ?2"
+        )?;
+        let mut rows = stmt.query_map(params![room_id, token_hash], |row| {
+            Ok(LocalRoomGuest {
+                id: row.get(0)?,
+                room_id: row.get(1)?,
+                nickname: row.get(2)?,
+                token_hash: row.get(3)?,
+                client_ip: row.get(4)?,
+                submission_count: row.get(5)?,
+                created_at: row.get(6)?,
+                last_seen_at: row.get(7)?,
+            })
+        })?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete_local_room_guests(&self, room_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute("DELETE FROM local_room_guests WHERE room_id = ?1", params![room_id])?;
+        Ok(deleted)
+    }
+
+    pub fn increment_local_guest_submission_count(&self, guest_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE local_room_guests SET submission_count = submission_count + 1, last_seen_at = ?1 WHERE id = ?2",
+            params![now, guest_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_local_room_submission(&self, sub: &LocalRoomSubmission) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO local_room_submissions (
+                id, room_id, submitted_by_type, submitted_by_id, submitted_by_name,
+                provider, source_url, provider_video_id, song_id, title, artist, version_tag,
+                thumbnail_url, duration_ms, bpm, half_time_bpm, double_time_bpm,
+                musical_key, camelot_key, overall_energy, danceability,
+                genre_tags_json, mood_tags_json, metadata_source, acquisition_status,
+                acquisition_note, dj_status, dj_score, local_cache_path, created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
+            )",
+            params![
+                sub.id, sub.room_id, sub.submitted_by_type, sub.submitted_by_id, sub.submitted_by_name,
+                sub.provider, sub.source_url, sub.provider_video_id, sub.song_id, sub.title, sub.artist,
+                sub.version_tag, sub.thumbnail_url, sub.duration_ms, sub.bpm, sub.half_time_bpm,
+                sub.double_time_bpm, sub.musical_key, sub.camelot_key, sub.overall_energy,
+                sub.danceability, sub.genre_tags_json, sub.mood_tags_json, sub.metadata_source,
+                sub.acquisition_status, sub.acquisition_note, sub.dj_status, sub.dj_score,
+                sub.local_cache_path, sub.created_at, sub.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn map_local_room_submission(row: &rusqlite::Row) -> Result<LocalRoomSubmission> {
+        Ok(LocalRoomSubmission {
+            id: row.get(0)?,
+            room_id: row.get(1)?,
+            submitted_by_type: row.get(2)?,
+            submitted_by_id: row.get(3)?,
+            submitted_by_name: row.get(4)?,
+            provider: row.get(5)?,
+            source_url: row.get(6)?,
+            provider_video_id: row.get(7)?,
+            song_id: row.get(8)?,
+            title: row.get(9)?,
+            artist: row.get(10)?,
+            version_tag: row.get(11)?,
+            thumbnail_url: row.get(12)?,
+            duration_ms: row.get(13)?,
+            bpm: row.get(14)?,
+            half_time_bpm: row.get(15)?,
+            double_time_bpm: row.get(16)?,
+            musical_key: row.get(17)?,
+            camelot_key: row.get(18)?,
+            overall_energy: row.get(19)?,
+            danceability: row.get(20)?,
+            genre_tags_json: row.get(21)?,
+            mood_tags_json: row.get(22)?,
+            metadata_source: row.get(23)?,
+            acquisition_status: row.get(24)?,
+            acquisition_note: row.get(25)?,
+            dj_status: row.get(26)?,
+            dj_score: row.get(27)?,
+            local_cache_path: row.get(28)?,
+            created_at: row.get(29)?,
+            updated_at: row.get(30)?,
+        })
+    }
+
+    pub fn get_local_room_submissions(&self, room_id: &str) -> Result<Vec<LocalRoomSubmission>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, room_id, submitted_by_type, submitted_by_id, submitted_by_name,
+                    provider, source_url, provider_video_id, song_id, title, artist, version_tag,
+                    thumbnail_url, duration_ms, bpm, half_time_bpm, double_time_bpm,
+                    musical_key, camelot_key, overall_energy, danceability,
+                    genre_tags_json, mood_tags_json, metadata_source, acquisition_status,
+                    acquisition_note, dj_status, dj_score, local_cache_path, created_at, updated_at
+             FROM local_room_submissions WHERE room_id = ?1 ORDER BY dj_score DESC, created_at ASC"
+        )?;
+        let rows = stmt.query_map(params![room_id], Self::map_local_room_submission)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Privacy-isolated query: returns ONLY submissions created by a specific guest in a specific room.
+    pub fn get_guest_own_submissions(&self, room_id: &str, guest_id: &str) -> Result<Vec<GuestOwnSubmissionView>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist, provider, dj_status, created_at
+             FROM local_room_submissions
+             WHERE room_id = ?1 AND submitted_by_type = 'guest' AND submitted_by_id = ?2
+             ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map(params![room_id, guest_id], |row| {
+            let raw_status: String = row.get(4)?;
+            let guest_safe_status = match raw_status.as_str() {
+                "playing" => "playing",
+                "played" => "played",
+                "prepared" => "queued_next",
+                _ => "received_by_dj",
+            }
+            .to_string();
+            Ok(GuestOwnSubmissionView {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                artist: row.get(2)?,
+                provider: row.get(3)?,
+                status: guest_safe_status,
+                created_at: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_submission_dj_state(&self, sub_id: &str, dj_status: &str, dj_score: f64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE local_room_submissions SET dj_status = ?1, dj_score = ?2, updated_at = ?3 WHERE id = ?4",
+            params![dj_status, dj_score, now, sub_id],
+        )?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Local Temporary Audio Cache Operations (10-15 Track Rolling Cap + Expiry)
+    // ========================================================================
+
+    pub fn upsert_local_temp_cache(&self, entry: &LocalTempCacheEntry) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO local_temp_cache (
+                id, room_id, submission_id, song_id, file_path, size_bytes,
+                priority_tier, is_locked, created_at, last_accessed_at, expires_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(id) DO UPDATE SET
+                priority_tier = excluded.priority_tier,
+                is_locked = excluded.is_locked,
+                last_accessed_at = excluded.last_accessed_at,
+                expires_at = excluded.expires_at",
+            params![
+                entry.id, entry.room_id, entry.submission_id, entry.song_id, entry.file_path,
+                entry.size_bytes, entry.priority_tier, if entry.is_locked { 1 } else { 0 },
+                entry.created_at, entry.last_accessed_at, entry.expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_local_temp_cache_priority(&self, cache_id: &str, priority_tier: i32, is_locked: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE local_temp_cache SET priority_tier = ?1, is_locked = ?2, last_accessed_at = ?3 WHERE id = ?4",
+            params![priority_tier, if is_locked { 1 } else { 0 }, now, cache_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_local_temp_cache_entry(&self, cache_id: &str) -> Result<Option<LocalTempCacheEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, room_id, submission_id, song_id, file_path, size_bytes, priority_tier, is_locked, created_at, last_accessed_at, expires_at
+             FROM local_temp_cache WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![cache_id], |row| {
+            let locked: i32 = row.get(7)?;
+            Ok(LocalTempCacheEntry {
+                id: row.get(0)?,
+                room_id: row.get(1)?,
+                submission_id: row.get(2)?,
+                song_id: row.get(3)?,
+                file_path: row.get(4)?,
+                size_bytes: row.get(5)?,
+                priority_tier: row.get(6)?,
+                is_locked: locked != 0,
+                created_at: row.get(8)?,
+                last_accessed_at: row.get(9)?,
+                expires_at: row.get(10)?,
+            })
+        })?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_local_temp_cache_stats(&self, max_tracks: usize) -> Result<LocalTempCacheStats> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0), SUM(CASE WHEN is_locked != 0 THEN 1 ELSE 0 END)
+             FROM local_temp_cache"
+        )?;
+        let stats = stmt.query_row([], |row| {
+            let count: i64 = row.get(0)?;
+            let bytes: i64 = row.get(1)?;
+            let locked: Option<i64> = row.get(2)?;
+            Ok(LocalTempCacheStats {
+                track_count: count as usize,
+                max_tracks,
+                total_bytes: bytes,
+                locked_tracks: locked.unwrap_or(0) as usize,
+            })
+        })?;
+        Ok(stats)
+    }
+
+    /// Evicts lowest-priority, oldest unlocked tracks whenever cached track count exceeds max_tracks (10-15).
+    pub fn prune_local_temp_cache_over_cap(&self, max_tracks: usize) -> Result<Vec<(String, String)>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let total_count: usize = tx.query_row(
+            "SELECT COUNT(*) FROM local_temp_cache",
+            [],
+            |row| row.get::<_, i64>(0).map(|c| c as usize),
+        )?;
+
+        if total_count <= max_tracks {
+            return Ok(Vec::new());
+        }
+
+        let excess = total_count - max_tracks;
+        let mut to_evict = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, file_path FROM local_temp_cache
+                 WHERE is_locked = 0
+                 ORDER BY priority_tier ASC, last_accessed_at ASC
+                 LIMIT ?1"
+            )?;
+            let rows = stmt.query_map(params![excess as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                to_evict.push(r?);
+            }
+        }
+
+        for (id, _) in &to_evict {
+            tx.execute("DELETE FROM local_temp_cache WHERE id = ?1", params![id])?;
+        }
+
+        tx.commit()?;
+        Ok(to_evict)
+    }
+
+    pub fn delete_local_temp_cache_for_room(&self, room_id: &str) -> Result<Vec<(String, String)>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut entries = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT id, file_path FROM local_temp_cache WHERE room_id = ?1")?;
+            let rows = stmt.query_map(params![room_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                entries.push(r?);
+            }
+        }
+        tx.execute("DELETE FROM local_temp_cache WHERE room_id = ?1", params![room_id])?;
+        tx.commit()?;
+        Ok(entries)
+    }
+
+    pub fn delete_expired_local_temp_cache(&self, now_ms: i64) -> Result<Vec<(String, String)>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut entries = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT id, file_path FROM local_temp_cache WHERE expires_at <= ?1")?;
+            let rows = stmt.query_map(params![now_ms], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                entries.push(r?);
+            }
+        }
+        tx.execute("DELETE FROM local_temp_cache WHERE expires_at <= ?1", params![now_ms])?;
+        tx.commit()?;
+        Ok(entries)
+    }
+
+    // ========================================================================
+    // Global Shared Song Metadata Catalogue Operations (Reusable Metadata Only)
+    // ========================================================================
+
+    fn load_global_song_with_urls(conn: &Connection, song_id: &str) -> Result<Option<GlobalSongMetadata>> {
+        let mut stmt = conn.prepare(
+            "SELECT song_id, canonical_fingerprint, title, artist, version_tag, duration_ms,
+                    original_bpm, half_time_bpm, double_time_bpm, bpm_confidence,
+                    musical_key, camelot_key, key_confidence, beat_grid_json, phrase_markers_json,
+                    overall_energy, danceability, genre_tags_json, mood_tags_json,
+                    analysis_version, analysis_confidence, processing_status, created_at, updated_at
+             FROM global_song_catalogue WHERE song_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![song_id], |row| {
+            let genres_str: String = row.get(17)?;
+            let moods_str: String = row.get(18)?;
+            Ok(GlobalSongMetadata {
+                song_id: row.get(0)?,
+                canonical_fingerprint: row.get(1)?,
+                title: row.get(2)?,
+                artist: row.get(3)?,
+                version_tag: row.get(4)?,
+                duration_ms: row.get(5)?,
+                original_bpm: row.get(6)?,
+                half_time_bpm: row.get(7)?,
+                double_time_bpm: row.get(8)?,
+                bpm_confidence: row.get(9)?,
+                musical_key: row.get(10)?,
+                camelot_key: row.get(11)?,
+                key_confidence: row.get(12)?,
+                beat_grid_json: row.get(13)?,
+                phrase_markers_json: row.get(14)?,
+                overall_energy: row.get(15)?,
+                danceability: row.get(16)?,
+                genre_tags: serde_json::from_str(&genres_str).unwrap_or_default(),
+                mood_tags: serde_json::from_str(&moods_str).unwrap_or_default(),
+                analysis_version: row.get(19)?,
+                analysis_confidence: row.get(20)?,
+                processing_status: row.get(21)?,
+                source_urls: Vec::new(),
+                created_at: row.get(22)?,
+                updated_at: row.get(23)?,
+            })
+        })?;
+
+        let mut song = match rows.next() {
+            Some(r) => r?,
+            None => return Ok(None),
+        };
+
+        let mut url_stmt = conn.prepare(
+            "SELECT source_url FROM global_song_source_urls WHERE song_id = ?1 ORDER BY created_at ASC"
+        )?;
+        let url_rows = url_stmt.query_map(params![song_id], |row| row.get::<_, String>(0))?;
+        for u in url_rows {
+            song.source_urls.push(u?);
+        }
+
+        Ok(Some(song))
+    }
+
+    pub fn lookup_global_song_by_video_id(&self, video_id: &str) -> Result<Option<GlobalSongMetadata>> {
+        let conn = self.conn.lock().unwrap();
+        let song_id_opt: Option<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT song_id FROM global_song_source_urls WHERE provider_video_id = ?1 LIMIT 1"
+            )?;
+            let mut rows = stmt.query_map(params![video_id], |row| row.get(0))?;
+            rows.next().transpose()?
+        };
+        if let Some(song_id) = song_id_opt {
+            Self::load_global_song_with_urls(&conn, &song_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn lookup_global_song_by_url(&self, source_url: &str) -> Result<Option<GlobalSongMetadata>> {
+        let conn = self.conn.lock().unwrap();
+        let song_id_opt: Option<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT song_id FROM global_song_source_urls WHERE source_url = ?1 LIMIT 1"
+            )?;
+            let mut rows = stmt.query_map(params![source_url], |row| row.get(0))?;
+            rows.next().transpose()?
+        };
+        if let Some(song_id) = song_id_opt {
+            Self::load_global_song_with_urls(&conn, &song_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn lookup_global_song_by_fingerprint(&self, canonical_fingerprint: &str) -> Result<Option<GlobalSongMetadata>> {
+        let conn = self.conn.lock().unwrap();
+        let song_id_opt: Option<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT song_id FROM global_song_catalogue WHERE canonical_fingerprint = ?1 LIMIT 1"
+            )?;
+            let mut rows = stmt.query_map(params![canonical_fingerprint], |row| row.get(0))?;
+            rows.next().transpose()?
+        };
+        if let Some(song_id) = song_id_opt {
+            Self::load_global_song_with_urls(&conn, &song_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Deduplicates by provider_video_id or canonical_fingerprint while preserving distinct remixes/live/edits.
+    /// Upgrades existing records when incoming analysis has higher version or confidence.
+    pub fn upsert_global_song_metadata(
+        &self,
+        record: &GlobalSongMetadata,
+        source_link: Option<(&str, &str, &str)>, // (source_url, provider, provider_video_id)
+    ) -> Result<GlobalSongMetadata> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // 1. Check if provider_video_id already maps to an existing song_id
+        let existing_id_by_vid: Option<String> = if let Some((_, _, vid)) = source_link {
+            let mut stmt = tx.prepare("SELECT song_id FROM global_song_source_urls WHERE provider_video_id = ?1 LIMIT 1")?;
+            let mut rows = stmt.query_map(params![vid], |r| r.get(0))?;
+            rows.next().transpose()?
+        } else {
+            None
+        };
+
+        // 2. Otherwise check if canonical_fingerprint (normalized title+artist+version_tag+duration bucket) matches
+        let existing_id_by_fp: Option<String> = if existing_id_by_vid.is_none() {
+            let mut stmt = tx.prepare("SELECT song_id FROM global_song_catalogue WHERE canonical_fingerprint = ?1 LIMIT 1")?;
+            let mut rows = stmt.query_map(params![record.canonical_fingerprint], |r| r.get(0))?;
+            rows.next().transpose()?
+        } else {
+            None
+        };
+
+        let target_song_id = existing_id_by_vid
+            .or(existing_id_by_fp)
+            .unwrap_or_else(|| record.song_id.clone());
+
+        let genre_json = serde_json::to_string(&record.genre_tags).unwrap_or_else(|_| "[]".to_string());
+        let mood_json = serde_json::to_string(&record.mood_tags).unwrap_or_else(|_| "[]".to_string());
+
+        tx.execute(
+            "INSERT INTO global_song_catalogue (
+                song_id, canonical_fingerprint, title, artist, version_tag, duration_ms,
+                original_bpm, half_time_bpm, double_time_bpm, bpm_confidence,
+                musical_key, camelot_key, key_confidence, beat_grid_json, phrase_markers_json,
+                overall_energy, danceability, genre_tags_json, mood_tags_json,
+                analysis_version, analysis_confidence, processing_status, created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+            )
+            ON CONFLICT(song_id) DO UPDATE SET
+                duration_ms = CASE WHEN excluded.duration_ms > 0 THEN excluded.duration_ms ELSE duration_ms END,
+                original_bpm = COALESCE(excluded.original_bpm, original_bpm),
+                half_time_bpm = COALESCE(excluded.half_time_bpm, half_time_bpm),
+                double_time_bpm = COALESCE(excluded.double_time_bpm, double_time_bpm),
+                bpm_confidence = COALESCE(excluded.bpm_confidence, bpm_confidence),
+                musical_key = COALESCE(excluded.musical_key, musical_key),
+                camelot_key = COALESCE(excluded.camelot_key, camelot_key),
+                key_confidence = COALESCE(excluded.key_confidence, key_confidence),
+                beat_grid_json = COALESCE(excluded.beat_grid_json, beat_grid_json),
+                phrase_markers_json = COALESCE(excluded.phrase_markers_json, phrase_markers_json),
+                overall_energy = COALESCE(excluded.overall_energy, overall_energy),
+                danceability = COALESCE(excluded.danceability, danceability),
+                genre_tags_json = CASE WHEN excluded.genre_tags_json != '[]' THEN excluded.genre_tags_json ELSE genre_tags_json END,
+                mood_tags_json = CASE WHEN excluded.mood_tags_json != '[]' THEN excluded.mood_tags_json ELSE mood_tags_json END,
+                analysis_version = MAX(analysis_version, excluded.analysis_version),
+                analysis_confidence = MAX(analysis_confidence, excluded.analysis_confidence),
+                processing_status = CASE WHEN excluded.processing_status = 'analyzed' OR excluded.processing_status = 'verified' THEN excluded.processing_status ELSE processing_status END,
+                updated_at = excluded.updated_at",
+            params![
+                target_song_id, record.canonical_fingerprint, record.title, record.artist, record.version_tag,
+                record.duration_ms, record.original_bpm, record.half_time_bpm, record.double_time_bpm,
+                record.bpm_confidence, record.musical_key, record.camelot_key, record.key_confidence,
+                record.beat_grid_json, record.phrase_markers_json, record.overall_energy, record.danceability,
+                genre_json, mood_json, record.analysis_version, record.analysis_confidence,
+                record.processing_status, record.created_at, now
+            ],
+        )?;
+
+        if let Some((source_url, provider, vid)) = source_link {
+            tx.execute(
+                "INSERT OR IGNORE INTO global_song_source_urls (source_url, provider, provider_video_id, song_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![source_url, provider, vid, target_song_id, now],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(Self::load_global_song_with_urls(&conn, &target_song_id)?.unwrap())
     }
 }
 

@@ -1,21 +1,21 @@
-import { PartyEventMessage } from '../types';
-import { apiClient } from './client';
+import { LocalRoomEvent } from '../types';
+import { localHelperClient } from './client';
 
-type EventHandler = (event: PartyEventMessage) => void;
+type EventHandler = (event: LocalRoomEvent) => void;
 type StatusHandler = (connected: boolean) => void;
 
-export class PartyWebSocketClient {
+export class LocalRoomWebSocketClient {
   private ws: WebSocket | null = null;
-  private partyId: string | null = null;
+  private roomId: string | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
   private shouldReconnect = false;
   private onEventCallback: EventHandler | null = null;
   private onStatusCallback: StatusHandler | null = null;
 
-  public connect(partyId: string, onEvent: EventHandler, onStatus?: StatusHandler): void {
+  public connect(roomId: string, onEvent: EventHandler, onStatus?: StatusHandler): void {
     this.disconnect();
-    this.partyId = partyId;
+    this.roomId = roomId;
     this.onEventCallback = onEvent;
     this.onStatusCallback = onStatus || null;
     this.shouldReconnect = true;
@@ -24,9 +24,10 @@ export class PartyWebSocketClient {
   }
 
   private openSocket(): void {
-    if (!this.partyId || !this.shouldReconnect) return;
+    if (!this.roomId || !this.shouldReconnect) return;
+    const url = localHelperClient.getHostWebSocketUrl(this.roomId);
+    if (!url) return;
 
-    const url = apiClient.getWebSocketUrl(this.partyId);
     try {
       this.ws = new WebSocket(url);
 
@@ -37,10 +38,10 @@ export class PartyWebSocketClient {
 
       this.ws.onmessage = (event) => {
         try {
-          const parsed: PartyEventMessage = JSON.parse(event.data);
+          const parsed: LocalRoomEvent = JSON.parse(event.data);
           this.onEventCallback?.(parsed);
         } catch (err) {
-          console.warn('Failed to parse WebSocket message:', err);
+          console.warn('Failed to parse local room WebSocket message:', err);
         }
       };
 
@@ -52,7 +53,7 @@ export class PartyWebSocketClient {
       this.ws.onerror = () => {
         this.ws?.close();
       };
-    } catch (err) {
+    } catch {
       this.onStatusCallback?.(false);
       this.scheduleReconnect();
     }
@@ -61,7 +62,7 @@ export class PartyWebSocketClient {
   private scheduleReconnect(): void {
     if (!this.shouldReconnect) return;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 15000);
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 12000);
     this.reconnectAttempts++;
     this.reconnectTimer = setTimeout(() => this.openSocket(), delay);
   }
@@ -79,9 +80,9 @@ export class PartyWebSocketClient {
       this.ws.close();
       this.ws = null;
     }
-    this.partyId = null;
+    this.roomId = null;
     this.onStatusCallback?.(false);
   }
 }
 
-export const partyWsClient = new PartyWebSocketClient();
+export const localRoomWsClient = new LocalRoomWebSocketClient();

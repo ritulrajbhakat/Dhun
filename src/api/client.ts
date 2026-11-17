@@ -1,28 +1,39 @@
 import {
-  CloudParty,
-  CreatePartyResponse,
-  PartyConfiguration,
-  PartyDetailsResponse,
-  PartySongRequest,
-  PartySourceReference,
+  CreateLocalRoomResponse,
+  HostRoomDashboardResponse,
+  LocalHelperHealth,
+  LocalPartyRoom,
+  UnifiedSongSubmissionResponse,
 } from '../types';
 
-const DEFAULT_API_BASE = (import.meta as any).env?.VITE_API_BASE_URL || 'http://localhost:8080';
+const DEFAULT_LOCAL_HELPER_URL =
+  (import.meta as any).env?.VITE_LOCAL_HELPER_URL || 'http://127.0.0.1:47821';
 
 const STORAGE_KEYS = {
-  API_BASE_URL: 'dhun_api_base_url',
-  HOST_TOKEN: 'dhun_host_token',
-  PARTY_ID: 'dhun_active_party_id',
+  HELPER_URL: 'dhun_local_helper_url',
+  HOST_TOKEN: 'dhun_local_host_token',
+  ROOM_ID: 'dhun_local_room_id',
+  ROOM_QR_SVG: 'dhun_local_room_qr_svg',
+  ROOM_GUEST_URL: 'dhun_local_room_guest_url',
 };
 
-export class DhunApiClient {
+/**
+ * Client for communicating strictly with the host's Local DHUN Helper Service
+ * running on the host laptop (`http://127.0.0.1:47821`).
+ *
+ * Notice:
+ * - Zero cloud party management calls.
+ * - Zero host approval/rejection endpoints.
+ * - Zero direct access to the Global Shared Song Metadata Catalogue (engine-only).
+ */
+export class LocalHelperClient {
   private baseUrl: string;
   private hostToken: string | null;
 
   constructor() {
     this.baseUrl =
-      (typeof window !== 'undefined' && localStorage.getItem(STORAGE_KEYS.API_BASE_URL)) ||
-      DEFAULT_API_BASE;
+      (typeof window !== 'undefined' && localStorage.getItem(STORAGE_KEYS.HELPER_URL)) ||
+      DEFAULT_LOCAL_HELPER_URL;
     this.hostToken =
       (typeof window !== 'undefined' && localStorage.getItem(STORAGE_KEYS.HOST_TOKEN)) || null;
   }
@@ -33,9 +44,9 @@ export class DhunApiClient {
 
   public setBaseUrl(url: string): void {
     const clean = url.trim().replace(/\/+$/, '');
-    this.baseUrl = clean || DEFAULT_API_BASE;
+    this.baseUrl = clean || DEFAULT_LOCAL_HELPER_URL;
     if (typeof window !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.API_BASE_URL, this.baseUrl);
+      localStorage.setItem(STORAGE_KEYS.HELPER_URL, this.baseUrl);
     }
   }
 
@@ -54,18 +65,36 @@ export class DhunApiClient {
     }
   }
 
-  public getSavedPartyId(): string | null {
+  public getSavedRoomId(): string | null {
     if (typeof window === 'undefined') return null;
-    return localStorage.getItem(STORAGE_KEYS.PARTY_ID);
+    return localStorage.getItem(STORAGE_KEYS.ROOM_ID);
   }
 
-  public setSavedPartyId(partyId: string | null): void {
+  public setSavedRoomSession(
+    roomId: string | null,
+    guestUrl?: string | null,
+    qrSvg?: string | null
+  ): void {
     if (typeof window === 'undefined') return;
-    if (partyId) {
-      localStorage.setItem(STORAGE_KEYS.PARTY_ID, partyId);
+    if (roomId) {
+      localStorage.setItem(STORAGE_KEYS.ROOM_ID, roomId);
+      if (guestUrl) localStorage.setItem(STORAGE_KEYS.ROOM_GUEST_URL, guestUrl);
+      else localStorage.removeItem(STORAGE_KEYS.ROOM_GUEST_URL);
+      if (qrSvg) localStorage.setItem(STORAGE_KEYS.ROOM_QR_SVG, qrSvg);
+      else localStorage.removeItem(STORAGE_KEYS.ROOM_QR_SVG);
     } else {
-      localStorage.removeItem(STORAGE_KEYS.PARTY_ID);
+      localStorage.removeItem(STORAGE_KEYS.ROOM_ID);
+      localStorage.removeItem(STORAGE_KEYS.ROOM_GUEST_URL);
+      localStorage.removeItem(STORAGE_KEYS.ROOM_QR_SVG);
     }
+  }
+
+  public getSavedGuestQr(): { guestUrl: string | null; qrSvg: string | null } {
+    if (typeof window === 'undefined') return { guestUrl: null, qrSvg: null };
+    return {
+      guestUrl: localStorage.getItem(STORAGE_KEYS.ROOM_GUEST_URL),
+      qrSvg: localStorage.getItem(STORAGE_KEYS.ROOM_QR_SVG),
+    };
   }
 
   private async request<T>(
@@ -91,17 +120,21 @@ export class DhunApiClient {
 
     if (!res.ok) {
       const errorText = await res.text().catch(() => res.statusText);
-      throw new Error(errorText || `Request failed with status ${res.status}`);
+      throw new Error(errorText || `Local helper request failed (${res.status})`);
     }
 
     return res.json();
   }
 
-  public async checkHealth(): Promise<{ connected: boolean; version?: string; error?: string }> {
+  public async checkHealth(): Promise<{
+    connected: boolean;
+    health?: LocalHelperHealth;
+    error?: string;
+  }> {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3500);
-      const res = await fetch(`${this.baseUrl}/api/health`, {
+      const timeoutId = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch(`${this.baseUrl}/api/local/health`, {
         method: 'GET',
         signal: controller.signal,
       });
@@ -110,70 +143,74 @@ export class DhunApiClient {
       if (!res.ok) {
         return { connected: false, error: `HTTP ${res.status}` };
       }
-      const data = await res.json();
-      return { connected: true, version: data.version || '1.0.0' };
+      const data: LocalHelperHealth = await res.json();
+      return { connected: true, health: data };
     } catch (err: any) {
       return {
         connected: false,
-        error: err?.name === 'AbortError' ? 'Connection timed out' : (err?.message || 'Backend unreachable'),
+        error:
+          err?.name === 'AbortError'
+            ? 'Local DHUN helper timed out'
+            : 'Local DHUN helper is not running on this computer',
       };
     }
   }
 
-  public async createParty(payload: {
+  public async createLocalRoom(payload: {
     party_name: string;
-    dj_level?: string;
-    primary_mood_id?: string;
+    dj_level: number;
+    primary_mood_id: string;
     secondary_mood_id?: string;
-    energy_progression?: string;
-    allow_guest_requests?: boolean;
-    max_requests_per_guest?: number;
-  }): Promise<CreatePartyResponse> {
-    const data = await this.request<CreatePartyResponse>('/api/parties', {
+  }): Promise<CreateLocalRoomResponse> {
+    const data = await this.request<CreateLocalRoomResponse>('/api/local/rooms', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
     this.setHostToken(data.host_token);
-    this.setSavedPartyId(data.party_id);
+    this.setSavedRoomSession(data.room.room_id, data.guest_url, data.qr_svg);
     return data;
   }
 
-  public async getParty(partyId: string): Promise<PartyDetailsResponse> {
-    return this.request<PartyDetailsResponse>(`/api/parties/${partyId}`, {
-      method: 'GET',
-    });
+  public async getRoomDashboard(roomId: string): Promise<HostRoomDashboardResponse> {
+    return this.request<HostRoomDashboardResponse>(
+      `/api/local/rooms/${roomId}`,
+      { method: 'GET' },
+      true
+    );
   }
 
-  public async startParty(partyId: string): Promise<CloudParty> {
-    return this.request<CloudParty>(
-      `/api/parties/${partyId}/start`,
+  public async startLocalRoom(roomId: string): Promise<LocalPartyRoom> {
+    return this.request<LocalPartyRoom>(
+      `/api/local/rooms/${roomId}/start`,
       { method: 'POST' },
       true
     );
   }
 
-  public async endParty(partyId: string): Promise<CloudParty> {
-    return this.request<CloudParty>(
-      `/api/parties/${partyId}/end`,
+  public async closeLocalRoom(roomId: string): Promise<{
+    room_id: string;
+    status: string;
+    closed_at: number;
+    invalidated_guests: number;
+    purged_cache_files: number;
+  }> {
+    return this.request(
+      `/api/local/rooms/${roomId}/close`,
       { method: 'POST' },
       true
     );
   }
 
-  public async sendHeartbeat(partyId: string): Promise<{ status: string; last_heartbeat_at: number }> {
-    return this.request<{ status: string; last_heartbeat_at: number }>(
-      `/api/parties/${partyId}/heartbeat`,
-      { method: 'POST' },
-      true
-    );
-  }
-
-  public async updateConfig(
-    partyId: string,
-    payload: Partial<PartyConfiguration>
-  ): Promise<PartyConfiguration> {
-    return this.request<PartyConfiguration>(
-      `/api/parties/${partyId}/config`,
+  public async updateRoomConfig(
+    roomId: string,
+    payload: {
+      dj_level?: number;
+      primary_mood_id?: string;
+      secondary_mood_id?: string;
+    }
+  ): Promise<LocalPartyRoom> {
+    return this.request<LocalPartyRoom>(
+      `/api/local/rooms/${roomId}/config`,
       {
         method: 'POST',
         body: JSON.stringify(payload),
@@ -182,9 +219,13 @@ export class DhunApiClient {
     );
   }
 
-  public async registerSource(partyId: string, url: string): Promise<PartySourceReference> {
-    return this.request<PartySourceReference>(
-      `/api/parties/${partyId}/sources`,
+  /**
+   * Unified song submission endpoint used by BOTH the host and LAN guests.
+   * No approval queue — enters the private DJ candidate pool directly.
+   */
+  public async submitSong(roomId: string, url: string): Promise<UnifiedSongSubmissionResponse> {
+    return this.request<UnifiedSongSubmissionResponse>(
+      `/api/local/rooms/${roomId}/submissions`,
       {
         method: 'POST',
         body: JSON.stringify({ url }),
@@ -193,43 +234,24 @@ export class DhunApiClient {
     );
   }
 
-  public async listSources(partyId: string): Promise<PartySourceReference[]> {
-    return this.request<PartySourceReference[]>(`/api/parties/${partyId}/sources`, {
-      method: 'GET',
-    });
-  }
-
-  public async listRequests(partyId: string): Promise<PartySongRequest[]> {
-    return this.request<PartySongRequest[]>(
-      `/api/parties/${partyId}/requests`,
-      { method: 'GET' },
-      true
-    );
-  }
-
-  public async approveRequest(partyId: string, requestId: string): Promise<void> {
-    await this.request(
-      `/api/parties/${partyId}/requests/${requestId}/approve`,
+  public async evaluateDjPool(roomId: string): Promise<{
+    evaluated_count: number;
+    prepared_next_submission_id: string | null;
+    interrupted_current_track: boolean;
+    transition_style: string;
+  }> {
+    return this.request(
+      `/api/local/rooms/${roomId}/dj/evaluate`,
       { method: 'POST' },
       true
     );
   }
 
-  public async rejectRequest(partyId: string, requestId: string, reason?: string): Promise<void> {
-    await this.request(
-      `/api/parties/${partyId}/requests/${requestId}/reject`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ reason }),
-      },
-      true
-    );
-  }
-
-  public getWebSocketUrl(partyId: string): string {
+  public getHostWebSocketUrl(roomId: string): string | null {
+    if (!this.hostToken) return null;
     const base = this.baseUrl.replace(/^http/, 'ws');
-    return `${base}/ws/parties/${partyId}`;
+    return `${base}/ws/local/rooms/${roomId}?role=host&token=${encodeURIComponent(this.hostToken)}`;
   }
 }
 
-export const apiClient = new DhunApiClient();
+export const localHelperClient = new LocalHelperClient();

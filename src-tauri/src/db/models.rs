@@ -313,4 +313,141 @@ pub struct PartySongRequest {
     pub updated_at: i64,
 }
 
+// ========================================================================
+// Local Party Helper & Global Shared Song Metadata Catalogue Models (Phase 2)
+// ========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalPartyRoom {
+    pub room_id: String,
+    pub room_code: String,
+    pub party_name: String,
+    pub status: String, // 'created' | 'live' | 'closed' (explicit closure only)
+    pub dj_level: i32,  // 1..=4
+    pub primary_mood_id: String,
+    pub secondary_mood_id: Option<String>,
+    #[serde(skip_serializing)]
+    pub host_token_hash: String,
+    #[serde(skip_serializing)]
+    pub room_access_token_hash: String,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub closed_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRoomGuest {
+    pub id: String,
+    pub room_id: String,
+    pub nickname: String,
+    #[serde(skip_serializing)]
+    pub token_hash: String,
+    pub client_ip: String,
+    pub submission_count: i32,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRoomSubmission {
+    pub id: String,
+    pub room_id: String,
+    pub submitted_by_type: String, // 'guest' | 'host'
+    pub submitted_by_id: String,
+    pub submitted_by_name: String,
+    pub provider: String, // 'youtube' | 'youtube_music'
+    pub source_url: String,
+    pub provider_video_id: String,
+    pub song_id: Option<String>,
+    pub title: String,
+    pub artist: String,
+    pub version_tag: String,
+    pub thumbnail_url: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub bpm: Option<f64>,
+    pub half_time_bpm: Option<f64>,
+    pub double_time_bpm: Option<f64>,
+    pub musical_key: Option<String>,
+    pub camelot_key: Option<String>,
+    pub overall_energy: Option<f64>,
+    pub danceability: Option<f64>,
+    pub genre_tags_json: String,
+    pub mood_tags_json: String,
+    pub metadata_source: String,
+    pub acquisition_status: String, // 'restricted_by_provider' | 'cached_authorized' | 'pending' | 'failed'
+    pub acquisition_note: Option<String>,
+    pub dj_status: String, // 'queued_for_dj' | 'prepared' | 'playing' | 'played' | 'skipped_unplayable'
+    pub dj_score: f64,
+    pub local_cache_path: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Strictly privacy-isolated view returned to an authenticated guest for their OWN submissions only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestOwnSubmissionView {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub provider: String,
+    pub status: String, // 'received_by_dj' | 'queued_next' | 'playing' | 'played'
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalTempCacheEntry {
+    pub id: String,
+    pub room_id: String,
+    pub submission_id: Option<String>,
+    pub song_id: String,
+    pub file_path: String,
+    pub size_bytes: i64,
+    pub priority_tier: i32, // 3=playing, 2=next_deck, 1=upcoming, 0=evictable
+    pub is_locked: bool,
+    pub created_at: i64,
+    pub last_accessed_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalTempCacheStats {
+    pub track_count: usize,
+    pub max_tracks: usize,
+    pub total_bytes: i64,
+    pub locked_tracks: usize,
+}
+
+/// Global Shared Song Metadata Catalogue Record (Reusable Musical Intelligence ONLY).
+/// Never contains party IDs, playlists, guest requests, or raw audio files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalSongMetadata {
+    pub song_id: String,
+    pub canonical_fingerprint: String,
+    pub title: String,
+    pub artist: String,
+    pub version_tag: String, // 'original', 'remix', 'live', 'edit', 'acoustic', 'extended', etc.
+    pub duration_ms: i64,
+    pub original_bpm: Option<f64>,
+    pub half_time_bpm: Option<f64>,
+    pub double_time_bpm: Option<f64>,
+    pub bpm_confidence: Option<f64>,
+    pub musical_key: Option<String>,
+    pub camelot_key: Option<String>,
+    pub key_confidence: Option<f64>,
+    pub beat_grid_json: Option<String>,
+    pub phrase_markers_json: Option<String>,
+    pub overall_energy: Option<f64>,
+    pub danceability: Option<f64>,
+    pub genre_tags: Vec<String>,
+    pub mood_tags: Vec<String>,
+    pub analysis_version: i32,
+    pub analysis_confidence: f64,
+    pub processing_status: String, // 'metadata_only' | 'analyzed' | 'verified'
+    pub source_urls: Vec<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+
 

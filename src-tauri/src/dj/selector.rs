@@ -230,3 +230,105 @@ pub fn calculate_camelot_compatibility(key_a: &str, key_b: &str) -> f64 {
     0.35 // Clash / chromatic distance
 }
 
+/// Evaluates an unplayed private room submission (from either guest or host — zero approval queue)
+/// against the active mood, energy progression, current BPM (with half/double-time matching),
+/// Camelot harmonic key, and phrase/playability readiness.
+pub fn score_local_submission_for_dj(
+    sub: &crate::db::models::LocalRoomSubmission,
+    primary_mood: &crate::dj::moods::MoodDefinition,
+    secondary_mood: Option<&crate::dj::moods::MoodDefinition>,
+    current_bpm: Option<f64>,
+    current_camelot: Option<&str>,
+    target_energy: f64,
+) -> f64 {
+    let mut score = 0.0;
+
+    // 1. BPM compatibility (with current playing track + mood BPM window)
+    let sub_bpm = sub.bpm.unwrap_or((primary_mood.min_bpm + primary_mood.max_bpm) / 2.0);
+    let bpm_fit = if let Some(cur) = current_bpm {
+        calculate_bpm_compatibility(cur, sub_bpm)
+    } else if sub_bpm >= primary_mood.min_bpm && sub_bpm <= primary_mood.max_bpm {
+        1.0
+    } else {
+        0.65
+    };
+    score += bpm_fit * 30.0;
+
+    // 2. Camelot harmonic key compatibility
+    let key_fit = match (current_camelot, sub.camelot_key.as_deref()) {
+        (Some(cur_k), Some(sub_k)) => calculate_camelot_compatibility(cur_k, sub_k),
+        _ => 0.70,
+    };
+    score += key_fit * 25.0;
+
+    // 3. Energy curve progression fit
+    let sub_energy = sub.overall_energy.unwrap_or(primary_mood.target_energy);
+    let energy_fit = (1.0 - (sub_energy - target_energy).abs()).clamp(0.1, 1.0);
+    score += energy_fit * 20.0;
+
+    // 4. Mood & genre affinity (primary mood + 30% secondary mood blend)
+    let sub_moods: Vec<String> = serde_json::from_str(&sub.mood_tags_json).unwrap_or_default();
+    let sub_genres: Vec<String> = serde_json::from_str(&sub.genre_tags_json).unwrap_or_default();
+    let mut mood_affinity = if sub_moods.iter().any(|m| m.eq_ignore_ascii_case(&primary_mood.id)) {
+        1.0
+    } else if primary_mood
+        .genre_weights
+        .iter()
+        .any(|(g, _)| sub_genres.iter().any(|sg| sg.to_lowercase().contains(&g.to_lowercase())))
+    {
+        0.85
+    } else {
+        0.55
+    };
+
+    if let Some(sec) = secondary_mood {
+        let sec_hit = if sub_moods.iter().any(|m| m.eq_ignore_ascii_case(&sec.id)) {
+            1.0
+        } else {
+            0.5
+        };
+        mood_affinity = (mood_affinity * 0.70) + (sec_hit * 0.30);
+    }
+    score += mood_affinity * 15.0;
+
+    // 5. Local cache playability readiness bonus (prioritize locally cached authorized audio)
+    if sub.acquisition_status == "cached_authorized" {
+        score += 10.0;
+    }
+
+    (score * 100.0).round() / 100.0
+}
+
+/// Evaluates all queued room submissions and selects the highest-scoring next candidate
+/// WITHOUT ever interrupting an actively playing track.
+pub fn select_next_submission_without_interrupting(
+    submissions: &[crate::db::models::LocalRoomSubmission],
+    primary_mood: &crate::dj::moods::MoodDefinition,
+    secondary_mood: Option<&crate::dj::moods::MoodDefinition>,
+    target_energy: f64,
+) -> (Vec<(String, f64)>, Option<String>) {
+    let currently_playing = submissions.iter().find(|s| s.dj_status == "playing");
+    let current_bpm = currently_playing.and_then(|s| s.bpm);
+    let current_camelot = currently_playing.and_then(|s| s.camelot_key.as_deref());
+
+    let mut scored: Vec<(String, f64)> = submissions
+        .iter()
+        .filter(|s| s.dj_status == "queued_for_dj" || s.dj_status == "prepared")
+        .map(|s| {
+            let sc = score_local_submission_for_dj(
+                s,
+                primary_mood,
+                secondary_mood,
+                current_bpm,
+                current_camelot,
+                target_energy,
+            );
+            (s.id.clone(), sc)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let best_next_id = scored.first().map(|(id, _)| id.clone());
+    (scored, best_next_id)
+}
+

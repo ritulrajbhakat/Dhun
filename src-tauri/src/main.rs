@@ -7,6 +7,7 @@ mod commands;
 mod db;
 mod dj;
 mod library;
+mod metadata_service;
 mod network;
 mod recovery;
 mod sync;

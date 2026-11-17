@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useDhunStore } from '../../store/useDhunStore';
 import { StageVisualFxCanvas, FX_NAMES } from './StageVisualFxCanvas';
 import { AnimatedDjCharacter } from './AnimatedDjCharacter';
+import { webAudioEngine } from '../../audio/WebAudioEngine';
+import { DjLevel } from '../../types';
 import {
   Play,
   Square,
@@ -16,13 +18,16 @@ import {
   Maximize2,
   Minimize2,
   Radio,
-  Server,
+  Laptop,
   RefreshCw,
   ExternalLink,
   QrCode,
   CheckCircle2,
   AlertCircle,
   Copy,
+  HardDrive,
+  Wifi,
+  CloudUpload,
 } from 'lucide-react';
 
 const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({ isLive, bpm }) => {
@@ -36,12 +41,14 @@ const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({
 
     let animId: number;
     let waveTime = 0;
+    const waveData = new Uint8Array(new ArrayBuffer(128));
 
     const draw = () => {
       const w = canvas.width;
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
 
+      webAudioEngine.getWaveformData(waveData);
       waveTime += (isLive ? 0.045 : 0.012) * (bpm / 128);
 
       ctx.save();
@@ -56,14 +63,12 @@ const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({
 
       for (let i = 0; i < 64; i++) {
         const envelope = Math.sin((i / 63) * Math.PI);
-        const amp = isLive ? 14 * envelope : 2 * envelope;
-        const y = h / 2 + Math.sin(waveTime * 2.5 + i * 0.22) * amp;
+        const audioOffset = (waveData[i * 2] - 128) / 128.0;
+        const amp = isLive ? 12 * envelope : 2 * envelope;
+        const y = h / 2 + audioOffset * 26 + Math.sin(waveTime * 2.5 + i * 0.22) * amp;
 
-        if (i === 0) {
-          ctx.moveTo(x, y);
-        } else {
-          ctx.lineTo(x, y);
-        }
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
         x += sliceWidth;
       }
 
@@ -77,7 +82,7 @@ const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({
         x = 0;
         for (let i = 0; i < 64; i++) {
           const envelope = Math.sin((i / 63) * Math.PI);
-          const y = h / 2 - Math.sin(waveTime * 2.5 + i * 0.22) * (8 * envelope);
+          const y = h / 2 - Math.sin(waveTime * 2.5 + i * 0.22) * (7 * envelope);
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
           x += sliceWidth;
@@ -105,78 +110,83 @@ const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({
 
 export const StageDisplayScreen: React.FC = () => {
   const {
-    apiBaseUrl,
-    backendConnected,
-    backendVersion,
-    backendError,
+    helperUrl,
+    helperConnected,
+    helperVersion,
+    helperError,
     wsConnected,
-    cloudParty,
-    partyConfig,
+    lanReachable,
+    detectedLanIp,
+    lanNotice,
+    activeRoom,
+    exposedDecks,
+    internalDeckCapacity,
     guestUrl,
     qrSvg,
-    registeredSources,
-    songRequests,
+    submissions,
+    cacheStats,
+    syncOverview,
     moodProfiles,
-    setApiBaseUrl,
-    checkBackendHealth,
-    createCloudParty,
-    startCloudParty,
-    endCloudParty,
-    clearActiveParty,
-    registerYouTubeSource,
-    approveSongRequest,
-    rejectSongRequest,
+    selectedMoodId,
+    selectedDjLevel,
+    crossfader,
+    decks,
+    setHelperUrl,
+    checkHelperHealth,
+    createLocalRoom,
+    startLocalRoom,
+    closeLocalRoom,
+    clearLocalRoomSession,
+    submitSong,
+    evaluateDjPool,
     setDjLevel,
     setPartyMood,
+    setCrossfaderPos,
+    updateDeckEq,
   } = useDhunStore();
 
   const [currentFxIndex, setCurrentFxIndex] = useState(0);
   const [autoCycleFx, setAutoCycleFx] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showHostDrawer, setShowHostDrawer] = useState(false);
-  const [activeDrawerTab, setActiveDrawerTab] = useState<'party' | 'sources' | 'requests' | 'fx'>('party');
+  const [activeDrawerTab, setActiveDrawerTab] = useState<'party' | 'submit' | 'dj' | 'fx'>('party');
 
-  // Form States
-  const [apiUrlDraft, setApiUrlDraft] = useState(apiBaseUrl);
-  const [partyNameInput, setPartyNameInput] = useState('DHUN Celebration Party');
-  const [selectedDjType, setSelectedDjType] = useState('Smart');
-  const [selectedMood, setSelectedMood] = useState('house_party');
+  // Form states
+  const [helperUrlDraft, setHelperUrlDraft] = useState(helperUrl);
+  const [partyNameInput, setPartyNameInput] = useState('DHUN Celebration Night');
   const [youtubeUrlInput, setYoutubeUrlInput] = useState('');
 
   // Action feedback states
   const [isBusy, setIsBusy] = useState(false);
-  const [sourceFeedback, setSourceFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-  const [partyFeedback, setPartyFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [roomFeedback, setRoomFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [submitFeedback, setSubmitFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [copiedUrl, setCopiedUrl] = useState(false);
 
-  // Sync local dropdowns with real persisted party config when loaded
   useEffect(() => {
-    if (partyConfig?.primary_mood_id) {
-      setSelectedMood(partyConfig.primary_mood_id);
-    }
-    if (partyConfig?.dj_level) {
-      const map: Record<string, string> = {
-        hands_off: 'Pro',
-        balanced: 'Smart',
-        curated: 'Advanced',
-        manual: 'Creative',
-      };
-      setSelectedDjType(map[partyConfig.dj_level] || 'Smart');
-    }
-  }, [partyConfig]);
+    setHelperUrlDraft(helperUrl);
+  }, [helperUrl]);
+
+  // Mood selection automatically influences visual FX preset
+  const activeMoodProfile =
+    moodProfiles.find((m) => m.id === selectedMoodId) || moodProfiles[0];
 
   useEffect(() => {
-    setApiUrlDraft(apiBaseUrl);
-  }, [apiBaseUrl]);
+    if (activeMoodProfile?.preferred_fx_index !== undefined) {
+      setCurrentFxIndex(activeMoodProfile.preferred_fx_index % 15);
+    }
+  }, [activeMoodProfile?.id]);
 
-  const isPartyLive = cloudParty?.status === 'live';
-  const activeMoodProfile = moodProfiles.find((m) => m.id === selectedMood) || moodProfiles[0];
-  const stageBpm = activeMoodProfile ? Math.round((activeMoodProfile.min_bpm + activeMoodProfile.max_bpm) / 2) : 124;
+  const isPartyLive = activeRoom?.status === 'live';
+  const stageBpm = activeMoodProfile
+    ? Math.round((activeMoodProfile.min_bpm + activeMoodProfile.max_bpm) / 2)
+    : 124;
   const stageEnergy = activeMoodProfile ? activeMoodProfile.target_energy : 0.75;
 
-  // Honest lead source display (never hardcoded "Chaiyya Chaiyya")
-  const leadSource = registeredSources.length > 0 ? registeredSources[0] : null;
-  const pendingRequestsCount = songRequests.filter((r) => r.status === 'pending').length;
+  const activeOrPreparedSubmission =
+    submissions.find((s) => s.dj_status === 'playing') ||
+    submissions.find((s) => s.dj_status === 'prepared') ||
+    submissions[0] ||
+    null;
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -188,27 +198,21 @@ export const StageDisplayScreen: React.FC = () => {
     }
   };
 
-  // Keyboard shortcuts: 'M' for Host Console, 'F' for Fullscreen, 'Escape' to close drawer
+  // Keyboard shortcuts: 'M' for Host Console, 'F' for Fullscreen, 'Escape' to close
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['INPUT', 'SELECT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
         return;
       }
-      if (e.key === 'm' || e.key === 'M') {
-        setShowHostDrawer((prev) => !prev);
-      }
-      if (e.key === 'Escape') {
-        setShowHostDrawer(false);
-      }
-      if (e.key === 'f' || e.key === 'F') {
-        toggleFullscreen();
-      }
+      if (e.key === 'm' || e.key === 'M') setShowHostDrawer((prev) => !prev);
+      if (e.key === 'Escape') setShowHostDrawer(false);
+      if (e.key === 'f' || e.key === 'F') toggleFullscreen();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Auto-cycle visual FX loops every 25 seconds when enabled
+  // Auto-cycle visual FX every 25s
   useEffect(() => {
     if (!autoCycleFx) return;
     const fxTimer = setInterval(() => {
@@ -217,87 +221,94 @@ export const StageDisplayScreen: React.FC = () => {
     return () => clearInterval(fxTimer);
   }, [autoCycleFx]);
 
-  const djTypes = [
-    { id: 'Pro', level: 1, key: 'hands_off', name: 'DJ TYPE: Hands-Off Auto' },
-    { id: 'Smart', level: 2, key: 'balanced', name: 'DJ TYPE: Balanced Smart' },
-    { id: 'Advanced', level: 3, key: 'curated', name: 'DJ TYPE: Curated Control' },
-    { id: 'Creative', level: 4, key: 'manual', name: 'DJ TYPE: Manual Assist' },
+  const djLevelOptions: { level: DjLevel; label: string }[] = [
+    { level: 1, label: 'DJ LEVEL 1: Professional 2-Deck Mixer' },
+    { level: 2, label: 'DJ LEVEL 2: Smart Mixing' },
+    { level: 3, label: 'DJ LEVEL 3: Advanced Performance' },
+    { level: 4, label: 'DJ LEVEL 4: Creative DJ Tools' },
   ];
 
-  const handleCreateParty = async (e: React.FormEvent) => {
+  const handleSaveHelperUrl = async () => {
+    setIsBusy(true);
+    await setHelperUrl(helperUrlDraft);
+    setIsBusy(false);
+  };
+
+  const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!partyNameInput.trim()) return;
     setIsBusy(true);
-    setPartyFeedback(null);
+    setRoomFeedback(null);
     try {
-      const djObj = djTypes.find((d) => d.id === selectedDjType) || djTypes[1];
-      await createCloudParty(partyNameInput.trim(), selectedMood, djObj.key);
-      setPartyFeedback({
+      await createLocalRoom(partyNameInput.trim(), selectedDjLevel, selectedMoodId);
+      setRoomFeedback({
         type: 'ok',
-        text: 'Cloud party created! Register YouTube links and press "Go Live" to start.',
+        text: 'Private LAN party room created on your local DHUN helper. Press "Start Party" to begin automated DJ playback.',
       });
     } catch (err: any) {
-      setPartyFeedback({
+      setRoomFeedback({
         type: 'err',
-        text: err?.message || 'Failed to create party. Verify Cloud Backend connection.',
+        text: err?.message || 'Could not create local party room. Ensure dhun-local-helper is running.',
       });
     } finally {
       setIsBusy(false);
     }
   };
 
-  const handleStartParty = async () => {
+  const handleStartRoom = async () => {
     setIsBusy(true);
-    setPartyFeedback(null);
+    setRoomFeedback(null);
     try {
-      await startCloudParty();
-      setPartyFeedback({ type: 'ok', text: 'Party is now LIVE! Guests can scan the QR code to request songs.' });
+      await startLocalRoom();
+      setRoomFeedback({
+        type: 'ok',
+        text: 'Local party is LIVE! Automated DJ is active and remains open until you explicitly close it.',
+      });
     } catch (err: any) {
-      setPartyFeedback({ type: 'err', text: err?.message || 'Failed to start party.' });
+      setRoomFeedback({ type: 'err', text: err?.message || 'Failed to start local party.' });
     } finally {
       setIsBusy(false);
     }
   };
 
-  const handleEndParty = async () => {
+  const handleCloseRoom = async () => {
     setIsBusy(true);
-    setPartyFeedback(null);
+    setRoomFeedback(null);
     try {
-      await endCloudParty();
-      setPartyFeedback({ type: 'ok', text: 'Party session ended gracefully.' });
+      const res = await closeLocalRoom();
+      setRoomFeedback({
+        type: 'ok',
+        text: res
+          ? `Party explicitly closed. Invalidated ${res.invalidated_guests} guest session(s) and purged ${res.purged_cache_files} temporary audio file(s).`
+          : 'Party room closed.',
+      });
     } catch (err: any) {
-      setPartyFeedback({ type: 'err', text: err?.message || 'Failed to end party.' });
+      setRoomFeedback({ type: 'err', text: err?.message || 'Failed to close local party room.' });
     } finally {
       setIsBusy(false);
     }
   };
 
-  const handleRegisterSource = async (e: React.FormEvent) => {
+  const handleSubmitSong = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!youtubeUrlInput.trim()) return;
     setIsBusy(true);
-    setSourceFeedback(null);
+    setSubmitFeedback(null);
     try {
-      const added = await registerYouTubeSource(youtubeUrlInput.trim());
-      setSourceFeedback({
+      const res = await submitSong(youtubeUrlInput.trim());
+      setSubmitFeedback({
         type: 'ok',
-        text: `Registered "${added.title}" (${added.playability_status}).`,
+        text: `Submitted "${res.title}" to automated DJ pool (score: ${res.dj_score.toFixed(1)}, acquisition: ${res.acquisition_status}). Current track was not interrupted.`,
       });
       setYoutubeUrlInput('');
     } catch (err: any) {
-      setSourceFeedback({
+      setSubmitFeedback({
         type: 'err',
-        text: err?.message || 'Could not validate or register YouTube URL.',
+        text: err?.message || 'Song submission rejected. Paste a valid YouTube or YouTube Music URL.',
       });
     } finally {
       setIsBusy(false);
     }
-  };
-
-  const handleSaveApiUrl = async () => {
-    setIsBusy(true);
-    await setApiBaseUrl(apiUrlDraft);
-    setIsBusy(false);
   };
 
   const handleCopyGuestUrl = () => {
@@ -307,33 +318,33 @@ export const StageDisplayScreen: React.FC = () => {
     setTimeout(() => setCopiedUrl(false), 2000);
   };
 
-  // Honest connection status text and badge color
-  const connectionBadge = (() => {
-    if (!backendConnected) {
+  // Honest Local Helper Connection Badge
+  const statusBadge = (() => {
+    if (!helperConnected) {
       return {
         dot: 'bg-rose-500',
         textClass: 'text-rose-400',
-        label: 'Backend Offline',
+        label: 'Local Helper Offline',
       };
     }
     if (isPartyLive) {
       return {
         dot: 'bg-emerald-400 animate-ping',
         textClass: 'text-emerald-400',
-        label: wsConnected ? 'LIVE • Realtime Sync' : 'LIVE • Cloud Connected',
+        label: wsConnected ? 'LAN LIVE • Auto DJ Active' : 'LAN LIVE • Local Helper',
       };
     }
-    if (cloudParty) {
+    if (activeRoom && activeRoom.status === 'created') {
       return {
         dot: 'bg-amber-400 animate-pulse',
         textClass: 'text-amber-300',
-        label: `Party ${cloudParty.status.toUpperCase()} • Ready`,
+        label: `Room ${activeRoom.room_code} • Standby`,
       };
     }
     return {
       dot: 'bg-sky-400',
       textClass: 'text-sky-300',
-      label: 'Cloud Connected • Setup',
+      label: 'Local Helper Ready',
     };
   })();
 
@@ -351,7 +362,7 @@ export const StageDisplayScreen: React.FC = () => {
           onFxChange={(idx) => setCurrentFxIndex(idx)}
         />
 
-        {/* Central Golden Devanagari Title & Waveform in LED Screen */}
+        {/* Central Golden Devanagari Title & Oscilloscope Waveform */}
         <div className="absolute inset-0 flex flex-col items-center justify-start pt-2 md:pt-4 pointer-events-none z-10 px-4">
           <h1
             className="text-6xl md:text-8xl font-black text-amber-400 tracking-wider"
@@ -363,7 +374,9 @@ export const StageDisplayScreen: React.FC = () => {
             धुन डीजे
           </h1>
           <p className="text-xs md:text-sm font-bold tracking-[0.35em] uppercase text-white/95 drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)] mt-1">
-            {cloudParty ? cloudParty.party_name : 'DHUN — PARTY REQUEST PLATFORM'}
+            {activeRoom && activeRoom.status !== 'closed'
+              ? `${activeRoom.party_name} • ${activeMoodProfile.display_name}`
+              : 'DHUN — LOCAL AUTOMATIC PARTY DJ'}
           </p>
 
           <StageOscilloscopeWaveform isLive={isPartyLive} bpm={stageBpm} />
@@ -385,7 +398,7 @@ export const StageDisplayScreen: React.FC = () => {
         <AnimatedDjCharacter
           bpm={stageBpm}
           energy={stageEnergy}
-          moodId={selectedMood}
+          moodId={selectedMoodId}
           isPlaying={isPartyLive}
         />
       </div>
@@ -402,43 +415,37 @@ export const StageDisplayScreen: React.FC = () => {
       {/* LAYER 5: THREE FLOATING FROSTED GLASS UI CARDS               */}
       {/* ============================================================ */}
 
-      {/* 5A. TOP-LEFT: HONEST CLOUD STATUS, DJ TYPE, MOOD DROPDOWNS */}
+      {/* 5A. TOP-LEFT: HONEST LOCAL HELPER STATUS, 4 DJ LEVELS, 14 MOODS */}
       <div className="absolute top-5 left-5 z-40 flex flex-col space-y-2 pointer-events-auto">
-        {/* Cloud Session Status Pill */}
         <div
           onClick={() => setShowHostDrawer(true)}
-          title="Click to open Host DJ Console & Cloud Party Settings (or press 'M')"
-          className="inline-flex flex-col bg-zinc-950/75 backdrop-blur-xl border border-white/10 px-3.5 py-2 rounded-xl shadow-2xl cursor-pointer hover:border-amber-400/40 transition-all group"
+          title="Open Host DJ Console & Local Party Helper Settings (Press 'M')"
+          className="inline-flex flex-col bg-zinc-950/75 backdrop-blur-xl border border-white/10 px-3.5 py-2 rounded-xl shadow-2xl cursor-pointer hover:border-amber-400/40 transition-all"
         >
           <span className="text-[11px] font-bold text-slate-300 flex items-center justify-between gap-3">
-            <span>Cloud Party Status</span>
+            <span>Local Helper Status</span>
             <span className="text-[9px] font-mono text-amber-300/80 uppercase">Press M</span>
           </span>
           <div className="flex items-center space-x-1.5 mt-0.5">
-            <span className={`w-2 h-2 rounded-full ${connectionBadge.dot}`} />
-            <span className={`text-[11px] font-semibold ${connectionBadge.textClass}`}>
-              {connectionBadge.label}
+            <span className={`w-2 h-2 rounded-full ${statusBadge.dot}`} />
+            <span className={`text-[11px] font-semibold ${statusBadge.textClass}`}>
+              {statusBadge.label}
             </span>
           </div>
         </div>
 
-        {/* DJ TYPE Dropdown */}
+        {/* 4 DJ LEVELS Dropdown */}
         <div className="relative">
           <select
-            value={selectedDjType}
+            value={selectedDjLevel}
             onChange={async (e) => {
-              const val = e.target.value;
-              setSelectedDjType(val);
-              const found = djTypes.find((d) => d.id === val);
-              if (found) {
-                await setDjLevel(found.level);
-              }
+              await setDjLevel(Number(e.target.value) as DjLevel);
             }}
-            className="w-56 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
+            className="w-60 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
-            {djTypes.map((t) => (
-              <option key={t.id} value={t.id} className="bg-zinc-950 text-white">
-                {t.name}
+            {djLevelOptions.map((opt) => (
+              <option key={opt.level} value={opt.level} className="bg-zinc-950 text-white">
+                {opt.label}
               </option>
             ))}
           </select>
@@ -447,16 +454,14 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* MOOD Dropdown (All 14 Curated Moods) */}
+        {/* ALL 14 MOODS Dropdown */}
         <div className="relative">
           <select
-            value={selectedMood}
+            value={selectedMoodId}
             onChange={async (e) => {
-              const moodVal = e.target.value;
-              setSelectedMood(moodVal);
-              await setPartyMood(moodVal);
+              await setPartyMood(e.target.value);
             }}
-            className="w-56 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
+            className="w-60 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
             {moodProfiles.map((m) => (
               <option key={m.id} value={m.id} className="bg-zinc-950 text-white">
@@ -469,7 +474,6 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* Quick Launch Host Console CTA if no live party */}
         {!isPartyLive && (
           <button
             onClick={() => {
@@ -479,12 +483,12 @@ export const StageDisplayScreen: React.FC = () => {
             className="flex items-center justify-center space-x-2 bg-gradient-to-r from-amber-500 to-rose-600 hover:from-amber-400 hover:to-rose-500 text-white text-xs font-black px-3.5 py-2 rounded-xl shadow-lg shadow-rose-950/60 transition-all"
           >
             <Radio className="w-3.5 h-3.5" />
-            <span>{cloudParty ? 'Manage & Go Live' : 'Setup Cloud Party'}</span>
+            <span>{activeRoom && activeRoom.status === 'created' ? 'Start Local Party' : 'Setup Local Party'}</span>
           </button>
         )}
       </div>
 
-      {/* 5B. BOTTOM-LEFT: HONEST NOW PLAYING / DECK STANDBY CARD */}
+      {/* 5B. BOTTOM-LEFT: AUTOMATED DJ DECK & CANDIDATE STATUS CARD */}
       <div className="absolute bottom-6 left-6 z-40 w-72 md:w-80 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.9)] pointer-events-auto">
         <div className="flex items-center justify-between text-xs text-slate-400 mb-2 font-bold">
           <span className="text-white flex items-center space-x-1.5">
@@ -493,27 +497,20 @@ export const StageDisplayScreen: React.FC = () => {
                 isPartyLive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
               }`}
             />
-            <span>{isPartyLive ? 'Active Stage Queue' : 'Party Standby'}</span>
+            <span>{isPartyLive ? 'Auto DJ Engine' : 'DJ Standby'}</span>
           </span>
-          <button
-            onClick={() => {
-              setActiveDrawerTab('sources');
-              setShowHostDrawer(true);
-            }}
-            className="px-2 py-0.5 rounded-md bg-white/10 hover:bg-white/20 text-[10px] font-bold text-amber-300 transition-colors"
-            title="Manage YouTube Music Sources"
-          >
-            Sources ({registeredSources.length})
-          </button>
+          <span className="text-[10px] font-mono text-teal-300 bg-teal-500/10 border border-teal-500/30 px-2 py-0.5 rounded-full">
+            {exposedDecks}/{internalDeckCapacity} Decks • {activeMoodProfile.transition_style}
+          </span>
         </div>
 
-        {leadSource ? (
+        {activeOrPreparedSubmission ? (
           <>
             <div className="flex items-center space-x-3 mb-2.5">
-              {leadSource.thumbnail_url ? (
+              {activeOrPreparedSubmission.thumbnail_url ? (
                 <img
-                  src={leadSource.thumbnail_url}
-                  alt={leadSource.title}
+                  src={activeOrPreparedSubmission.thumbnail_url}
+                  alt={activeOrPreparedSubmission.title}
                   className="w-11 h-11 rounded-xl object-cover shadow-lg border border-white/10"
                 />
               ) : (
@@ -523,18 +520,21 @@ export const StageDisplayScreen: React.FC = () => {
               )}
               <div className="flex-1 min-w-0">
                 <h4 className="text-sm font-extrabold text-white truncate drop-shadow">
-                  {leadSource.title}
+                  {activeOrPreparedSubmission.title}
                 </h4>
-                <p className="text-xs text-slate-300 truncate">{leadSource.artist}</p>
+                <p className="text-xs text-slate-300 truncate">
+                  {activeOrPreparedSubmission.artist}
+                  {activeOrPreparedSubmission.bpm ? ` • ${Math.round(activeOrPreparedSubmission.bpm)} BPM` : ''}
+                  {activeOrPreparedSubmission.camelot_key ? ` • ${activeOrPreparedSubmission.camelot_key}` : ''}
+                </p>
               </div>
             </div>
 
-            <div className="bg-amber-500/10 border border-amber-400/25 rounded-xl px-2.5 py-1.5 mb-2.5">
-              <p className="text-[10px] text-amber-200 font-medium leading-tight">
-                Official YouTube Reference Registered &bull; Playability:{' '}
-                <span className="font-mono font-bold text-amber-300">{leadSource.playability_status}</span>
-                <br />
-                Phase 2 will enable embedded YouTube Player audio playback.
+            <div className="bg-white/5 border border-white/10 rounded-xl px-2.5 py-1.5 mb-2.5">
+              <p className="text-[10px] text-slate-300 leading-tight">
+                Pool: <span className="font-bold text-amber-300">{submissions.length}</span> &bull; DJ Score:{' '}
+                <span className="font-mono text-teal-300">{activeOrPreparedSubmission.dj_score.toFixed(1)}</span> &bull;{' '}
+                <span className="font-mono text-amber-200">{activeOrPreparedSubmission.acquisition_status}</span>
               </p>
             </div>
           </>
@@ -543,86 +543,92 @@ export const StageDisplayScreen: React.FC = () => {
             <div className="w-10 h-10 mx-auto rounded-xl bg-white/5 border border-white/10 flex items-center justify-center">
               <Music className="w-5 h-5 text-slate-400" />
             </div>
-            <h4 className="text-sm font-bold text-slate-200">No Active Track Queued</h4>
+            <h4 className="text-sm font-bold text-slate-200">Private DJ Pool Empty</h4>
             <p className="text-[11px] text-slate-400 leading-snug">
-              {cloudParty
-                ? 'Add official YouTube links in Host Console to populate the party catalog.'
-                : 'Create a Cloud Party and register official YouTube tracks to begin.'}
+              {activeRoom && activeRoom.status !== 'closed'
+                ? 'Submit a YouTube / YouTube Music link or let LAN guests scan the QR code.'
+                : 'Start the local helper on this laptop and create a private LAN party room.'}
             </p>
           </div>
         )}
 
-        {/* Host Quick Action Controls */}
         <div className="flex items-center justify-between pt-2 border-t border-white/10 gap-2">
           <button
             onClick={() => {
-              setActiveDrawerTab('sources');
+              setActiveDrawerTab('submit');
               setShowHostDrawer(true);
             }}
             className="flex-1 py-1.5 rounded-xl bg-white/10 hover:bg-white/15 text-[11px] font-bold text-slate-200 flex items-center justify-center space-x-1.5 transition-colors"
           >
             <Link2 className="w-3.5 h-3.5 text-amber-400" />
-            <span>Add YouTube Link</span>
+            <span>Submit Song</span>
           </button>
 
-          {cloudParty && !isPartyLive && cloudParty.status !== 'ended' && (
+          {activeRoom && activeRoom.status === 'created' && (
             <button
-              onClick={handleStartParty}
+              onClick={handleStartRoom}
               disabled={isBusy}
               className="px-3 py-1.5 rounded-xl bg-teal-400 hover:bg-teal-300 text-black text-[11px] font-black flex items-center space-x-1 shadow-lg shadow-teal-400/30 transition-all"
             >
               <Play className="w-3.5 h-3.5 fill-current" />
-              <span>Go Live</span>
+              <span>Start</span>
             </button>
           )}
 
           {isPartyLive && (
             <button
-              onClick={handleEndParty}
+              onClick={handleCloseRoom}
               disabled={isBusy}
               className="px-3 py-1.5 rounded-xl bg-rose-600/80 hover:bg-rose-500 text-white text-[11px] font-bold flex items-center space-x-1 transition-all"
+              title="Explicitly close party room and clean temporary cache"
             >
               <Square className="w-3 h-3 fill-current" />
-              <span>End</span>
+              <span>Close</span>
             </button>
           )}
         </div>
       </div>
 
-      {/* 5C. BOTTOM-RIGHT: HONEST SCAN TO REQUEST FROSTED GLASS QR CARD */}
+      {/* 5C. BOTTOM-RIGHT: REAL REACHABLE LAN QR CARD (ZERO FAKE IPs) */}
       <div className="absolute bottom-6 right-6 z-40 w-64 md:w-72 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.9)] pointer-events-auto flex flex-col items-center text-center">
         <h4 className="text-xs font-bold tracking-wider text-slate-200 uppercase mb-2.5 flex items-center gap-1.5">
           <QrCode className="w-3.5 h-3.5 text-amber-400" />
-          <span>Guest Request Portal</span>
+          <span>Same-Wi-Fi Guest QR</span>
         </h4>
 
-        {cloudParty && qrSvg ? (
+        {activeRoom && activeRoom.status !== 'closed' && lanReachable && qrSvg ? (
           <>
             <div
-              className="w-32 h-32 md:w-36 md:h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-2.5 overflow-hidden [&>svg]:w-full [&>svg]:h-full"
+              className="w-32 h-32 md:w-36 md:h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-2 overflow-hidden [&>svg]:w-full [&>svg]:h-full"
               dangerouslySetInnerHTML={{ __html: qrSvg }}
             />
             <p className="text-xs font-black tracking-wide text-white uppercase drop-shadow">
               SCAN TO REQUEST
             </p>
             <p className="text-[11px] font-bold text-amber-300 mt-0.5">
-              स्कैन कर गाना मांगें
+              स्कैन कर गाना मांगें &bull; Code: <span className="font-mono">{activeRoom.room_code}</span>
             </p>
             <button
               onClick={handleCopyGuestUrl}
               className="mt-1.5 px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-mono text-slate-300 flex items-center gap-1.5 max-w-full"
-              title="Copy Guest Join URL"
+              title="Copy LAN Guest Join URL"
             >
-              <span className="truncate">{guestUrl?.replace(/^https?:\/\//, '')}</span>
+              <Wifi className="w-3 h-3 text-emerald-400 shrink-0" />
+              <span className="truncate">{detectedLanIp}</span>
               {copiedUrl ? <Check className="w-3 h-3 text-emerald-400 shrink-0" /> : <Copy className="w-3 h-3 shrink-0" />}
             </button>
           </>
         ) : (
           <div className="w-full py-5 px-3 rounded-2xl bg-black/50 border border-dashed border-white/15 flex flex-col items-center justify-center space-y-2 mb-1">
             <QrCode className="w-10 h-10 text-slate-600" />
-            <p className="text-xs font-bold text-slate-300">QR Inactive</p>
+            <p className="text-xs font-bold text-slate-300">
+              {activeRoom && activeRoom.status !== 'closed' && !lanReachable
+                ? 'No Reachable LAN Wi-Fi'
+                : 'Local LAN QR Inactive'}
+            </p>
             <p className="text-[10px] text-slate-400 leading-relaxed">
-              Create &amp; connect a live Cloud Party to generate an authentic Guest QR code.
+              {lanNotice ||
+                'Connect to your Local DHUN Helper and create a private LAN party room to generate a real Wi-Fi QR code.'}
             </p>
             <button
               onClick={() => {
@@ -631,7 +637,7 @@ export const StageDisplayScreen: React.FC = () => {
               }}
               className="mt-1 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-300 text-[11px] font-bold transition-colors"
             >
-              Create Party
+              Open Local Setup
             </button>
           </div>
         )}
@@ -650,7 +656,7 @@ export const StageDisplayScreen: React.FC = () => {
                 <div>
                   <h3 className="text-lg font-black text-white leading-none">DHUN Host Console</h3>
                   <p className="text-[11px] text-slate-400 mt-1">
-                    Web Application &bull; Cloud Party Foundation (Phase 1)
+                    Local Party Helper &bull; Private LAN Room &bull; Automated 4-Deck DJ
                   </p>
                 </div>
               </div>
@@ -662,7 +668,7 @@ export const StageDisplayScreen: React.FC = () => {
               </button>
             </div>
 
-            {/* Tab Navigation */}
+            {/* 4 Clean Tabs (Notice: ZERO Approval Queue, ZERO Global Catalogue Browser) */}
             <div className="flex space-x-1.5 my-4">
               <button
                 onClick={() => setActiveDrawerTab('party')}
@@ -672,27 +678,27 @@ export const StageDisplayScreen: React.FC = () => {
                     : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
                 }`}
               >
-                Party &amp; Cloud
+                Local Party
               </button>
               <button
-                onClick={() => setActiveDrawerTab('sources')}
+                onClick={() => setActiveDrawerTab('submit')}
                 className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
-                  activeDrawerTab === 'sources'
+                  activeDrawerTab === 'submit'
                     ? 'bg-amber-500/20 border-amber-400 text-amber-300'
                     : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
                 }`}
               >
-                Sources ({registeredSources.length})
+                Submit Song ({submissions.length})
               </button>
               <button
-                onClick={() => setActiveDrawerTab('requests')}
+                onClick={() => setActiveDrawerTab('dj')}
                 className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
-                  activeDrawerTab === 'requests'
+                  activeDrawerTab === 'dj'
                     ? 'bg-amber-500/20 border-amber-400 text-amber-300'
                     : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
                 }`}
               >
-                Requests ({pendingRequestsCount})
+                Auto DJ &amp; Cache
               </button>
               <button
                 onClick={() => setActiveDrawerTab('fx')}
@@ -706,39 +712,37 @@ export const StageDisplayScreen: React.FC = () => {
               </button>
             </div>
 
-            {/* Tab Content */}
             <div className="flex-1 overflow-y-auto space-y-4">
-              {/* TAB 1: PARTY & CLOUD BACKEND */}
+              {/* TAB 1: LOCAL DHUN HELPER & PRIVATE LAN PARTY ROOM */}
               {activeDrawerTab === 'party' && (
                 <div className="space-y-4">
-                  {/* Cloud Backend Connection Configuration */}
                   <div className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-2.5">
                     <div className="flex items-center justify-between">
                       <h4 className="text-xs font-bold text-sky-300 uppercase flex items-center gap-1.5">
-                        <Server className="w-3.5 h-3.5" />
-                        <span>Cloud Backend Endpoint</span>
+                        <Laptop className="w-3.5 h-3.5" />
+                        <span>Host Local DHUN Helper</span>
                       </h4>
                       <span
                         className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                          backendConnected
+                          helperConnected
                             ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                             : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                         }`}
                       >
-                        {backendConnected ? `Connected v${backendVersion || '1.0'}` : 'Offline'}
+                        {helperConnected ? `Running v${helperVersion || '2.0'}` : 'Not Detected'}
                       </span>
                     </div>
 
                     <div className="flex gap-2">
                       <input
                         type="url"
-                        value={apiUrlDraft}
-                        onChange={(e) => setApiUrlDraft(e.target.value)}
-                        placeholder="https://your-dhun-server.onrender.com"
+                        value={helperUrlDraft}
+                        onChange={(e) => setHelperUrlDraft(e.target.value)}
+                        placeholder="http://127.0.0.1:47821"
                         className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono outline-none focus:border-sky-400"
                       />
                       <button
-                        onClick={handleSaveApiUrl}
+                        onClick={handleSaveHelperUrl}
                         disabled={isBusy}
                         className="px-3 py-1.5 bg-sky-500 hover:bg-sky-400 text-black font-extrabold text-xs rounded-lg flex items-center gap-1"
                       >
@@ -747,27 +751,31 @@ export const StageDisplayScreen: React.FC = () => {
                       </button>
                     </div>
 
-                    {!backendConnected && (
+                    <p className="text-[11px] text-slate-400 leading-snug">
+                      Party rooms run privately on this laptop&rsquo;s local helper — never in the cloud. Guests on the same Wi-Fi connect directly via LAN QR code.
+                    </p>
+
+                    {!helperConnected && (
                       <p className="text-[11px] text-rose-400 flex items-center gap-1.5">
                         <AlertCircle className="w-3.5 h-3.5 shrink-0" />
                         <span>
-                          {backendError || 'Backend unreachable.'} Deploy <code className="text-rose-200">dhun-server</code> (Render/Railway/Fly.io) or run locally on port 8080.
+                          {helperError || 'Local helper unreachable.'} Launch <code className="text-rose-200">dhun-local-helper</code> on this computer.
                         </span>
                       </p>
                     )}
                   </div>
 
-                  {/* Party Lifecycle Panel */}
+                  {/* Private LAN Party Room Lifecycle */}
                   <div className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-3">
                     <h4 className="text-xs font-bold text-amber-300 uppercase flex items-center gap-1.5">
                       <Radio className="w-3.5 h-3.5" />
-                      <span>Party Session Management</span>
+                      <span>Private Local Party Room</span>
                     </h4>
 
-                    {!cloudParty ? (
-                      <form onSubmit={handleCreateParty} className="space-y-3">
+                    {!activeRoom || activeRoom.status === 'closed' ? (
+                      <form onSubmit={handleCreateRoom} className="space-y-3">
                         <div>
-                          <label className="text-[11px] text-slate-400 block mb-1">Party Name</label>
+                          <label className="text-[11px] text-slate-400 block mb-1">Party Room Name</label>
                           <input
                             type="text"
                             value={partyNameInput}
@@ -778,10 +786,10 @@ export const StageDisplayScreen: React.FC = () => {
                         </div>
                         <button
                           type="submit"
-                          disabled={!backendConnected || isBusy || !partyNameInput.trim()}
+                          disabled={!helperConnected || isBusy || !partyNameInput.trim()}
                           className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-black text-xs rounded-xl transition-all"
                         >
-                          {isBusy ? 'Creating Party...' : 'Create Cloud Party & Generate Host Token'}
+                          {isBusy ? 'Creating Private Room...' : 'Create Private Local Party Room'}
                         </button>
                       </form>
                     ) : (
@@ -789,92 +797,92 @@ export const StageDisplayScreen: React.FC = () => {
                         <div className="p-3 rounded-lg bg-black/50 border border-white/10 space-y-1.5 text-xs">
                           <div className="flex justify-between">
                             <span className="text-slate-400">Party Name:</span>
-                            <span className="font-bold text-white">{cloudParty.party_name}</span>
+                            <span className="font-bold text-white">{activeRoom.party_name}</span>
                           </div>
                           <div className="flex justify-between">
-                            <span className="text-slate-400">Party ID:</span>
-                            <span className="font-mono text-amber-300">{cloudParty.id}</span>
+                            <span className="text-slate-400">Room Code (LAN):</span>
+                            <span className="font-mono font-bold text-amber-300">{activeRoom.room_code}</span>
                           </div>
                           <div className="flex justify-between">
-                            <span className="text-slate-400">Lifecycle Status:</span>
-                            <span className="font-bold uppercase text-emerald-400">{cloudParty.status}</span>
+                            <span className="text-slate-400">Reachable LAN IP:</span>
+                            <span className="font-mono text-emerald-300">
+                              {lanReachable ? detectedLanIp : 'Not Connected to Wi-Fi/LAN'}
+                            </span>
                           </div>
                           <div className="flex justify-between">
-                            <span className="text-slate-400">Realtime WebSocket:</span>
-                            <span className={wsConnected ? 'text-emerald-400 font-bold' : 'text-amber-400'}>
-                              {wsConnected ? 'Connected' : 'Reconnecting...'}
+                            <span className="text-slate-400">Room Status:</span>
+                            <span className="font-bold uppercase text-emerald-400">
+                              {activeRoom.status} (Explicit Close Only)
                             </span>
                           </div>
                         </div>
 
                         <div className="flex gap-2">
-                          {cloudParty.status === 'created' && (
+                          {activeRoom.status === 'created' && (
                             <button
-                              onClick={handleStartParty}
+                              onClick={handleStartRoom}
                               disabled={isBusy}
                               className="flex-1 py-2 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-xs rounded-xl flex items-center justify-center gap-1.5"
                             >
                               <Play className="w-3.5 h-3.5 fill-current" />
-                              <span>Go Live</span>
+                              <span>Start Automated DJ Party</span>
                             </button>
                           )}
 
-                          {cloudParty.status === 'live' && (
+                          {activeRoom.status === 'live' && (
                             <button
-                              onClick={handleEndParty}
+                              onClick={handleCloseRoom}
                               disabled={isBusy}
                               className="flex-1 py-2 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5"
                             >
                               <Square className="w-3.5 h-3.5 fill-current" />
-                              <span>End Live Party</span>
+                              <span>Explicitly Close Party &amp; Purge Cache</span>
                             </button>
                           )}
 
                           <button
-                            onClick={clearActiveParty}
+                            onClick={clearLocalRoomSession}
                             className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-slate-200 font-bold text-xs rounded-xl"
                           >
-                            New Party
+                            Reset UI
                           </button>
                         </div>
                       </div>
                     )}
 
-                    {partyFeedback && (
+                    {roomFeedback && (
                       <div
                         className={`text-xs px-3 py-2 rounded-lg border flex items-center gap-2 ${
-                          partyFeedback.type === 'ok'
+                          roomFeedback.type === 'ok'
                             ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
                             : 'bg-rose-950/50 border-rose-500/40 text-rose-300'
                         }`}
                       >
-                        {partyFeedback.type === 'ok' ? (
+                        {roomFeedback.type === 'ok' ? (
                           <CheckCircle2 className="w-4 h-4 shrink-0" />
                         ) : (
                           <AlertCircle className="w-4 h-4 shrink-0" />
                         )}
-                        <span>{partyFeedback.text}</span>
+                        <span>{roomFeedback.text}</span>
                       </div>
                     )}
                   </div>
                 </div>
               )}
 
-              {/* TAB 2: OFFICIAL ONLINE MUSIC SOURCES (ZERO LOCAL IMPORT) */}
-              {activeDrawerTab === 'sources' && (
+              {/* TAB 2: UNIFIED HOST & GUEST SONG SUBMISSION (NO APPROVAL QUEUE) */}
+              {activeDrawerTab === 'submit' && (
                 <div className="space-y-4">
                   <form
-                    onSubmit={handleRegisterSource}
+                    onSubmit={handleSubmitSong}
                     className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-2.5"
                   >
                     <h4 className="text-xs font-bold text-amber-300 uppercase flex items-center gap-1.5">
                       <Link2 className="w-3.5 h-3.5" />
-                      <span>Register YouTube / YouTube Music Track</span>
+                      <span>Submit Song to Automated DJ (YouTube / YT Music Only)</span>
                     </h4>
                     <p className="text-[11px] text-slate-400">
-                      Paste an official link from <code className="text-slate-300">youtube.com/watch</code>,{' '}
-                      <code className="text-slate-300">youtu.be</code>, or{' '}
-                      <code className="text-slate-300">music.youtube.com</code>. Official metadata is fetched via oEmbed.
+                      Host and guests use the exact same submission flow. There is no manual approval queue — the automated DJ scores mood, BPM, key, and energy to mix songs seamlessly without interrupting playback.
                     </p>
                     <div className="flex gap-2">
                       <input
@@ -882,63 +890,67 @@ export const StageDisplayScreen: React.FC = () => {
                         value={youtubeUrlInput}
                         onChange={(e) => setYoutubeUrlInput(e.target.value)}
                         placeholder="https://www.youtube.com/watch?v=..."
-                        disabled={!cloudParty || !backendConnected || isBusy}
+                        disabled={!activeRoom || activeRoom.status === 'closed' || isBusy}
                         className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono outline-none focus:border-amber-400 disabled:opacity-40"
                       />
                       <button
                         type="submit"
-                        disabled={!cloudParty || !backendConnected || isBusy || !youtubeUrlInput.trim()}
+                        disabled={!activeRoom || activeRoom.status === 'closed' || isBusy || !youtubeUrlInput.trim()}
                         className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-extrabold text-xs rounded-lg"
                       >
-                        {isBusy ? 'Adding...' : 'Register'}
+                        {isBusy ? 'Processing...' : 'Submit'}
                       </button>
                     </div>
 
-                    {!cloudParty && (
-                      <p className="text-[11px] text-amber-400">
-                        Create a Cloud Party in the &ldquo;Party &amp; Cloud&rdquo; tab first to register sources.
-                      </p>
-                    )}
-
-                    {sourceFeedback && (
+                    {submitFeedback && (
                       <div
                         className={`text-xs px-3 py-2 rounded-lg border flex items-center gap-2 ${
-                          sourceFeedback.type === 'ok'
+                          submitFeedback.type === 'ok'
                             ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
                             : 'bg-rose-950/50 border-rose-500/40 text-rose-300'
                         }`}
                       >
-                        {sourceFeedback.type === 'ok' ? (
+                        {submitFeedback.type === 'ok' ? (
                           <CheckCircle2 className="w-4 h-4 shrink-0" />
                         ) : (
                           <AlertCircle className="w-4 h-4 shrink-0" />
                         )}
-                        <span>{sourceFeedback.text}</span>
+                        <span>{submitFeedback.text}</span>
                       </div>
                     )}
                   </form>
 
-                  {/* Registered Sources Catalog */}
+                  {/* Private Party Candidate Pool (Host View Only — Guests Cannot See This) */}
                   <div>
-                    <h4 className="text-xs font-bold text-slate-400 uppercase mb-2">
-                      Registered Party Catalog ({registeredSources.length})
-                    </h4>
-                    {registeredSources.length === 0 ? (
+                    <div className="flex items-center justify-between mb-2">
+                      <h4 className="text-xs font-bold text-slate-400 uppercase">
+                        Private DJ Candidate Pool ({submissions.length})
+                      </h4>
+                      <button
+                        onClick={() => evaluateDjPool()}
+                        disabled={!activeRoom || activeRoom.status === 'closed'}
+                        className="text-[11px] font-bold text-teal-300 hover:text-teal-200 disabled:opacity-40"
+                      >
+                        Re-score for Mood
+                      </button>
+                    </div>
+
+                    {submissions.length === 0 ? (
                       <div className="p-6 text-center rounded-xl bg-zinc-900/50 border border-white/5 text-xs text-slate-500">
-                        No online music sources registered yet. Paste a YouTube link above to populate the party catalog.
+                        No songs in the private candidate pool yet. Submit a YouTube link above or invite LAN guests.
                       </div>
                     ) : (
                       <div className="space-y-2">
-                        {registeredSources.map((src) => (
+                        {submissions.map((sub) => (
                           <div
-                            key={src.id}
+                            key={sub.id}
                             className="flex items-center justify-between gap-3 p-2.5 bg-zinc-900/70 rounded-xl border border-white/10"
                           >
                             <div className="flex items-center gap-3 min-w-0">
-                              {src.thumbnail_url ? (
+                              {sub.thumbnail_url ? (
                                 <img
-                                  src={src.thumbnail_url}
-                                  alt={src.title}
+                                  src={sub.thumbnail_url}
+                                  alt={sub.title}
                                   className="w-11 h-8 rounded-md object-cover bg-black shrink-0"
                                 />
                               ) : (
@@ -947,29 +959,35 @@ export const StageDisplayScreen: React.FC = () => {
                                 </div>
                               )}
                               <div className="min-w-0">
-                                <p className="text-xs font-bold text-white truncate">{src.title}</p>
+                                <p className="text-xs font-bold text-white truncate">
+                                  {sub.title}{' '}
+                                  {sub.version_tag !== 'original' && (
+                                    <span className="text-[9px] uppercase text-amber-300">[{sub.version_tag}]</span>
+                                  )}
+                                </p>
                                 <p className="text-[11px] text-slate-400 truncate">
-                                  {src.artist} &bull; <span className="font-mono">{src.provider_video_id}</span>
+                                  {sub.artist} &bull; via {sub.submitted_by_type === 'host' ? 'Host' : sub.submitted_by_name} &bull; Score{' '}
+                                  <span className="font-mono text-teal-300">{sub.dj_score.toFixed(1)}</span>
                                 </p>
                               </div>
                             </div>
 
                             <div className="flex items-center gap-1.5 shrink-0">
-                              <span className="px-1.5 py-0.5 rounded bg-red-500/20 border border-red-500/30 text-[9px] font-bold text-red-300 uppercase">
-                                {src.provider === 'youtube_music' ? 'YT Music' : 'YouTube'}
+                              <span className="px-1.5 py-0.5 rounded bg-teal-500/15 border border-teal-500/30 text-[9px] font-mono font-bold text-teal-300">
+                                {sub.dj_status}
                               </span>
                               <span
                                 className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[9px] font-mono font-bold text-amber-300"
-                                title={src.error_reason || 'Prepared for Phase 2 YouTube IFrame Player'}
+                                title={sub.acquisition_note || 'Compliance status'}
                               >
-                                {src.playability_status}
+                                {sub.acquisition_status}
                               </span>
                               <a
-                                href={src.original_url}
+                                href={sub.source_url}
                                 target="_blank"
                                 rel="noreferrer"
                                 className="p-1 text-slate-400 hover:text-white"
-                                title="Open on YouTube"
+                                title="Open Official Source"
                               >
                                 <ExternalLink className="w-3.5 h-3.5" />
                               </a>
@@ -982,75 +1000,101 @@ export const StageDisplayScreen: React.FC = () => {
                 </div>
               )}
 
-              {/* TAB 3: LIVE GUEST REQUESTS */}
-              {activeDrawerTab === 'requests' && (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <h4 className="text-xs font-bold text-amber-300 uppercase">Live Guest Song Requests</h4>
-                    <span className="text-[10px] font-mono text-slate-400">
-                      {songRequests.length} total
-                    </span>
+              {/* TAB 3: AUTOMATED 4-DECK DJ, TEMP CACHE (10-15 TRACKS), & OFFLINE SYNC OUTBOX */}
+              {activeDrawerTab === 'dj' && (
+                <div className="space-y-4">
+                  {/* Local Temp Cache & Metadata-Only Sync Telemetry */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-zinc-900/90 p-3.5 rounded-xl border border-white/10 space-y-1">
+                      <div className="text-[10px] font-bold text-amber-300 uppercase flex items-center gap-1.5">
+                        <HardDrive className="w-3.5 h-3.5" />
+                        <span>Local Temp Cache</span>
+                      </div>
+                      <div className="text-lg font-black text-white font-mono">
+                        {cacheStats.track_count} / {cacheStats.max_tracks} <span className="text-xs font-normal text-slate-400">tracks</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400">
+                        {cacheStats.locked_tracks} priority-locked &bull; Auto-purged on party close
+                      </p>
+                    </div>
+
+                    <div className="bg-zinc-900/90 p-3.5 rounded-xl border border-white/10 space-y-1">
+                      <div className="text-[10px] font-bold text-sky-300 uppercase flex items-center gap-1.5">
+                        <CloudUpload className="w-3.5 h-3.5" />
+                        <span>Metadata-Only Sync</span>
+                      </div>
+                      <div className="text-lg font-black text-white font-mono">
+                        {syncOverview.synced_count} <span className="text-xs font-normal text-slate-400">synced</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400">
+                        {syncOverview.pending_count} offline queued &bull; Zero audio uploaded
+                      </p>
+                    </div>
                   </div>
 
-                  {songRequests.length === 0 ? (
-                    <div className="p-6 text-center rounded-xl bg-zinc-900/50 border border-white/5 text-xs text-slate-400">
-                      No requests yet. Once the party is live, guests can scan the QR code to request songs from your registered YouTube catalog!
+                  {/* 4-Deck Web Audio Mixer Strip (2 Decks for Levels 1-2, 4 Decks for Levels 3-4) */}
+                  <div className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-bold text-amber-300 uppercase">
+                        Web Audio Engine ({exposedDecks} Active / {internalDeckCapacity}-Deck Architecture)
+                      </h4>
+                      <span className="text-[10px] font-mono text-emerald-300">Auto DJ Enabled</span>
                     </div>
-                  ) : (
-                    songRequests.map((req) => (
-                      <div
-                        key={req.id}
-                        className="p-3 bg-zinc-900 rounded-xl border border-white/10 flex items-center justify-between gap-3"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <p className="text-xs font-bold text-white truncate">
-                              {req.source_title || 'Requested Song'}
-                            </p>
-                            <span
-                              className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${
-                                req.status === 'approved'
-                                  ? 'bg-emerald-500/20 text-emerald-300'
-                                  : req.status === 'rejected'
-                                  ? 'bg-rose-500/20 text-rose-300'
-                                  : 'bg-amber-500/20 text-amber-300'
-                              }`}
-                            >
-                              {req.status}
+
+                    <div className="grid grid-cols-2 gap-3">
+                      {Array.from({ length: exposedDecks }).map((_, deckId) => (
+                        <div key={deckId} className="bg-black/50 p-3 rounded-xl border border-white/10 space-y-2">
+                          <div className="text-xs font-bold text-white flex justify-between">
+                            <span>Deck {String.fromCharCode(65 + deckId)}</span>
+                            <span className="text-[10px] font-mono text-slate-400">
+                              {deckId % 2 === 0 ? 'XF Left' : 'XF Right'}
                             </span>
                           </div>
-                          <p className="text-[11px] text-slate-400 truncate mt-0.5">
-                            {req.source_artist} &bull; by{' '}
-                            <span className="text-amber-300">{req.guest_name || 'Guest'}</span>
-                          </p>
-                          {req.custom_note && (
-                            <p className="text-[10px] italic text-slate-300 mt-1">
-                              &ldquo;{req.custom_note}&rdquo;
-                            </p>
-                          )}
-                        </div>
-
-                        {req.status === 'pending' && (
-                          <div className="flex space-x-1.5 shrink-0">
-                            <button
-                              onClick={() => approveSongRequest(req.id)}
-                              className="p-1.5 bg-emerald-600/30 hover:bg-emerald-600 border border-emerald-500 rounded text-emerald-300 hover:text-white transition-colors"
-                              title="Approve Request"
-                            >
-                              <Check className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => rejectSongRequest(req.id, 'Declined by host')}
-                              className="p-1.5 bg-rose-600/30 hover:bg-rose-600 border border-rose-500 rounded text-rose-300 hover:text-white transition-colors"
-                              title="Reject Request"
-                            >
-                              <X className="w-3.5 h-3.5" />
-                            </button>
+                          <div>
+                            <label className="text-[10px] text-slate-400">Low EQ ({decks[deckId].eqLow} dB)</label>
+                            <input
+                              type="range"
+                              min="-24"
+                              max="6"
+                              value={decks[deckId].eqLow}
+                              onChange={(e) =>
+                                updateDeckEq(deckId, Number(e.target.value), decks[deckId].eqMid, decks[deckId].eqHigh)
+                              }
+                              className="w-full accent-rose-400"
+                            />
                           </div>
-                        )}
-                      </div>
-                    ))
-                  )}
+                          <div>
+                            <label className="text-[10px] text-slate-400">High EQ ({decks[deckId].eqHigh} dB)</label>
+                            <input
+                              type="range"
+                              min="-24"
+                              max="6"
+                              value={decks[deckId].eqHigh}
+                              onChange={(e) =>
+                                updateDeckEq(deckId, decks[deckId].eqLow, decks[deckId].eqMid, Number(e.target.value))
+                              }
+                              className="w-full accent-teal-400"
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold text-amber-300 uppercase block mb-1">
+                        Master Crossfader ({activeMoodProfile.transition_style})
+                      </label>
+                      <input
+                        type="range"
+                        min="-1"
+                        max="1"
+                        step="0.05"
+                        value={crossfader}
+                        onChange={(e) => setCrossfaderPos(Number(e.target.value))}
+                        className="w-full accent-amber-400"
+                      />
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -1098,22 +1142,22 @@ export const StageDisplayScreen: React.FC = () => {
             <div className="pt-4 mt-4 border-t border-white/10 flex items-center justify-between">
               <button
                 onClick={async () => {
-                  await checkBackendHealth();
+                  await checkHelperHealth();
                 }}
                 className="px-3.5 py-2 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-xl text-xs font-bold text-slate-300 flex items-center space-x-1.5"
               >
                 <RefreshCw className="w-3.5 h-3.5 text-sky-400" />
-                <span>Check Health</span>
+                <span>Refresh Local Helper</span>
               </button>
 
               <div className="flex items-center gap-2">
                 {isPartyLive && (
                   <button
-                    onClick={handleEndParty}
+                    onClick={handleCloseRoom}
                     className="px-3.5 py-2 bg-red-950 hover:bg-red-900 border border-red-700 rounded-xl text-xs font-bold text-red-200 flex items-center space-x-1.5"
                   >
                     <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
-                    <span>End Party</span>
+                    <span>Close Party</span>
                   </button>
                 )}
                 <button

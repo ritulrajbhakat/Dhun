@@ -276,7 +276,11 @@ impl MetadataSyncManager {
             return Err(anyhow!("Authentication required: remote sync endpoint configured but API key is missing."));
         };
 
-        let path = format!("/api/v1/sync/{}", item.entity_type);
+        let path = if item.entity_type == "global_song_metadata" {
+            "/api/v1/catalogue/upsert".to_string()
+        } else {
+            format!("/api/v1/sync/{}", item.entity_type)
+        };
         let url = format!("{}{}", endpoint.trim_end_matches('/'), path);
         let timestamp = chrono::Utc::now().timestamp();
         let sig = sign_request(key, "POST", &path, timestamp, &item.payload_json);
@@ -297,6 +301,71 @@ impl MetadataSyncManager {
         }
 
         Ok(())
+    }
+
+    /// Enqueues metadata-only song identity & analysis for Global Shared Song Metadata Catalogue sync.
+    /// Strictly never transmits raw audio bytes, party IDs, or guest data.
+    pub fn enqueue_global_song_metadata(
+        &self,
+        payload: &crate::metadata_service::CatalogueUpsertRequest,
+        video_id: &str,
+        db: &Database,
+    ) -> Result<String> {
+        let id = format!("sync_meta_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
+        let now = chrono::Utc::now().timestamp_millis();
+        let payload_json = serde_json::to_string(payload)?;
+
+        let item = SyncOutboxItem {
+            id: id.clone(),
+            entity_type: "global_song_metadata".to_string(),
+            entity_id: video_id.to_string(),
+            payload_json,
+            retry_count: 0,
+            status: "pending".to_string(),
+            last_attempt_at: None,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        db.enqueue_sync_item(&item)?;
+        info!("Enqueued metadata-only sync item '{}' for video '{}'", id, video_id);
+        Ok(id)
+    }
+
+    /// Authenticated engine-only lookup against the Global Shared Song Metadata Catalogue.
+    /// Gracefully returns Ok(None) when offline or when no remote catalogue endpoint is configured.
+    pub async fn lookup_global_song_metadata(
+        &self,
+        req: &crate::metadata_service::CatalogueLookupRequest,
+    ) -> Result<Option<crate::db::models::GlobalSongMetadata>> {
+        let (Some(endpoint), Some(key)) = (&self.remote_endpoint, &self.api_key) else {
+            return Ok(None);
+        };
+
+        let path = "/api/v1/catalogue/lookup";
+        let url = format!("{}{}", endpoint.trim_end_matches('/'), path);
+        let payload_json = serde_json::to_string(req)?;
+        let timestamp = chrono::Utc::now().timestamp();
+        let sig = sign_request(key, "POST", path, timestamp, &payload_json);
+
+        let resp = match self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("X-Dhun-Timestamp", timestamp.to_string())
+            .header("X-Dhun-Signature", format!("sha256={}", sig))
+            .body(payload_json)
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Ok(None),
+        };
+
+        let parsed: crate::metadata_service::CatalogueLookupResponse = resp.json().await?;
+        Ok(parsed.metadata)
     }
 
     pub fn get_sync_overview(&self, db: &Database) -> Result<SyncStatusOverview> {

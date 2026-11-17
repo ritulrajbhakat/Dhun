@@ -206,6 +206,174 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         info!("Migration v3 applied successfully.");
     }
 
+    if current_version < 4 {
+        info!("Applying DHUN schema migration v4 (Local Party Helper rooms, private submissions, 10-15 track temp cache, & global metadata cache)...");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS local_party_rooms (
+                room_id TEXT PRIMARY KEY NOT NULL,
+                room_code TEXT NOT NULL UNIQUE,
+                party_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'created', -- 'created', 'live', 'closed' (explicit closure only)
+                dj_level INTEGER NOT NULL DEFAULT 2,
+                primary_mood_id TEXT NOT NULL DEFAULT 'house_party',
+                secondary_mood_id TEXT,
+                host_token_hash TEXT NOT NULL,
+                room_access_token_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                closed_at INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_local_rooms_status ON local_party_rooms(status);
+
+            CREATE TABLE IF NOT EXISTS local_room_guests (
+                id TEXT PRIMARY KEY NOT NULL,
+                room_id TEXT NOT NULL REFERENCES local_party_rooms(room_id) ON DELETE CASCADE,
+                nickname TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                client_ip TEXT NOT NULL,
+                submission_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_local_room_guests_auth ON local_room_guests(room_id, token_hash);
+
+            CREATE TABLE IF NOT EXISTS local_room_submissions (
+                id TEXT PRIMARY KEY NOT NULL,
+                room_id TEXT NOT NULL REFERENCES local_party_rooms(room_id) ON DELETE CASCADE,
+                submitted_by_type TEXT NOT NULL, -- 'guest' | 'host'
+                submitted_by_id TEXT NOT NULL,
+                submitted_by_name TEXT NOT NULL,
+                provider TEXT NOT NULL, -- 'youtube' | 'youtube_music'
+                source_url TEXT NOT NULL,
+                provider_video_id TEXT NOT NULL,
+                song_id TEXT,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                version_tag TEXT NOT NULL DEFAULT 'original',
+                thumbnail_url TEXT,
+                duration_ms INTEGER,
+                bpm REAL,
+                half_time_bpm REAL,
+                double_time_bpm REAL,
+                musical_key TEXT,
+                camelot_key TEXT,
+                overall_energy REAL,
+                danceability REAL,
+                genre_tags_json TEXT NOT NULL DEFAULT '[]',
+                mood_tags_json TEXT NOT NULL DEFAULT '[]',
+                metadata_source TEXT NOT NULL DEFAULT 'pending',
+                acquisition_status TEXT NOT NULL DEFAULT 'restricted_by_provider',
+                acquisition_note TEXT,
+                dj_status TEXT NOT NULL DEFAULT 'queued_for_dj', -- 'queued_for_dj', 'prepared', 'playing', 'played', 'skipped_unplayable'
+                dj_score REAL NOT NULL DEFAULT 0.0,
+                local_cache_path TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_local_sub_room_status ON local_room_submissions(room_id, dj_status);
+            CREATE INDEX IF NOT EXISTS idx_local_sub_guest ON local_room_submissions(room_id, submitted_by_id);
+
+            CREATE TABLE IF NOT EXISTS local_temp_cache (
+                id TEXT PRIMARY KEY NOT NULL,
+                room_id TEXT NOT NULL,
+                submission_id TEXT,
+                song_id TEXT NOT NULL,
+                file_path TEXT NOT NULL UNIQUE,
+                size_bytes INTEGER NOT NULL,
+                priority_tier INTEGER NOT NULL DEFAULT 0, -- 3=playing, 2=next_deck, 1=upcoming, 0=evictable
+                is_locked INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                last_accessed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_local_temp_cache_room ON local_temp_cache(room_id);
+            CREATE INDEX IF NOT EXISTS idx_local_temp_cache_expiry ON local_temp_cache(expires_at);
+            ",
+        )?;
+
+        apply_global_catalogue_schema(conn)?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at, description) VALUES (4, ?1, 'Local Party Helper tables, temp cache, and Global Song Metadata Catalogue schema')",
+            params![now],
+        )?;
+        info!("Migration v4 applied successfully.");
+    }
+
+    Ok(())
+}
+
+/// Strictly isolated schema for the separate Cloud Global Shared Song Metadata Catalogue Service.
+/// Contains ZERO party rooms, ZERO playlists, ZERO guest requests, and ZERO audio files.
+pub fn apply_global_catalogue_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS global_song_catalogue (
+            song_id TEXT PRIMARY KEY NOT NULL,
+            canonical_fingerprint TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            artist TEXT NOT NULL,
+            version_tag TEXT NOT NULL DEFAULT 'original',
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            original_bpm REAL,
+            half_time_bpm REAL,
+            double_time_bpm REAL,
+            bpm_confidence REAL,
+            musical_key TEXT,
+            camelot_key TEXT,
+            key_confidence REAL,
+            beat_grid_json TEXT,
+            phrase_markers_json TEXT,
+            overall_energy REAL,
+            danceability REAL,
+            genre_tags_json TEXT NOT NULL DEFAULT '[]',
+            mood_tags_json TEXT NOT NULL DEFAULT '[]',
+            analysis_version INTEGER NOT NULL DEFAULT 1,
+            analysis_confidence REAL NOT NULL DEFAULT 0.0,
+            processing_status TEXT NOT NULL DEFAULT 'metadata_only',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_global_song_fp ON global_song_catalogue(canonical_fingerprint);
+
+        CREATE TABLE IF NOT EXISTS global_song_source_urls (
+            source_url TEXT PRIMARY KEY NOT NULL,
+            provider TEXT NOT NULL,
+            provider_video_id TEXT NOT NULL,
+            song_id TEXT NOT NULL REFERENCES global_song_catalogue(song_id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_global_source_vid ON global_song_source_urls(provider_video_id);
+        CREATE INDEX IF NOT EXISTS idx_global_source_song ON global_song_source_urls(song_id);
+        ",
+    )?;
+    Ok(())
+}
+
+/// Runs migrations strictly for the standalone Global Metadata Catalogue database (zero party tables).
+pub fn run_global_catalogue_migrations(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at INTEGER NOT NULL,
+            description TEXT NOT NULL
+        );"
+    )?;
+    let current_version: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    if current_version < 1 {
+        apply_global_catalogue_schema(conn)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at, description) VALUES (1, ?1, 'Global Shared Song Metadata Catalogue isolated schema')",
+            params![now],
+        )?;
+        info!("Global Metadata Catalogue isolated schema v1 applied.");
+    }
     Ok(())
 }
 
