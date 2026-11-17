@@ -40,8 +40,12 @@ pub fn verify_signature(
     signature_hex: &str,
 ) -> bool {
     let now = chrono::Utc::now().timestamp();
-    // Replay attack prevention: timestamp must be within 300s of current server time
-    if (now - timestamp).abs() > 300 {
+    // Replay attack prevention: timestamp must be within 300s of current server time (checked subtraction prevents i64 overflow)
+    let in_replay_window = now
+        .checked_sub(timestamp)
+        .map(|diff| (-300..=300).contains(&diff))
+        .unwrap_or(false);
+    if !in_replay_window {
         return false;
     }
 

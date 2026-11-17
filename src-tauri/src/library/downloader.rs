@@ -227,48 +227,10 @@ impl AudioDownloader {
         let dir = cache_dir.into();
         let _ = fs::create_dir_all(&dir);
 
-        // Configure client with custom redirect policy that validates every redirect target (fail closed)
-        let redirect_policy = Policy::custom(|attempt| {
-            if attempt.previous().len() >= 3 {
-                return attempt.stop();
-            }
-            let scheme = attempt.url().scheme().to_string();
-            if scheme != "https" {
-                return attempt.error("Security violation: Redirect to insecure non-HTTPS scheme blocked");
-            }
-            let host_opt = attempt.url().host_str().map(|h| h.to_string());
-            let port = attempt.url().port_or_known_default().unwrap_or(443);
-
-            let Some(host) = host_opt else {
-                return attempt.error("Security violation: Redirect URL missing host");
-            };
-            let lower = host.to_lowercase();
-            if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-                return attempt.error("Security violation: Redirect to localhost/local domain blocked");
-            }
-            match (host.as_str(), port).to_socket_addrs() {
-                Ok(addrs) => {
-                    let mut has_addr = false;
-                    for addr in addrs {
-                        has_addr = true;
-                        if is_restricted_ip(&addr.ip()) {
-                            return attempt.error("Security violation: Redirect to private or restricted network address blocked");
-                        }
-                    }
-                    if !has_addr {
-                        return attempt.error("Security violation: Redirect target has no resolvable IP addresses");
-                    }
-                }
-                Err(e) => {
-                    return attempt.error(format!("Security violation: Failed to resolve redirect host '{}': {}", host, e));
-                }
-            }
-            attempt.follow()
-        });
-
+        // Configure client with fail-closed redirect policy (redirects handled explicitly via manual pinned loop)
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
-            .redirect(redirect_policy)
+            .redirect(Policy::none())
             .build()
             .unwrap_or_default();
 
@@ -381,28 +343,89 @@ impl AudioDownloader {
 
         info!("Starting download for task '{}' from URL '{}' (pinned: {})", task_id, validated_url, pinned_addr);
 
-        // 3. Initiate HTTP GET request over DNS-pinned connection to defeat DNS-rebinding attacks
-        let host = validated_url.host_str().unwrap_or("");
-        let download_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .resolve(host, pinned_addr)
-            .build()
-            .unwrap_or_else(|_| self.client.clone());
+        // 3. Initiate HTTP GET request over fail-closed manual redirect loop (max 3 hops)
+        // Every redirect hop validates destination scheme, resolves host, verifies anti-SSRF IP restrictions,
+        // pins DNS with .resolve(), and uses Policy::none() so no unpinned automatic redirects can occur.
+        let mut current_url = validated_url;
+        let mut current_pinned = pinned_addr;
+        let mut redirect_count: usize = 0;
+        const MAX_REDIRECT_HOPS: usize = 3;
 
-        let resp = match download_client.get(validated_url.clone()).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                let err_msg = format!("HTTP connection failed: {}", e);
+        let resp = loop {
+            let host = current_url
+                .host_str()
+                .ok_or_else(|| anyhow!("URL is missing a valid host"))?;
+
+            let download_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .redirect(Policy::none())
+                .resolve(host, current_pinned)
+                .build()
+                .map_err(|e| anyhow!("Failed to build pinned HTTP client for '{}': {}", host, e))?;
+
+            let response = match download_client.get(current_url.clone()).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_msg = format!("HTTP connection failed to '{}': {}", current_url, e);
+                    db.update_download_status(&task_id, "failed", Some(&err_msg))?;
+                    return Err(anyhow!(err_msg));
+                }
+            };
+
+            if response.status().is_redirection() {
+                if redirect_count >= MAX_REDIRECT_HOPS {
+                    let err_msg = format!(
+                        "Security violation: Redirect chain exceeded maximum limit of {} hops",
+                        MAX_REDIRECT_HOPS
+                    );
+                    db.update_download_status(&task_id, "failed", Some(&err_msg))?;
+                    return Err(anyhow!(err_msg));
+                }
+
+                let loc_val = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .ok_or_else(|| anyhow!("Redirect response missing Location header"))?;
+                let loc_str = loc_val
+                    .to_str()
+                    .map_err(|_| anyhow!("Redirect Location header contains invalid characters"))?;
+
+                let next_url = current_url
+                    .join(loc_str)
+                    .map_err(|e| anyhow!("Failed to resolve redirect Location '{}': {}", loc_str, e))?;
+
+                // Strictly validate redirect target: HTTPS, non-localhost, anti-SSRF IP verification, address pinning
+                let (revalidated_url, next_pinned) = match validate_safe_public_url(next_url.as_str()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err_msg = format!("Redirect target failed security validation: {}", e);
+                        db.update_download_status(&task_id, "failed", Some(&err_msg))?;
+                        return Err(anyhow!(err_msg));
+                    }
+                };
+
+                info!(
+                    "Download task '{}': following redirect hop {} to '{}' (pinned: {})",
+                    task_id,
+                    redirect_count + 1,
+                    revalidated_url,
+                    next_pinned
+                );
+
+                current_url = revalidated_url;
+                current_pinned = next_pinned;
+                redirect_count += 1;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let err_msg = format!("HTTP error: status {}", response.status());
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
             }
-        };
 
-        if !resp.status().is_success() {
-            let err_msg = format!("HTTP error: status {}", resp.status());
-            db.update_download_status(&task_id, "failed", Some(&err_msg))?;
-            return Err(anyhow!(err_msg));
-        }
+            break response;
+        };
 
         // 4. Validate Content-Type header if present
         if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
@@ -535,7 +558,7 @@ impl AudioDownloader {
 
         // 9. Automatically ingest and analyze into DHUN library and managed cache
         db.update_download_status(&task_id, "ingesting", None)?;
-        let ingest_res = match ingest_audio_asset(&dest_path, "url_download", Some(validated_url.as_str()), true, db) {
+        let ingest_res = match ingest_audio_asset(&dest_path, "url_download", Some(current_url.as_str()), true, db) {
             Ok(res) => res,
             Err(e) => {
                 let err_msg = format!("Ingestion/analysis failed: {}", e);

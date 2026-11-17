@@ -1745,20 +1745,104 @@ mod tests {
         assert_eq!(MAX_DECODED_AUDIO_MINUTES, 30, "Decoded audio memory budget must be capped at 30 minutes");
     }
 
+    /// Helper to generate synthetic WAV bytes with customizable declared and actual frame counts
+    fn create_test_wav_bytes(sample_rate: u32, channels: u16, declared_frames: u32, actual_frames: u32) -> Vec<u8> {
+        let bits_per_sample: u16 = 16;
+        let bytes_per_sample: u16 = bits_per_sample / 8;
+        let block_align: u16 = channels * bytes_per_sample;
+        let byte_rate: u32 = sample_rate * block_align as u32;
+
+        let declared_data_bytes = declared_frames * block_align as u32;
+        let actual_data_bytes = actual_frames * block_align as u32;
+        let riff_chunk_size = 36 + declared_data_bytes;
+
+        let mut buf = Vec::with_capacity(44 + actual_data_bytes as usize);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&riff_chunk_size.to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size
+        buf.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+        buf.extend_from_slice(&channels.to_le_bytes());
+        buf.extend_from_slice(&sample_rate.to_le_bytes());
+        buf.extend_from_slice(&byte_rate.to_le_bytes());
+        buf.extend_from_slice(&block_align.to_le_bytes());
+        buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&declared_data_bytes.to_le_bytes());
+
+        // Generate sinusoidal PCM 16-bit audio samples for actual_frames
+        for f in 0..actual_frames {
+            let t = f as f32 / sample_rate as f32;
+            let sample_val = ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 16000.0) as i16;
+            for _ in 0..channels {
+                buf.extend_from_slice(&sample_val.to_le_bytes());
+            }
+        }
+        buf
+    }
+
     #[test]
     fn test_decoder_rejects_truncated_damaged_audio() {
         use dhun_lib::audio::decoder::decode_audio_file;
 
         let temp_dir = std::env::temp_dir().join(format!("dhun_trunc_test_{}", uuid::Uuid::new_v4()));
         let _ = std::fs::create_dir_all(&temp_dir);
-        let truncated_file = temp_dir.join("broken_header.mp3");
 
-        // Write partial truncated header with invalid frames
-        std::fs::write(&truncated_file, b"ID3\x03\x00\x00\x00\x00\x00\x10TRUNCATED_CORRUPT_BUFFER").unwrap();
+        // 1. Broken / corrupted container header
+        let corrupted_file = temp_dir.join("broken_header.mp3");
+        std::fs::write(&corrupted_file, b"ID3\x03\x00\x00\x00\x00\x00\x10TRUNCATED_CORRUPT_BUFFER").unwrap();
+        let res_corrupt = decode_audio_file(&corrupted_file);
+        assert!(res_corrupt.is_err(), "Decoder must strictly reject damaged/truncated audio streams");
 
-        // Must reject damaged audio with an error rather than accepting partial frames
-        let res = decode_audio_file(&truncated_file);
-        assert!(res.is_err(), "Decoder must strictly reject damaged/truncated audio streams");
+        // 2. Real truncated audio fixture: RIFF WAV header declares 100,000 frames (~2.27s), but file cuts off at 50,000 frames (~1.13s)
+        let truncated_wav_file = temp_dir.join("truncated_fixture.wav");
+        let truncated_bytes = create_test_wav_bytes(44100, 2, 100_000, 50_000);
+        std::fs::write(&truncated_wav_file, &truncated_bytes).unwrap();
+        let res_trunc = decode_audio_file(&truncated_wav_file);
+        assert!(
+            res_trunc.is_err(),
+            "Decoder must reject premature stream truncation where actual frames < declared frames"
+        );
+        let err_text = res_trunc.err().unwrap().to_string();
+        assert!(
+            err_text.contains("Premature stream truncation"),
+            "Error message must specify premature truncation: {}", err_text
+        );
+
+        // 3. Short audio file fixture (< 1.0 second) with undeclared/tiny frames (500 frames at 44.1kHz = 11.3ms)
+        let tiny_wav_file = temp_dir.join("tiny_fixture.wav");
+        let tiny_bytes = create_test_wav_bytes(44100, 2, 500, 500);
+        std::fs::write(&tiny_wav_file, &tiny_bytes).unwrap();
+        let res_tiny = decode_audio_file(&tiny_wav_file);
+        assert!(
+            res_tiny.is_err(),
+            "Decoder must reject files containing less than 1.0 second of audio"
+        );
+
+        // 4. Valid complete audio fixture (44100 frames = exactly 1.0 second stereo)
+        let valid_wav_file = temp_dir.join("valid_fixture.wav");
+        let valid_bytes = create_test_wav_bytes(44100, 2, 44100, 44100);
+        std::fs::write(&valid_wav_file, &valid_bytes).unwrap();
+        let res_valid = decode_audio_file(&valid_wav_file);
+        assert!(res_valid.is_ok(), "Complete valid 1.0s stereo WAV file must decode cleanly");
+        let decoded = res_valid.unwrap();
+        assert_eq!(decoded.sample_rate, 44100);
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.duration_ms, 1000);
+        assert_eq!(decoded.samples.len(), 44100 * 2);
+
+        // 5. Layout-aware conversion: Mono WAV (1 channel) correctly upmixed and normalized to stereo [M, M]
+        let mono_wav_file = temp_dir.join("mono_fixture.wav");
+        let mono_bytes = create_test_wav_bytes(44100, 1, 44100, 44100);
+        std::fs::write(&mono_wav_file, &mono_bytes).unwrap();
+        let res_mono = decode_audio_file(&mono_wav_file);
+        assert!(res_mono.is_ok(), "Mono audio file must decode and upmix to standardized stereo");
+        let decoded_mono = res_mono.unwrap();
+        assert_eq!(decoded_mono.channels, 2);
+        assert_eq!(decoded_mono.samples.len(), 44100 * 2);
+        // Verify channel duplication [M, M]
+        assert_eq!(decoded_mono.samples[0], decoded_mono.samples[1]);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -1811,6 +1895,16 @@ mod tests {
         assert!(
             !verify_signature(secret, method, path, expired_timestamp, payload, &sig),
             "Expired timestamp beyond 300-second window must be rejected"
+        );
+
+        // 7. Robustness against extreme timestamps: i64::MIN and i64::MAX must not overflow or panic
+        assert!(
+            !verify_signature(secret, method, path, i64::MIN, payload, &sig),
+            "i64::MIN timestamp must be safely rejected without integer overflow"
+        );
+        assert!(
+            !verify_signature(secret, method, path, i64::MAX, payload, &sig),
+            "i64::MAX timestamp must be safely rejected without integer overflow"
         );
     }
 
@@ -1901,6 +1995,68 @@ mod tests {
         assert!(
             ingest_res.is_err(),
             "Duplicate ingestion must fail with database integrity error if canonical track is missing"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_downloader_redirect_anti_ssrf_and_hop_limits() {
+        use dhun_lib::library::downloader::{validate_safe_public_url, AudioDownloader};
+        use reqwest::Url;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let temp_dir = std::env::temp_dir().join(format!("dhun_redirect_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let downloader = AudioDownloader::new(&temp_dir);
+
+        // 1. Initial URL validation blocks SSRF before any connection attempt
+        let ssrf_res = downloader.download_audio("https://127.0.0.1/track.mp3", None, None, &db).await;
+        assert!(ssrf_res.is_err(), "Direct download to loopback must fail security validation");
+
+        let tasks = db.list_download_tasks(10).unwrap();
+        // Failed task was audited in DB
+        let failed_task = tasks.iter().find(|t| t.url == "https://127.0.0.1/track.mp3");
+        assert!(failed_task.is_some(), "Failed download task must be recorded for audit trail");
+        assert_eq!(failed_task.unwrap().status, "failed");
+
+        // 2. Redirect target validation: relative and absolute redirect hops to private / insecure addresses
+        let base_url = Url::parse("https://safe-cdn.dhun-party.com/audio/v1/track.mp3").unwrap();
+
+        // Redirect hop to insecure scheme
+        let insecure_redirect = base_url.join("http://safe-cdn.dhun-party.com/audio/v1/track.mp3").unwrap();
+        assert!(
+            validate_safe_public_url(insecure_redirect.as_str()).is_err(),
+            "Redirect target with non-HTTPS scheme must fail validation"
+        );
+
+        // Redirect hop to loopback / internal service
+        let loopback_redirect = base_url.join("https://127.0.0.1/internal/admin.mp3").unwrap();
+        assert!(
+            validate_safe_public_url(loopback_redirect.as_str()).is_err(),
+            "Redirect target pointing to loopback must fail anti-SSRF validation"
+        );
+
+        // Redirect hop to private network
+        let private_redirect = base_url.join("https://192.168.1.50/audio.mp3").unwrap();
+        assert!(
+            validate_safe_public_url(private_redirect.as_str()).is_err(),
+            "Redirect target pointing to private IP must fail anti-SSRF validation"
+        );
+
+        // Redirect hop to cloud metadata service
+        let metadata_redirect = base_url.join("https://169.254.169.254/latest/meta-data/").unwrap();
+        assert!(
+            validate_safe_public_url(metadata_redirect.as_str()).is_err(),
+            "Redirect target pointing to link-local/cloud metadata must fail anti-SSRF validation"
+        );
+
+        // Redirect hop to localhost hostname
+        let localhost_redirect = base_url.join("https://localhost:8443/secret.wav").unwrap();
+        assert!(
+            validate_safe_public_url(localhost_redirect.as_str()).is_err(),
+            "Redirect target pointing to localhost hostname must fail anti-SSRF validation"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

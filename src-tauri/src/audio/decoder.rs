@@ -97,7 +97,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
                 append_audio_buffer(&decoded, &mut sample_buf, &mut interleaved);
             }
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                clean_eof = true;
+                fatal_error = Some(format!("Decoder payload truncated mid-frame: {}", e));
                 break;
             }
             Err(SymphoniaError::DecodeError(e)) => {
@@ -134,7 +134,16 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
     }
 
     let total_frames = interleaved.len() / 2;
-    // Validate decoded frame count against declared container frame count (with 15% tolerance for VBR container headers)
+
+    // 1. Enforce minimum decodable audio duration (at least 1.0 second) to reject truncated snippets or scraps
+    if total_frames < sample_rate as usize {
+        return Err(anyhow!(
+            "Corrupt or truncated audio file: contains less than 1.0 second of audio ({} frames at {} Hz)",
+            total_frames, sample_rate
+        ));
+    }
+
+    // 2. Validate decoded frame count against declared container frame count (with 15% tolerance for VBR container headers)
     if let Some(declared_frames) = declared_n_frames {
         if declared_frames > 0 && total_frames < (declared_frames as usize * 85 / 100) {
             return Err(anyhow!(
@@ -155,7 +164,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 }
 
 /// Robust conversion of any Symphonia sample format (U8, S16, S24, S32, F32, F64)
-/// with universal calibrated ITU-R BS.775 downmixing/upmixing into standardized stereo [L, R]
+/// with universal calibrated ITU-R BS.775 layout-aware downmixing/upmixing into standardized stereo [L, R]
 fn append_audio_buffer(
     buf_ref: &AudioBufferRef,
     sample_buf: &mut Option<SampleBuffer<f32>>,
@@ -176,81 +185,98 @@ fn append_audio_buffer(
     sbuf.copy_interleaved_ref(buf_ref.clone());
     let raw_samples = sbuf.samples();
 
-    match num_channels {
-        1 => {
-            // Mono to stereo duplicate [M, M]
-            out.reserve(num_frames * 2);
-            for &sample in raw_samples.iter().take(num_frames) {
-                out.push(sample);
-                out.push(sample);
+    if num_channels == 1 {
+        // Mono to stereo duplicate [M, M]
+        out.reserve(num_frames * 2);
+        for &sample in raw_samples.iter().take(num_frames) {
+            out.push(sample);
+            out.push(sample);
+        }
+        return;
+    }
+
+    let channels = buf_ref.spec().channels;
+
+    if num_channels == 2
+        && channels.contains(symphonia::core::audio::Channels::FRONT_LEFT)
+        && channels.contains(symphonia::core::audio::Channels::FRONT_RIGHT)
+    {
+        // Direct stereo [L, R]
+        let total_samples = num_frames * 2;
+        out.extend_from_slice(&raw_samples[..total_samples.min(raw_samples.len())]);
+        return;
+    }
+
+    // Layout-aware channel mapping: inspect the declared Channels bitflags to find exact channel positions
+    let mut left_idx = None;
+    let mut right_idx = None;
+    let mut center_idx = None;
+    let mut lfe_idx = None;
+    let mut surround_left_idx = None;
+    let mut surround_right_idx = None;
+    let mut rear_left_idx = None;
+    let mut rear_right_idx = None;
+
+    for (idx, ch) in channels.iter().enumerate() {
+        if ch.contains(symphonia::core::audio::Channels::FRONT_LEFT) {
+            left_idx = Some(idx);
+        } else if ch.contains(symphonia::core::audio::Channels::FRONT_RIGHT) {
+            right_idx = Some(idx);
+        } else if ch.contains(symphonia::core::audio::Channels::FRONT_CENTRE) {
+            center_idx = Some(idx);
+        } else if ch.contains(symphonia::core::audio::Channels::LFE1) {
+            lfe_idx = Some(idx);
+        } else if ch.contains(symphonia::core::audio::Channels::SIDE_LEFT) {
+            surround_left_idx = Some(idx);
+        } else if ch.contains(symphonia::core::audio::Channels::SIDE_RIGHT) {
+            surround_right_idx = Some(idx);
+        } else if ch.contains(symphonia::core::audio::Channels::REAR_LEFT) {
+            if surround_left_idx.is_none() {
+                surround_left_idx = Some(idx);
+            } else {
+                rear_left_idx = Some(idx);
+            }
+        } else if ch.contains(symphonia::core::audio::Channels::REAR_RIGHT) {
+            if surround_right_idx.is_none() {
+                surround_right_idx = Some(idx);
+            } else {
+                rear_right_idx = Some(idx);
+            }
+        } else if ch.contains(symphonia::core::audio::Channels::REAR_CENTRE) {
+            if center_idx.is_none() {
+                center_idx = Some(idx);
             }
         }
-        2 => {
-            // Direct stereo [L, R]
-            let total_samples = num_frames * 2;
-            out.extend_from_slice(&raw_samples[..total_samples.min(raw_samples.len())]);
-        }
-        3 => {
-            // 3.0 Layout: 0=Left, 1=Right, 2=Center
-            out.reserve(num_frames * 2);
-            let norm = 0.5857f32; // 1.0 / (1.0 + 0.7071)
-            for frame_idx in 0..num_frames {
-                let base = frame_idx * 3;
-                let left = raw_samples[base];
-                let right = raw_samples[base + 1];
-                let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
-                out.push(((left + center) * norm).clamp(-1.0, 1.0));
-                out.push(((right + center) * norm).clamp(-1.0, 1.0));
-            }
-        }
-        4 => {
-            // Quadraphonic 4.0 Layout: 0=Left, 1=Right, 2=Left Surround, 3=Right Surround
-            out.reserve(num_frames * 2);
-            let norm = 0.5857f32;
-            for frame_idx in 0..num_frames {
-                let base = frame_idx * 4;
-                let left = raw_samples[base];
-                let right = raw_samples[base + 1];
-                let ls = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
-                let rs = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.7071f32;
-                out.push(((left + ls) * norm).clamp(-1.0, 1.0));
-                out.push(((right + rs) * norm).clamp(-1.0, 1.0));
-            }
-        }
-        5 | 6 => {
-            // 5.1 Surround (ITU-R BS.775): 0=Left, 1=Right, 2=Center, 3=LFE, 4=Left Surround, 5=Right Surround
-            out.reserve(num_frames * 2);
-            let norm = 0.41f32; // Normalization prevents digital clipping
-            for frame_idx in 0..num_frames {
-                let base = frame_idx * num_channels;
-                let left = raw_samples[base];
-                let right = raw_samples[base + 1];
-                let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
-                let lfe = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.50f32;
-                let ls = raw_samples.get(base + 4).copied().unwrap_or(0.0) * 0.7071f32;
-                let rs = raw_samples.get(base + 5).copied().unwrap_or(0.0) * 0.7071f32;
-                out.push(((left + center + ls + lfe) * norm).clamp(-1.0, 1.0));
-                out.push(((right + center + rs + lfe) * norm).clamp(-1.0, 1.0));
-            }
-        }
-        ch => {
-            // 7.1+ Surround: 0=Left, 1=Right, 2=Center, 3=LFE, 4=Ls, 5=Rs, 6=Lb, 7=Rb
-            out.reserve(num_frames * 2);
-            let norm = 0.35f32;
-            for frame_idx in 0..num_frames {
-                let base = frame_idx * ch;
-                let left = raw_samples[base];
-                let right = raw_samples[base + 1];
-                let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
-                let lfe = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.50f32;
-                let ls = raw_samples.get(base + 4).copied().unwrap_or(0.0) * 0.7071f32;
-                let rs = raw_samples.get(base + 5).copied().unwrap_or(0.0) * 0.7071f32;
-                let lb = raw_samples.get(base + 6).copied().unwrap_or(0.0) * 0.50f32;
-                let rb = raw_samples.get(base + 7).copied().unwrap_or(0.0) * 0.50f32;
-                out.push(((left + center + ls + lb + lfe) * norm).clamp(-1.0, 1.0));
-                out.push(((right + center + rs + rb + lfe) * norm).clamp(-1.0, 1.0));
-            }
-        }
+    }
+
+    let l_i = left_idx.unwrap_or(0);
+    let r_i = right_idx.unwrap_or(1.min(num_channels - 1));
+
+    // Dynamic normalization factor based on present channel components to prevent digital clipping
+    let mut max_sum = 1.0f32;
+    if center_idx.is_some() { max_sum += 0.7071; }
+    if surround_left_idx.is_some() || surround_right_idx.is_some() { max_sum += 0.7071; }
+    if rear_left_idx.is_some() || rear_right_idx.is_some() { max_sum += 0.5000; }
+    if lfe_idx.is_some() { max_sum += 0.5000; }
+    let norm = 1.0f32 / max_sum;
+
+    out.reserve(num_frames * 2);
+    for frame_idx in 0..num_frames {
+        let base = frame_idx * num_channels;
+        let l_val = raw_samples.get(base + l_i).copied().unwrap_or(0.0);
+        let r_val = raw_samples.get(base + r_i).copied().unwrap_or(0.0);
+        let c_val = center_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.7071;
+        let lfe_val = lfe_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.5000;
+        let ls_val = surround_left_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.7071;
+        let rs_val = surround_right_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.7071;
+        let lb_val = rear_left_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.5000;
+        let rb_val = rear_right_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.5000;
+
+        let mixed_l = ((l_val + c_val + ls_val + lb_val + lfe_val) * norm).clamp(-1.0, 1.0);
+        let mixed_r = ((r_val + c_val + rs_val + rb_val + lfe_val) * norm).clamp(-1.0, 1.0);
+
+        out.push(mixed_l);
+        out.push(mixed_r);
     }
 }
 
