@@ -8,6 +8,7 @@ impl TrackSelector {
         candidates: &[PlayableTrackCandidate],
         currently_playing: Option<&PlayableTrackCandidate>,
         mood: &MoodDefinition,
+        secondary_mood: Option<&MoodDefinition>,
         target_energy: f64,
         recent_history: &[PlaybackHistoryItem],
         approved_requests: &[GuestRequest],
@@ -53,21 +54,44 @@ impl TrackSelector {
                 }
             }
 
-            // 1. Genre Score (0.0 to 1.0)
-            let mut genre_score = 0.4;
+            // 1. Genre Score (0.0 to 1.0) with optional secondary mood blending (70% primary, 30% secondary)
+            let mut primary_genre_score = 0.4;
             for (g, weight) in &mood.genre_weights {
                 if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
-                    genre_score = *weight;
+                    primary_genre_score = *weight;
                     break;
                 }
             }
 
+            let genre_score = match secondary_mood {
+                Some(sec) => {
+                    let mut sec_genre_score = 0.4;
+                    for (g, weight) in &sec.genre_weights {
+                        if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
+                            sec_genre_score = *weight;
+                            break;
+                        }
+                    }
+                    (0.70 * primary_genre_score) + (0.30 * sec_genre_score)
+                }
+                None => primary_genre_score,
+            };
+
             // 2. BPM Compatibility Score
+            let effective_min_bpm = match secondary_mood {
+                Some(sec) => mood.min_bpm.min(sec.min_bpm),
+                None => mood.min_bpm,
+            };
+            let effective_max_bpm = match secondary_mood {
+                Some(sec) => mood.max_bpm.max(sec.max_bpm),
+                None => mood.max_bpm,
+            };
+
             let bpm_score = match currently_playing {
                 Some(curr) => calculate_bpm_compatibility(curr.analysis.bpm, candidate.analysis.bpm),
                 None => {
-                    // Check if candidate falls in mood BPM range
-                    if candidate.analysis.bpm >= mood.min_bpm && candidate.analysis.bpm <= mood.max_bpm {
+                    // Check if candidate falls in effective mood BPM range
+                    if candidate.analysis.bpm >= effective_min_bpm && candidate.analysis.bpm <= effective_max_bpm {
                         1.0
                     } else {
                         0.5
@@ -81,8 +105,12 @@ impl TrackSelector {
                 None => 0.8,
             };
 
-            // 4. Energy Compatibility Score
-            let energy_diff = (candidate.analysis.overall_energy - target_energy).abs();
+            // 4. Energy Compatibility Score with secondary mood blending
+            let effective_target_energy = match secondary_mood {
+                Some(sec) => (0.70 * target_energy) + (0.30 * sec.target_energy),
+                None => target_energy,
+            };
+            let energy_diff = (candidate.analysis.overall_energy - effective_target_energy).abs();
             let energy_score = (1.0 - energy_diff).clamp(0.1, 1.0);
 
             // 5. Repetition Penalty

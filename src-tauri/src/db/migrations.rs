@@ -185,7 +185,7 @@ fn seed_sample_tracks(conn: &Connection) -> Result<()> {
             "INSERT OR IGNORE INTO audio_assets (
                 id, track_id, file_path, file_format, file_size_bytes, sample_rate, bit_depth, channels, sha256_hash,
                 verification_status, availability_status, last_verified_at
-            ) VALUES (?1, ?2, ?3, 'mp3', 5000000, 44100, 16, 2, 'demosha256hash', 'verified', 'available', ?4)",
+            ) VALUES (?1, ?2, ?3, 'mp3', 5000000, 44100, 16, 2, 'demosha256hash', 'unverified', 'demo_catalog', ?4)",
             params![asset_id, id, dummy_path, now],
         )?;
 

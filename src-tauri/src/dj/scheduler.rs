@@ -14,6 +14,7 @@ use crate::dj::transition::TransitionPlan;
 pub struct DjScheduler {
     pub session: PartySession,
     pub mood: MoodDefinition,
+    pub secondary_mood: Option<MoodDefinition>,
     pub level: DjLevel,
     pub active_deck: usize, // 0 = Deck A, 1 = Deck B, 2 = Deck C, 3 = Deck D
     pub current_track: Option<PlayableTrackCandidate>,
@@ -31,15 +32,21 @@ impl DjScheduler {
     pub fn new(session: PartySession) -> Self {
         let preset_moods = get_preset_moods();
         let mood = preset_moods
-            .into_iter()
+            .iter()
             .find(|m| m.id == session.primary_mood_id)
+            .cloned()
             .unwrap_or_else(|| get_preset_moods().remove(0));
+
+        let secondary_mood = session.secondary_mood_id.as_ref().and_then(|sec_id| {
+            preset_moods.iter().find(|m| m.id == *sec_id).cloned()
+        });
 
         let level = DjLevel::from_i32(session.dj_level);
 
         Self {
             session,
             mood,
+            secondary_mood,
             level,
             active_deck: 0,
             current_track: None,
@@ -98,6 +105,7 @@ impl DjScheduler {
                 &candidates,
                 self.current_track.as_ref(),
                 &self.mood,
+                self.secondary_mood.as_ref(),
                 self.mood.target_energy,
                 &self.playback_history,
                 &approved_requests,
@@ -113,6 +121,7 @@ impl DjScheduler {
                 &candidates,
                 self.next_track.as_ref().or(self.current_track.as_ref()),
                 &self.mood,
+                self.secondary_mood.as_ref(),
                 self.mood.target_energy,
                 &self.playback_history,
                 &approved_requests,
@@ -132,7 +141,14 @@ impl DjScheduler {
             let target_deck = (self.active_deck + 1) % max_decks;
             info!("Preloading next track '{}' into Deck {} (DJ Level: {:?})", next.track.title, target_deck, self.level);
 
-            let decoded = decode_audio_file(&next.asset.file_path)?;
+            let decoded = match decode_audio_file(&next.asset.file_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Failed to decode track '{}' ({}): {}", next.track.title, next.asset.file_path, e);
+                    self.next_track = self.following_track.take();
+                    return Err(anyhow::anyhow!("Preload decode error: {}", e));
+                }
+            };
 
             // Adjust tempo rate if Smart Mixing (Level 2+) to beatmatch active deck within ±8%
             let rate = if let Some(curr) = &self.current_track {
@@ -177,49 +193,126 @@ impl DjScheduler {
         Ok(())
     }
 
+    /// Preloads next track into designated idle deck with automatic fallback retry loop
+    /// if the selected audio file is missing or corrupted.
+    pub fn preload_next_deck_with_db(&mut self, audio: &AudioEngine, db: &Database) -> Result<()> {
+        let mut attempts = 0;
+        while attempts < 3 {
+            attempts += 1;
+            if self.next_track.is_none() {
+                let _ = self.ensure_queue_populated(db);
+            }
+            if let Some(next) = self.next_track.as_ref() {
+                match decode_audio_file(&next.asset.file_path) {
+                    Ok(decoded) => {
+                        let max_decks = self.level.max_decks();
+                        let target_deck = (self.active_deck + 1) % max_decks;
+                        info!("Preloading next track '{}' into Deck {} (DJ Level: {:?})", next.track.title, target_deck, self.level);
+
+                        let rate = if let Some(curr) = &self.current_track {
+                            if self.level.supports_auto_sync() && next.analysis.bpm > 0.0 && curr.analysis.bpm > 0.0 {
+                                (curr.analysis.bpm / next.analysis.bpm).clamp(0.92, 1.08)
+                            } else {
+                                1.0
+                            }
+                        } else {
+                            1.0
+                        };
+
+                        audio.send_command(AudioCommand::LoadDeck {
+                            deck_id: target_deck,
+                            track_id: next.track.id.clone(),
+                            samples: decoded.samples,
+                            sample_rate: decoded.sample_rate,
+                            bpm: next.analysis.bpm,
+                        })?;
+
+                        let cue_point_ms = if next.analysis.recommended_mix_in_ms > 0 {
+                            next.analysis.recommended_mix_in_ms as u64
+                        } else if next.analysis.downbeat_offset_ms > 0 {
+                            next.analysis.downbeat_offset_ms as u64
+                        } else {
+                            0
+                        };
+                        if cue_point_ms > 0 {
+                            let _ = audio.send_command(AudioCommand::Seek {
+                                deck_id: target_deck,
+                                position_ms: cue_point_ms,
+                            });
+                        }
+
+                        audio.send_command(AudioCommand::SetTempoRate {
+                            deck_id: target_deck,
+                            rate,
+                        })?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Preload decode error for '{}' ({}): {}, quarantining and retrying", next.track.title, next.asset.file_path, e);
+                        let _ = db.update_asset_verification_status(&next.asset.id, "corrupt", "quarantined");
+                        self.next_track = self.following_track.take();
+                        let _ = self.ensure_queue_populated(db);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts playing the party immediately
     pub fn start_playback(&mut self, audio: &AudioEngine, db: &Database) -> Result<()> {
         self.ensure_queue_populated(db)?;
 
-        // If no track currently loaded, pull next track into active deck
-        if self.current_track.is_none() {
+        // If no track currently loaded, pull next track into active deck with fallback retry loop
+        while self.current_track.is_none() {
             if let Some(next) = self.next_track.take() {
-                let decoded = decode_audio_file(&next.asset.file_path)?;
-                audio.send_command(AudioCommand::LoadDeck {
-                    deck_id: self.active_deck,
-                    track_id: next.track.id.clone(),
-                    samples: decoded.samples,
-                    sample_rate: decoded.sample_rate,
-                    bpm: next.analysis.bpm,
-                })?;
+                match decode_audio_file(&next.asset.file_path) {
+                    Ok(decoded) => {
+                        audio.send_command(AudioCommand::LoadDeck {
+                            deck_id: self.active_deck,
+                            track_id: next.track.id.clone(),
+                            samples: decoded.samples,
+                            sample_rate: decoded.sample_rate,
+                            bpm: next.analysis.bpm,
+                        })?;
 
-                let cue_point_ms = if next.analysis.recommended_mix_in_ms > 0 {
-                    next.analysis.recommended_mix_in_ms as u64
-                } else if next.analysis.downbeat_offset_ms > 0 {
-                    next.analysis.downbeat_offset_ms as u64
-                } else {
-                    0
-                };
-                if cue_point_ms > 0 {
-                    let _ = audio.send_command(AudioCommand::Seek {
-                        deck_id: self.active_deck,
-                        position_ms: cue_point_ms,
-                    });
+                        let cue_point_ms = if next.analysis.recommended_mix_in_ms > 0 {
+                            next.analysis.recommended_mix_in_ms as u64
+                        } else if next.analysis.downbeat_offset_ms > 0 {
+                            next.analysis.downbeat_offset_ms as u64
+                        } else {
+                            0
+                        };
+                        if cue_point_ms > 0 {
+                            let _ = audio.send_command(AudioCommand::Seek {
+                                deck_id: self.active_deck,
+                                position_ms: cue_point_ms,
+                            });
+                        }
+
+                        audio.send_command(AudioCommand::Play { deck_id: self.active_deck })?;
+                        
+                        // Record history
+                        self.record_track_start(&next);
+                        self.current_track = Some(next);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to decode track '{}' ({}) on start, quarantining and retrying: {}", next.track.title, next.asset.file_path, e);
+                        let _ = db.update_asset_verification_status(&next.asset.id, "corrupt", "quarantined");
+                        self.ensure_queue_populated(db)?;
+                    }
                 }
-
-                audio.send_command(AudioCommand::Play { deck_id: self.active_deck })?;
-                
-                // Record history
-                self.record_track_start(&next);
-                self.current_track = Some(next);
+            } else {
+                break;
             }
-        } else {
-            audio.send_command(AudioCommand::Play { deck_id: self.active_deck })?;
         }
 
         // Repopulate next and following with reservation
         self.ensure_queue_populated(db)?;
-        self.preload_next_deck(audio)?;
+        self.preload_next_deck_with_db(audio, db)?;
 
         Ok(())
     }
@@ -280,7 +373,7 @@ impl DjScheduler {
 
                 // Repopulate next and preload next deck
                 self.ensure_queue_populated(db)?;
-                let _ = self.preload_next_deck(audio);
+                let _ = self.preload_next_deck_with_db(audio, db);
             }
             return Ok(());
         }

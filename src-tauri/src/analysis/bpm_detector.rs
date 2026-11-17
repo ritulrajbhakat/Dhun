@@ -69,4 +69,49 @@ impl BpmDetector {
 
         (bpm, confidence)
     }
+
+    /// Detects phase-aligned downbeat offset in milliseconds from audio onset energies
+    pub fn detect_downbeat_offset(samples: &Arc<Vec<f32>>, sample_rate: u32, bpm: f64) -> i64 {
+        let total_frames = samples.len() / 2;
+        let beat_period_ms = 60000.0 / bpm.max(60.0);
+        let beat_period_frames = ((sample_rate as f64 * beat_period_ms) / 1000.0) as usize;
+
+        if total_frames < beat_period_frames || beat_period_frames == 0 {
+            return 0;
+        }
+
+        // Subsample energy onset curve in 10ms steps across the first 4 bars (up to ~6s)
+        let step_ms = 10;
+        let step_frames = (sample_rate as usize * step_ms) / 1000;
+        let max_search_ms = (beat_period_ms * 4.0).min(6000.0) as usize;
+        let num_steps = (max_search_ms / step_ms).min(total_frames / step_frames.max(1));
+
+        let mut envelope = Vec::with_capacity(num_steps);
+        for s in 0..num_steps {
+            let start = s * step_frames * 2;
+            let mut sum_sq = 0.0f32;
+            let chunk_size = step_frames.min((total_frames - s * step_frames).max(1));
+            for i in 0..chunk_size {
+                let l = samples[start + i * 2];
+                let r = samples[start + i * 2 + 1];
+                sum_sq += l * l + r * r;
+            }
+            envelope.push((sum_sq / chunk_size as f32).sqrt());
+        }
+
+        // Calculate onset peaks
+        let mut best_step = 0;
+        let mut max_onset = 0.0f32;
+        for s in 1..num_steps {
+            let diff = envelope[s] - envelope[s - 1];
+            if diff > max_onset {
+                max_onset = diff;
+                best_step = s;
+            }
+        }
+
+        let detected_offset_ms = (best_step * step_ms) as f64;
+        let phase_aligned = (detected_offset_ms % beat_period_ms).round() as i64;
+        phase_aligned.max(0)
+    }
 }

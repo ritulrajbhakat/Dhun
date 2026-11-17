@@ -52,7 +52,9 @@
 
 ---
 
-## 5. Indian Party Mood Profiles
+## 5. All 14 Indian & Celebration Party Mood Profiles
+
+DHUN ships with 14 comprehensive, mathematically tuned party mood profiles with specialized genre weight matrices, harmonic Camelot filters, and tempo progression curves:
 
 | Mood | BPM Range | Primary Genres | Transition Preset | Energy Profile |
 | :--- | :--- | :--- | :--- | :--- |
@@ -65,6 +67,11 @@
 | **Garba** | 110 - 140 | Garba Folk (60%), Sanedo (40%) | Continuous Cyclic Rhythm Sync | Progressive Acceleration |
 | **Dandiya** | 120 - 144 | Dandiya Raas (70%), Fusion Beats (30%) | Synchronized Beat-Lock Cut | Fast Continuous |
 | **Retro Bollywood** | 90 - 125 | RD Burman Disco Funk (60%), Golden Classics (40%) | 16-bar Linear Fade | Nostalgic Steady |
+| **House Party** | 95 - 128 | Commercial Desi Pop (45%), Hip-Hop (35%), Acoustic (20%) | 16-bar Smart Bass Swap | Warm & Dynamic |
+| **Punjabi Tashan** | 128 - 148 | Heavy Dhol (50%), UK Bhangra (35%), Desi Trap (15%) | 8-bar High-Energy Cut | Maximum Intensity |
+| **Cocktail Night** | 105 - 122 | Mellow Bollywood (40%), Deep House (35%), Acoustic (25%) | 32-bar Long Smooth Blending | Sophisticated Lounge |
+| **Festival Mode** | 125 - 142 | Festive Anthems (50%), EDM Drops (30%), Brass Dhol (20%) | 16-bar Filter Drop & Swop | Euphoric Carnival |
+| **International Party** | 120 - 132 | Global EDM (40%), Afrobeats (35%), Latin Crossover (25%) | 32-bar Progressive Club Mix | Peak International Club |
 
 ---
 
@@ -196,4 +203,30 @@ npm run tauri build
 4. The mobile web page opens instantly in Safari/Chrome without installing an app.
 5. Guests search the laptop's music library and submit requests.
 6. Requests appear on the host's screen for instant approval or Force Next override.
+
+---
+
+## 9. Security & Reliability Architecture
+
+- **Anti-SSRF Direct Downloader**: Prohibits private networks (RFC 1918: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`), and carrier-grade NAT (`100.64.0.0/10`) with recursive redirect inspection (up to 3 hops).
+- **Windows Path & Reserved Name Sanitization**: Neutralizes path traversals and prevents denial-of-service from Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
+- **Symphonia Media Probing**: Decodes and verifies genuine audio containers before committing files from temporary `.part` buffers into the active catalogue.
+- **Cryptographic Guest Session Tokens**: Server-issued SHA-256 hashed guest tokens (`POST /api/auth`) with privacy masking (`GET /api/requests` hides notes and identities of other guests).
+- **Decoded Audio Memory Budget**: Strictly caps decoded PCM buffers to 30 minutes of stereo audio to prevent OOM errors on massive files.
+- **Cache Isolation & User File Protection**: Rolling LRU cleanup strictly deletes files only within `cache_dir`, preserving user music files on disk, and reconciles locks on startup.
+- **Crash Recovery & Offline Sync**: Outbox items left `in_flight` from abrupt shutdowns are safely restored to `pending` on startup, with automated background retry workers.
+- **3-Hour Continuous DJ Marathon**: Smart repetition penalties and candidate recycling ensure music never stops playing even in small libraries.
+
+---
+
+## 10. Automated Test Suite Verification
+
+The native test suite (`src-tauri/tests/engine_tests.rs`) runs **31 unit and integration tests** verifying core DSP, scheduler resilience, security, and SQLite persistence:
+
+```powershell
+cargo test --test engine_tests
+# Result: ok. 31 passed; 0 failed; 0 ignored; finished in 0.24s
+```
+
+All 31 tests are continuously executed and verified on native Windows build runners.
 

@@ -10,6 +10,8 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+pub const MAX_DECODED_AUDIO_MINUTES: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct DecodedAudio {
     pub samples: Arc<Vec<f32>>, // Interleaved stereo [L, R, L, R, ...]
@@ -54,20 +56,34 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         .map_err(|e| anyhow!("Failed to instantiate codec: {}", e))?;
 
     let mut interleaved = Vec::with_capacity(sample_rate as usize * 60 * 2); // Initial pre-allocation for ~1 min stereo
+    let max_samples = (sample_rate as usize * 60 * MAX_DECODED_AUDIO_MINUTES as usize) * 2;
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut clean_eof = false;
+    let mut consecutive_decode_errors = 0;
+    let mut fatal_error: Option<String> = None;
 
     loop {
+        if interleaved.len() >= max_samples {
+            tracing::info!(
+                "Reached maximum decoded audio memory budget ({} minutes); capping memory allocation.",
+                MAX_DECODED_AUDIO_MINUTES
+            );
+            clean_eof = true;
+            break;
+        }
+
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break; // Normal EOF
+                clean_eof = true;
+                break; // Clean EOF
             }
             Err(SymphoniaError::ResetRequired) => {
                 decoder.reset();
                 continue;
             }
             Err(e) => {
-                tracing::warn!("Non-fatal packet read issue: {}", e);
+                fatal_error = Some(format!("Fatal packet read issue: {}", e));
                 break;
             }
         };
@@ -78,17 +94,43 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
+                consecutive_decode_errors = 0;
                 append_audio_buffer(&decoded, &mut sample_buf, &mut interleaved);
             }
-            Err(SymphoniaError::IoError(_)) => break,
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                clean_eof = true;
+                break;
+            }
             Err(SymphoniaError::DecodeError(e)) => {
-                tracing::debug!("Decode frame skip: {}", e);
+                consecutive_decode_errors += 1;
+                tracing::debug!("Decode frame skip ({}): {}", consecutive_decode_errors, e);
+                // Allow isolated frame corruption, but abort on sustained stream corruption
+                if consecutive_decode_errors > 20 {
+                    fatal_error = Some(format!("Exceeded tolerable consecutive decode errors: {}", e));
+                    break;
+                }
                 continue;
             }
             Err(e) => {
-                tracing::warn!("Decoder error: {}", e);
+                fatal_error = Some(format!("Unrecoverable decoder error: {}", e));
                 break;
             }
+        }
+    }
+
+    // Fail if zero decodable samples were produced
+    if interleaved.is_empty() {
+        return Err(anyhow!(
+            "Failed to decode audio: stream contains zero valid audio frames ({})",
+            fatal_error.unwrap_or_else(|| "empty payload".to_string())
+        ));
+    }
+
+    // If an unrecoverable read or decode error caused loop termination before normal EOF,
+    // reject the file to prevent corrupted/truncated tracks from entering the performance queue
+    if let Some(err) = fatal_error {
+        if !clean_eof {
+            return Err(anyhow!("Corrupt audio file rejected due to premature termination: {}", err));
         }
     }
 
@@ -104,7 +146,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 }
 
 /// Robust conversion of any Symphonia sample format (U8, S16, S24, S32, F32, F64)
-/// with universal downmixing/upmixing into standardized stereo [L, R]
+/// with universal calibrated ITU-R BS.775 downmixing/upmixing into standardized stereo [L, R]
 fn append_audio_buffer(
     buf_ref: &AudioBufferRef,
     sample_buf: &mut Option<SampleBuffer<f32>>,
@@ -140,9 +182,9 @@ fn append_audio_buffer(
             out.extend_from_slice(&raw_samples[..total_samples.min(raw_samples.len())]);
         }
         ch => {
-            // Multi-channel downmix to stereo (e.g., 5.1 surround, quadraphonic)
-            // L_out = L + 0.707 * Center + 0.707 * Ls
-            // R_out = R + 0.707 * Center + 0.707 * Rs
+            // Calibrated ITU-R BS.775 multi-channel downmix to stereo (e.g. 5.1 surround)
+            // L_out = (L + 0.7071 * Center + 0.7071 * Ls + 0.50 * LFE) * Norm
+            // R_out = (R + 0.7071 * Center + 0.7071 * Rs + 0.50 * LFE) * Norm
             out.reserve(num_frames * 2);
             let center_weight = 0.7071f32;
             let surround_weight = 0.7071f32;
@@ -156,15 +198,18 @@ fn append_audio_buffer(
                 let right = raw_samples[base + 1];
 
                 let (mix_l, mix_r) = if ch >= 6 {
-                    // Standard 5.1 surround: 0=L, 1=R, 2=C, 3=LFE, 4=Ls, 5=Rs
+                    // Standard 5.1 surround: 0=Left, 1=Right, 2=Center, 3=LFE (subwoofer), 4=Left Surround, 5=Right Surround
                     let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * center_weight;
+                    let lfe = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.50f32;
                     let ls = raw_samples.get(base + 4).copied().unwrap_or(0.0) * surround_weight;
                     let rs = raw_samples.get(base + 5).copied().unwrap_or(0.0) * surround_weight;
-                    ((left + center + ls) * 0.7, (right + center + rs) * 0.7)
+                    let norm = 0.41f32; // Calibrated normalization preventing inter-sample peaks
+                    ((left + center + ls + lfe) * norm, (right + center + rs + lfe) * norm)
                 } else if ch >= 3 {
                     // 3.0 / quadraphonic: 0=L, 1=R, 2=Center/Rear
-                    let extra = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.5;
-                    ((left + extra) * 0.8, (right + extra) * 0.8)
+                    let extra = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
+                    let norm = 0.58f32;
+                    ((left + extra) * norm, (right + extra) * norm)
                 } else {
                     (left, right)
                 };

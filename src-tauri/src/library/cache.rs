@@ -64,8 +64,18 @@ impl RollingCacheManager {
         locks.len()
     }
 
+    /// Reconciles locks on application startup by clearing stale locks from SQLite
+    pub fn reconcile_locks(&self, db: &Database) -> Result<()> {
+        let mut locks = self.locked_asset_ids.lock().unwrap();
+        locks.clear();
+        db.clear_all_asset_cache_locks()?;
+        info!("Rolling cache locks successfully reconciled on startup");
+        Ok(())
+    }
+
     /// Runs rolling LRU cache eviction when cache exceeds max_cache_bytes.
-    /// Strictly guarantees NO active or queued playback asset is ever deleted.
+    /// Strictly guarantees NO active or queued playback asset is ever deleted,
+    /// and NEVER deletes local music files stored outside the managed cache directory.
     pub fn run_cleanup(&self, db: &Database) -> Result<usize> {
         // Sync in-memory locks with database manifest before pruning
         {
@@ -81,10 +91,15 @@ impl RollingCacheManager {
         for (_asset_id, path_str) in candidates {
             let path = Path::new(&path_str);
             if path.exists() {
-                if let Err(e) = fs::remove_file(path) {
-                    warn!("Failed to delete pruned cache file {:?}: {}", path, e);
+                // Safeguard: Only delete files located strictly within cache_dir
+                if path.starts_with(&self.cache_dir) {
+                    if let Err(e) = fs::remove_file(path) {
+                        warn!("Failed to delete pruned cache file {:?}: {}", path, e);
+                    } else {
+                        info!("Evicted cached file from disk: {:?}", path);
+                    }
                 } else {
-                    info!("Evicted cached file from disk: {:?}", path);
+                    info!("Preserving non-cache local file outside cache_dir: {:?}", path);
                 }
             }
         }
@@ -93,7 +108,8 @@ impl RollingCacheManager {
         Ok(count)
     }
 
-    /// Forcefully purges all unlocked cached files (useful on user request or disk low warning)
+    /// Forcefully purges all unlocked cached files (useful on user request or disk low warning).
+    /// Preserves user files located outside cache_dir.
     pub fn purge_unlocked(&self, db: &Database) -> Result<usize> {
         // Run prune with 0 max_bytes to evict all unlocked entries
         let candidates = db.prune_unlocked_cache_entries(0)?;
@@ -101,7 +117,7 @@ impl RollingCacheManager {
 
         for (_asset_id, path_str) in candidates {
             let path = Path::new(&path_str);
-            if path.exists() {
+            if path.exists() && path.starts_with(&self.cache_dir) {
                 let _ = fs::remove_file(path);
             }
         }

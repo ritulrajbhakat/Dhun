@@ -215,9 +215,30 @@ impl Database {
         })?;
 
         let mut candidates = Vec::new();
+        let mut missing_ids = Vec::new();
         for r in rows {
-            candidates.push(r?);
+            let candidate: PlayableTrackCandidate = r?;
+            // Exclude demo records
+            if candidate.asset.file_path.starts_with("demo://") {
+                continue;
+            }
+            // Exclude non-existent physical files on disk
+            let path = Path::new(&candidate.asset.file_path);
+            if !path.exists() {
+                missing_ids.push(candidate.asset.id);
+                continue;
+            }
+            candidates.push(candidate);
         }
+
+        drop(stmt);
+        for id in missing_ids {
+            let _ = conn.execute(
+                "UPDATE audio_assets SET availability_status = 'missing' WHERE id = ?1",
+                params![id],
+            );
+        }
+
         Ok(candidates)
     }
 
@@ -249,6 +270,59 @@ impl Database {
     }
 
     // --- Guest Requests ---
+    pub fn register_guest(&self, id: &str, session_id: &str, client_ip: &str, display_name: &str, token_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO guests (id, session_id, client_ip, display_name, token_hash, first_seen_at, last_request_at, request_count, is_blocked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 0, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                display_name = excluded.display_name,
+                token_hash = excluded.token_hash,
+                client_ip = excluded.client_ip",
+            params![id, session_id, client_ip, display_name, token_hash, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn lookup_guest_by_token_hash(&self, session_id: &str, token_hash: &str) -> Result<Option<Guest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, client_ip, display_name, token_hash, first_seen_at, last_request_at, request_count, is_blocked
+             FROM guests WHERE session_id = ?1 AND token_hash = ?2"
+        )?;
+        let mut rows = stmt.query_map(params![session_id, token_hash], |row| {
+            let is_blocked_val: i64 = row.get(8)?;
+            Ok(Guest {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                client_ip: row.get(2)?,
+                display_name: row.get(3)?,
+                token_hash: row.get(4)?,
+                first_seen_at: row.get(5)?,
+                last_request_at: row.get(6)?,
+                request_count: row.get(7)?,
+                is_blocked: is_blocked_val != 0,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn increment_guest_request_count(&self, guest_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE guests SET request_count = request_count + 1, last_request_at = ?1 WHERE id = ?2",
+            params![now, guest_id],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_guest_request(&self, req: &GuestRequest) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         // Ensure guest record exists for foreign key constraint
@@ -368,6 +442,70 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT track_id FROM audio_assets WHERE file_path = ?1")?;
         let mut rows = stmt.query_map(params![file_path], |row| row.get(0))?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_track_by_id(&self, track_id: &str) -> Result<Option<Track>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, artist, album, duration_ms, year, genre, subgenre, created_at, updated_at
+             FROM tracks WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![track_id], |row| {
+            Ok(Track {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                artist: row.get(2)?,
+                album: row.get(3)?,
+                duration_ms: row.get(4)?,
+                year: row.get(5)?,
+                genre: row.get(6)?,
+                subgenre: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_track_analysis_by_id(&self, track_id: &str) -> Result<Option<TrackAnalysis>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT track_id, bpm, bpm_confidence, key_name, camelot_key, key_confidence,
+                    time_signature_num, time_signature_den, downbeat_offset_ms, phrase_length_bars,
+                    overall_energy, dance_suitability, recommended_mix_in_ms, recommended_mix_out_ms,
+                    analysis_version, analyzed_at, manual_override
+             FROM track_analysis WHERE track_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![track_id], |row| {
+            Ok(TrackAnalysis {
+                track_id: row.get(0)?,
+                bpm: row.get(1)?,
+                bpm_confidence: row.get(2)?,
+                key_name: row.get(3)?,
+                camelot_key: row.get(4)?,
+                key_confidence: row.get(5)?,
+                time_signature_num: row.get(6)?,
+                time_signature_den: row.get(7)?,
+                downbeat_offset_ms: row.get(8)?,
+                phrase_length_bars: row.get(9)?,
+                overall_energy: row.get(10)?,
+                dance_suitability: row.get(11)?,
+                recommended_mix_in_ms: row.get(12)?,
+                recommended_mix_out_ms: row.get(13)?,
+                analysis_version: row.get(14)?,
+                analyzed_at: row.get(15)?,
+                manual_override: row.get(16)?,
+            })
+        })?;
         if let Some(r) = rows.next() {
             Ok(Some(r?))
         } else {
@@ -813,6 +951,54 @@ impl Database {
         })?;
 
         Ok(overview)
+    }
+
+    pub fn clear_all_asset_cache_locks(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE cache_manifest SET is_locked = 0, lock_reason = NULL", [])?;
+        conn.execute("UPDATE audio_assets SET availability_status = 'available' WHERE availability_status = 'locked_playback'", [])?;
+        Ok(())
+    }
+
+    pub fn recover_in_flight_sync_items(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let count = conn.execute(
+            "UPDATE sync_outbox SET status = 'pending', updated_at = ?1 WHERE status = 'in_flight'",
+            params![now],
+        )?;
+        Ok(count)
+    }
+
+    pub fn update_asset_verification_status(&self, asset_id: &str, status: &str, availability: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE audio_assets SET verification_status = ?1, availability_status = ?2 WHERE id = ?3",
+            params![status, availability, asset_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_app_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM app_settings WHERE key = ?1")?;
+        let mut rows = stmt.query_map(params![key], |row| row.get(0))?;
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_app_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, now],
+        )?;
+        Ok(())
     }
 }
 

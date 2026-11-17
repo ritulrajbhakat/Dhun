@@ -6,6 +6,8 @@ pub mod routes;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
+use axum::extract::DefaultBodyLimit;
+use axum::http::{header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE}, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::CorsLayer;
@@ -15,7 +17,10 @@ use crate::db::Database;
 use crate::network::ip::get_local_ip;
 use crate::network::qr::generate_party_qr_svg;
 use crate::network::rate_limit::RateLimiter;
-use crate::network::routes::{get_party_info, get_session_requests, search_catalog, serve_guest_mobile_html, submit_request, AppState};
+use crate::network::routes::{
+    get_party_info, get_session_requests, guest_auth, search_catalog, serve_guest_mobile_html,
+    submit_request, AppState,
+};
 
 pub struct LocalPartyServer {
     pub port: u16,
@@ -45,14 +50,26 @@ impl LocalPartyServer {
             rate_limiter: RateLimiter::new(4, 300), // Max 4 requests per 5 minutes per guest
         });
 
+        let cors = CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([CONTENT_TYPE, AUTHORIZATION, ACCEPT])
+            .allow_origin(tower_http::cors::Any);
+
         let app = Router::new()
             .route("/", get(serve_guest_mobile_html))
             .route("/request", get(serve_guest_mobile_html))
+            .route("/api/auth", post(guest_auth))
+            .route("/api/guest/auth", post(guest_auth))
             .route("/api/party/info", get(get_party_info))
+            .route("/api/info", get(get_party_info))
             .route("/api/guest/search", get(search_catalog))
+            .route("/api/search", get(search_catalog))
             .route("/api/guest/request", post(submit_request))
+            .route("/api/request", post(submit_request))
             .route("/api/guest/requests", get(get_session_requests))
-            .layer(CorsLayer::permissive())
+            .route("/api/requests", get(get_session_requests))
+            .layer(DefaultBodyLimit::max(64 * 1024)) // 64 KB maximum payload limit
+            .layer(cors)
             .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));

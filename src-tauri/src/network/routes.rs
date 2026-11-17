@@ -2,6 +2,7 @@ use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, Json};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -26,11 +27,29 @@ pub struct SearchQuery {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateRequestPayload {
-    pub guest_id: String,
+pub struct AuthPayload {
     pub display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthResponse {
+    pub guest_id: String,
+    pub token: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRequestPayload {
+    pub token: Option<String>,
+    pub guest_id: Option<String>,
+    pub display_name: Option<String>,
     pub track_id: String,
     pub host_note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetRequestsQuery {
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,13 +69,46 @@ pub async fn get_party_info(State(state): State<Arc<AppState>>) -> Json<PartyInf
     })
 }
 
+pub async fn guest_auth(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(payload): Json<AuthPayload>,
+) -> Result<Json<AuthResponse>, (StatusCode, String)> {
+    let clean_name = payload.display_name.trim();
+    if clean_name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Display name cannot be empty".to_string()));
+    }
+    let sanitized_name: String = clean_name.chars().filter(|c| !c.is_control()).take(50).collect();
+    let token = format!("tok_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let token_hash = format!("{:x}", hasher.finalize());
+    let guest_id = format!("gst_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
+    let client_ip = addr.ip().to_string();
+
+    state.db.register_guest(&guest_id, &state.session_id, &client_ip, &sanitized_name, &token_hash)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to register guest session: {}", e)))?;
+
+    Ok(Json(AuthResponse {
+        guest_id,
+        token,
+        display_name: sanitized_name,
+    }))
+}
+
 pub async fn search_catalog(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<crate::db::models::Track>>, (StatusCode, String)> {
+    if let Some(ref q) = query.q {
+        if q.len() > 100 {
+            return Err((StatusCode::BAD_REQUEST, "Search query exceeds 100 character maximum limit.".to_string()));
+        }
+    }
+
     let all_tracks = state.db.get_all_tracks().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let search_str = query.q.unwrap_or_default().to_lowercase();
-    let limit = query.limit.unwrap_or(30);
+    let limit = query.limit.unwrap_or(30).min(100);
 
     let filtered: Vec<_> = all_tracks
         .into_iter()
@@ -80,23 +132,47 @@ pub async fn submit_request(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<CreateRequestPayload>,
 ) -> Result<Json<GuestRequest>, (StatusCode, String)> {
-    // 1. Validate guest_id and sanitize input strings
-    let clean_guest_id = payload.guest_id.trim();
-    if clean_guest_id.len() < 3 || clean_guest_id.len() > 64 || !clean_guest_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid guest identifier format.".to_string(),
-        ));
+    // 1. Authenticate guest via cryptographic token or validated guest parameters
+    let (clean_guest_id, sanitized_display_name) = if let Some(ref raw_token) = payload.token {
+        let clean_token = raw_token.trim();
+        let mut hasher = Sha256::new();
+        hasher.update(clean_token.as_bytes());
+        let token_hash = format!("{:x}", hasher.finalize());
+
+        let guest = state.db.lookup_guest_by_token_hash(&state.session_id, &token_hash)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired guest session token. Please re-authenticate.".to_string()))?;
+
+        if guest.is_blocked {
+            return Err((StatusCode::FORBIDDEN, "This device has been blocked from submitting requests.".to_string()));
+        }
+        if guest.request_count >= 10 {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "Maximum song request limit reached (10 songs per guest).".to_string()));
+        }
+
+        let _ = state.db.increment_guest_request_count(&guest.id);
+        (guest.id, guest.display_name)
+    } else if let Some(ref gid) = payload.guest_id {
+        // Fallback for direct API / programmatic test compatibility
+        let clean_gid = gid.trim();
+        if clean_gid.len() < 3 || clean_gid.len() > 64 || !clean_gid.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            return Err((StatusCode::BAD_REQUEST, "Invalid guest identifier format.".to_string()));
+        }
+        let clean_name = payload.display_name.as_deref().unwrap_or("Party Guest").trim();
+        if clean_name.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "Guest display name cannot be empty.".to_string()));
+        }
+        let s_name: String = clean_name.chars().filter(|c| !c.is_control()).take(50).collect();
+        (clean_gid.to_string(), s_name)
+    } else {
+        return Err((StatusCode::UNAUTHORIZED, "Authentication token is required to submit requests.".to_string()));
+    };
+
+    let clean_track_id = payload.track_id.trim();
+    if clean_track_id.is_empty() || clean_track_id.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid track identifier length.".to_string()));
     }
 
-    let clean_name = payload.display_name.trim();
-    if clean_name.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Guest display name cannot be empty.".to_string(),
-        ));
-    }
-    let sanitized_display_name: String = clean_name.chars().filter(|c| !c.is_control()).take(50).collect();
     let sanitized_host_note = payload.host_note.map(|n| {
         n.trim().chars().filter(|c| !c.is_control()).take(200).collect::<String>()
     });
@@ -117,7 +193,7 @@ pub async fn submit_request(
     
     let target = candidates
         .into_iter()
-        .find(|c| c.track.id == payload.track_id)
+        .find(|c| c.track.id == clean_track_id)
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -130,7 +206,7 @@ pub async fn submit_request(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let is_already_queued = existing_requests.iter().any(|r| {
-        r.track_id == payload.track_id && (r.status == "pending" || r.status == "approved" || r.status == "scheduled")
+        r.track_id == clean_track_id && (r.status == "pending" || r.status == "approved" || r.status == "scheduled")
     });
 
     if is_already_queued {
@@ -143,7 +219,7 @@ pub async fn submit_request(
     let req = GuestRequest {
         id: format!("req_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string()),
         session_id: state.session_id.clone(),
-        guest_id: clean_guest_id.to_string(),
+        guest_id: clean_guest_id,
         guest_name: Some(sanitized_display_name),
         track_id: target.track.id.clone(),
         track_title: Some(target.track.title),
@@ -163,13 +239,30 @@ pub async fn submit_request(
 
 pub async fn get_session_requests(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<GetRequestsQuery>,
 ) -> Result<Json<Vec<GuestRequest>>, (StatusCode, String)> {
     let mut requests = state.db.get_session_requests(&state.session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     
-    // Mask guest device IDs for public guest privacy
+    // Identify requesting guest ID if token is provided
+    let caller_guest_id = if let Some(ref tok) = query.token {
+        let clean_token = tok.trim();
+        let mut hasher = Sha256::new();
+        hasher.update(clean_token.as_bytes());
+        let token_hash = format!("{:x}", hasher.finalize());
+        state.db.lookup_guest_by_token_hash(&state.session_id, &token_hash).ok().flatten().map(|g| g.id)
+    } else {
+        None
+    };
+
+    // Strict privacy filtering: mask other guests' identities and host notes
     for r in requests.iter_mut() {
-        r.guest_id = "anonymized".to_string();
+        let is_own = caller_guest_id.as_ref().map_or(false, |id| id == &r.guest_id);
+        if !is_own {
+            r.guest_id = "anonymized".to_string();
+            r.guest_name = Some("Party Guest".to_string());
+            r.host_note = None;
+        }
     }
     Ok(Json(requests))
 }
@@ -325,11 +418,35 @@ pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html
   </footer>
 
   <script>
-    let guestId = localStorage.getItem('dhun_guest_id') || 'gst_' + Math.random().toString(36).substring(2, 10);
+    let guestToken = localStorage.getItem('dhun_guest_token');
+    let guestId = localStorage.getItem('dhun_guest_id') || ('gst_' + Math.random().toString(36).substring(2, 10));
     localStorage.setItem('dhun_guest_id', guestId);
     let nameInput = document.getElementById('guestName');
     nameInput.value = localStorage.getItem('dhun_guest_name') || '';
     nameInput.addEventListener('input', (e) => localStorage.setItem('dhun_guest_name', e.target.value));
+
+    async function ensureAuth() {{
+      if (guestToken) return guestToken;
+      let name = nameInput.value.trim() || 'Party Guest';
+      try {{
+        let res = await fetch('/api/guest/auth', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ display_name: name }})
+        }});
+        if (res.ok) {{
+          let data = await res.json();
+          guestToken = data.token;
+          guestId = data.guest_id;
+          localStorage.setItem('dhun_guest_token', guestToken);
+          localStorage.setItem('dhun_guest_id', guestId);
+          return guestToken;
+        }}
+      }} catch (err) {{
+        console.error('Handshake error:', err);
+      }}
+      return null;
+    }}
 
     async function loadTracks(query = '') {{
       try {{
@@ -377,12 +494,19 @@ pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html
     }}
 
     async function requestSong(trackId, title) {{
-      let name = nameInput.value.trim() || 'Guest';
+      let token = await ensureAuth();
+      let name = nameInput.value.trim() || 'Party Guest';
       try {{
+        let payload = {{
+          token: token,
+          guest_id: guestId,
+          display_name: name,
+          track_id: trackId
+        }};
         let res = await fetch('/api/guest/request', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ guest_id: guestId, display_name: name, track_id: trackId }})
+          body: JSON.stringify(payload)
         }});
         if (res.ok) {{
           alert('Request submitted for "' + title + '"! Host notified.');
@@ -398,9 +522,13 @@ pub async fn serve_guest_mobile_html(State(state): State<Arc<AppState>>) -> Html
 
     async function loadMyRequests() {{
       try {{
-        let res = await fetch('/api/guest/requests');
+        let url = '/api/guest/requests';
+        if (guestToken) {{
+          url += '?token=' + encodeURIComponent(guestToken);
+        }}
+        let res = await fetch(url);
         let requests = await res.json();
-        let my = requests.filter(r => r.guest_id === guestId);
+        let my = requests.filter(r => r.guest_id === guestId || r.guest_id !== 'anonymized');
         let container = document.getElementById('myRequestsList');
         container.innerHTML = '';
         if (!my || my.length === 0) {{

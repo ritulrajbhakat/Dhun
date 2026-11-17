@@ -25,6 +25,16 @@ jobs:
       - name: Run Backend Engine Tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --tests
 
+      - name: Build Native Windows Release Binary
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Upload Windows Native Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhun-backend-windows-x86_64
+          path: target/release/dhun-backend.exe
+          if-no-files-found: error
+
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:

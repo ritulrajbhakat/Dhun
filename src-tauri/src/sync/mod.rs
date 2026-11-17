@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -32,18 +33,63 @@ pub struct PlaybackSyncEvent {
 #[derive(Clone)]
 pub struct MetadataSyncManager {
     remote_endpoint: Option<String>,
+    api_key: Option<String>,
     client: reqwest::Client,
 }
 
 impl MetadataSyncManager {
-    pub fn new(remote_endpoint: Option<String>) -> Self {
+    pub fn new(remote_endpoint: Option<String>, api_key: Option<String>) -> Self {
         Self {
             remote_endpoint,
+            api_key,
             client: reqwest::Client::builder()
+                .no_proxy()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
         }
+    }
+
+    /// Creates sync manager loading any persisted remote sync endpoint and API key from environment or SQLite
+    pub fn new_from_db(db: &Database) -> Self {
+        let endpoint = std::env::var("DHUN_SYNC_ENDPOINT")
+            .ok()
+            .or_else(|| db.get_app_setting("sync_remote_endpoint").unwrap_or(None));
+        let api_key = std::env::var("DHUN_SYNC_API_KEY")
+            .ok()
+            .or_else(|| db.get_app_setting("sync_api_key").unwrap_or(None));
+        Self::new(endpoint, api_key)
+    }
+
+    pub fn remote_endpoint(&self) -> Option<&str> {
+        self.remote_endpoint.as_deref()
+    }
+
+    /// Recovers any outbox records left in 'in_flight' status from a previous crash/shutdown
+    pub fn recover_in_flight_items(&self, db: &Database) -> Result<usize> {
+        let count = db.recover_in_flight_sync_items()?;
+        if count > 0 {
+            info!("Recovered {} in-flight sync outbox records back to pending status", count);
+        }
+        Ok(count)
+    }
+
+    /// Starts an asynchronous background task that periodically flushes pending outbox records
+    pub fn start_background_worker(
+        self: Arc<Self>,
+        db: Database,
+        interval_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            info!("Metadata sync background worker started (interval: {}s)", interval_secs);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                interval.tick().await;
+                if let Err(e) = self.process_pending_outbox(50, &db).await {
+                    warn!("Background sync worker error: {}", e);
+                }
+            }
+        })
     }
 
     /// Enqueues a track metadata correction for online sync
@@ -103,6 +149,11 @@ impl MetadataSyncManager {
 
     /// Processes pending sync items from the outbox with retry logic & conflict handling
     pub async fn process_pending_outbox(&self, max_batch: usize, db: &Database) -> Result<usize> {
+        // If no remote endpoint is configured, keep all items queued locally in pending status
+        let Some(_) = &self.remote_endpoint else {
+            return Ok(0);
+        };
+
         let items = db.get_pending_sync_items(max_batch)?;
         if items.is_empty() {
             return Ok(0);
@@ -141,22 +192,36 @@ impl MetadataSyncManager {
         Ok(synced_count)
     }
 
-    /// Dispatches a single sync item to remote endpoint or simulated receiver
+    /// Dispatches a single sync item to authenticated remote service with idempotency & request signing
     async fn dispatch_sync_item(&self, item: &SyncOutboxItem) -> Result<()> {
-        if let Some(endpoint) = &self.remote_endpoint {
-            let url = format!("{}/api/v1/sync/{}", endpoint.trim_end_matches('/'), item.entity_type);
-            let resp = self.client.post(&url)
-                .header("Content-Type", "application/json")
-                .body(item.payload_json.clone())
-                .send()
-                .await?;
+        let Some(endpoint) = &self.remote_endpoint else {
+            return Err(anyhow!("No remote sync service configured; item remains in local pending queue."));
+        };
 
-            if !resp.status().is_success() {
-                return Err(anyhow!("Remote returned status: {}", resp.status()));
-            }
-        } else {
-            // Local-first standalone mode: simulated successful sync ack
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let url = format!("{}/api/v1/sync/{}", endpoint.trim_end_matches('/'), item.entity_type);
+        let mut req = self.client.post(&url)
+            .header("Content-Type", "application/json")
+            .header("X-Dhun-Idempotency-Key", &item.id)
+            .header("X-Dhun-Entity-Type", &item.entity_type);
+
+        if let Some(ref key) = self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+
+            let mut hasher = Sha256::new();
+            hasher.update(key.as_bytes());
+            hasher.update(b":");
+            hasher.update(item.payload_json.as_bytes());
+            let sig = format!("{:x}", hasher.finalize());
+            req = req.header("X-Dhun-Signature", format!("sha256={}", sig));
+        }
+
+        let resp = req
+            .body(item.payload_json.clone())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!("Remote returned status: {}", resp.status()));
         }
 
         Ok(())

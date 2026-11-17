@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
+use reqwest::redirect::Policy;
+use reqwest::Url;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -15,6 +18,177 @@ use crate::db::models::DownloadTask;
 use crate::library::ingest::{ingest_audio_asset, IngestResult};
 
 pub const DEFAULT_MAX_AUDIO_DOWNLOAD_BYTES: i64 = 500 * 1024 * 1024; // 500 MB max audio file size
+
+/// Validates that an IP address is a safe, publicly routable address (anti-SSRF defense)
+pub fn is_restricted_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || ipv4.is_broadcast()
+                || ipv4.is_unspecified()
+                // Carrier-grade NAT (100.64.0.0/10)
+                || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                // Unique local address (fc00::/7)
+                || ((ipv6.segments()[0] & 0xfe00) == 0xfc00)
+                // Link-local unicast (fe80::/10)
+                || ((ipv6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// Strictly validates URL scheme (HTTPS only) and verifies that host does not resolve
+/// to loopback, private, or restricted IP addresses (SSRF mitigation)
+pub fn validate_safe_public_url(url_str: &str) -> Result<Url> {
+    let parsed = Url::parse(url_str).map_err(|e| anyhow!("Malformed URL: {}", e))?;
+
+    // 1. Strictly enforce HTTPS protocol
+    if parsed.scheme() != "https" {
+        return Err(anyhow!(
+            "Security violation: Only secure HTTPS endpoints are permitted for downloads (got '{}')",
+            parsed.scheme()
+        ));
+    }
+
+    // 2. Validate host name
+    let host = parsed.host_str().ok_or_else(|| anyhow!("URL is missing a valid host"))?;
+    let lower_host = host.to_lowercase();
+    if lower_host == "localhost" || lower_host.ends_with(".localhost") || lower_host.ends_with(".local") {
+        return Err(anyhow!("Security violation: Localhost and local domain targets are blocked: {}", host));
+    }
+
+    // 3. Resolve host and block private, loopback, link-local, carrier NAT IPs
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let socket_addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| anyhow!("Failed to resolve hostname '{}': {}", host, e))?;
+
+    for addr in socket_addrs {
+        let ip = addr.ip();
+        if is_restricted_ip(&ip) {
+            return Err(anyhow!(
+                "Security violation: Host '{}' resolves to private or restricted network address ({})",
+                host,
+                ip
+            ));
+        }
+    }
+
+    Ok(parsed)
+}
+
+/// Sanitizes custom filenames to prevent path traversal and Windows reserved filename issues
+pub fn sanitize_custom_filename(input: &str, default_fallback: &str) -> String {
+    // 1. Strip any directory separators to prevent traversal
+    let path = std::path::Path::new(input);
+    let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or(input);
+
+    // 2. Separate stem and extension
+    let (stem, ext) = match file_name.rfind('.') {
+        Some(idx) => (&file_name[..idx], Some(&file_name[idx..])),
+        None => (file_name, None),
+    };
+
+    // Filter characters in stem
+    let clean_stem: String = stem
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+        .collect();
+    let trimmed_stem = clean_stem.trim();
+
+    let clean_ext: String = match ext {
+        Some(e) => e.chars().filter(|c| c.is_alphanumeric() || *c == '.').collect(),
+        None => String::new(),
+    };
+
+    if trimmed_stem.is_empty() {
+        return default_fallback.to_string();
+    }
+
+    let upper_stem = trimmed_stem.to_uppercase();
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    let safe_stem = if reserved.contains(&upper_stem.as_str()) {
+        format!("safe_{}", trimmed_stem)
+    } else {
+        trimmed_stem.to_string()
+    };
+
+    format!("{}{}", safe_stem, clean_ext)
+}
+
+/// Probes a downloaded file using Symphonia to verify it contains a real, decodable audio stream
+/// and detects its true canonical format (mp3, wav, flac, m4a, ogg)
+pub fn probe_and_verify_audio_file(path: &Path) -> Result<String> {
+    let file = File::open(path)?;
+    let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+    let hint = symphonia::core::probe::Hint::new();
+    let format_opts = symphonia::core::formats::FormatOptions::default();
+    let meta_opts = symphonia::core::meta::MetadataOptions::default();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &format_opts, &meta_opts)
+        .map_err(|e| anyhow!("Invalid media format: unable to probe audio container ({})", e))?;
+
+    let track = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or_else(|| anyhow!("Invalid media format: file contains no decodable audio stream"))?;
+
+    let ext = match track.codec_params.codec {
+        symphonia::core::codecs::CODEC_TYPE_MP3 => "mp3",
+        symphonia::core::codecs::CODEC_TYPE_FLAC => "flac",
+        symphonia::core::codecs::CODEC_TYPE_AAC => "m4a",
+        symphonia::core::codecs::CODEC_TYPE_PCM_S16LE
+        | symphonia::core::codecs::CODEC_TYPE_PCM_S24LE
+        | symphonia::core::codecs::CODEC_TYPE_PCM_S32LE
+        | symphonia::core::codecs::CODEC_TYPE_PCM_F32LE => "wav",
+        symphonia::core::codecs::CODEC_TYPE_VORBIS => "ogg",
+        _ => "mp3",
+    };
+
+    Ok(ext.to_string())
+}
+
+/// RAII cleanup guard to guarantee temporary file removal and cancellation map cleanup on all exits
+struct DownloadCleanupGuard {
+    part_path: PathBuf,
+    dest_path: Option<PathBuf>,
+    task_id: String,
+    cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    armed: bool,
+}
+
+impl Drop for DownloadCleanupGuard {
+    fn drop(&mut self) {
+        // Guarantee removal of cancellation handle
+        if let Ok(mut map) = self.cancellations.lock() {
+            map.remove(&self.task_id);
+        }
+        // If armed (i.e. task failed or cancelled), remove partial / destination files
+        if self.armed {
+            if self.part_path.exists() {
+                let _ = fs::remove_file(&self.part_path);
+            }
+            if let Some(dest) = &self.dest_path {
+                if dest.exists() {
+                    let _ = fs::remove_file(dest);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AudioDownloader {
@@ -28,8 +202,32 @@ impl AudioDownloader {
     pub fn new<P: Into<PathBuf>>(cache_dir: P) -> Self {
         let dir = cache_dir.into();
         let _ = fs::create_dir_all(&dir);
+
+        // Configure client with custom redirect policy that validates every redirect target
+        let redirect_policy = Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.stop();
+            }
+            let target_url = attempt.url();
+            if target_url.scheme() != "https" {
+                return attempt.error("Security violation: Redirect to insecure non-HTTPS scheme blocked");
+            }
+            if let Some(host) = target_url.host_str() {
+                let port = target_url.port_or_known_default().unwrap_or(443);
+                if let Ok(addrs) = (host, port).to_socket_addrs() {
+                    for addr in addrs {
+                        if is_restricted_ip(&addr.ip()) {
+                            return attempt.error("Security violation: Redirect to private/restricted IP blocked");
+                        }
+                    }
+                }
+            }
+            attempt.follow()
+        });
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .redirect(redirect_policy)
             .build()
             .unwrap_or_default();
 
@@ -65,11 +263,11 @@ impl AudioDownloader {
         Ok(())
     }
 
-    /// Streams an audio file from an authorized direct URL with file size limits,
-    /// format validation, SHA-256 duplicate detection, and atomic ingestion
+    /// Streams an audio file from an authorized direct URL with security validation,
+    /// SSRF prevention, format validation, SHA-256 duplicate detection, and atomic ingestion
     pub async fn download_audio(
         &self,
-        url: &str,
+        url_str: &str,
         expected_sha256: Option<&str>,
         custom_filename: Option<&str>,
         db: &Database,
@@ -77,26 +275,42 @@ impl AudioDownloader {
         let task_id = format!("dl_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
         let now = chrono::Utc::now().timestamp_millis();
 
-        // Determine destination file format and path
-        let ext = if url.ends_with(".wav") { "wav" }
-            else if url.ends_with(".flac") { "flac" }
-            else if url.ends_with(".m4a") { "m4a" }
-            else if url.ends_with(".aac") { "aac" }
-            else if url.ends_with(".ogg") { "ogg" }
-            else { "mp3" };
-
-        let filename = match custom_filename {
-            Some(name) => format!("{}.{}", name.trim_end_matches(&['.', ' '][..]), ext),
-            None => format!("{}.{}", task_id, ext),
+        // 1. Validate URL security (strict HTTPS, anti-SSRF host/IP resolution)
+        let validated_url = match validate_safe_public_url(url_str) {
+            Ok(u) => u,
+            Err(e) => {
+                let err_msg = format!("URL security validation failed: {}", e);
+                // Record failed task in database for audit trail
+                let failed_task = DownloadTask {
+                    id: task_id.clone(),
+                    url: url_str.to_string(),
+                    destination_path: String::new(),
+                    expected_sha256: expected_sha256.map(|s| s.to_string()),
+                    status: "failed".to_string(),
+                    bytes_downloaded: 0,
+                    total_bytes: None,
+                    error_message: Some(err_msg.clone()),
+                    created_at: now,
+                    updated_at: now,
+                };
+                let _ = db.create_download_task(&failed_task);
+                return Err(anyhow!(err_msg));
+            }
         };
 
-        let dest_path = self.cache_dir.join(&filename);
-        let part_path = self.cache_dir.join(format!("{}.part", filename));
+        // 2. Compute safe filenames
+        let safe_base_name = match custom_filename {
+            Some(name) => sanitize_custom_filename(name, &task_id),
+            None => task_id.clone(),
+        };
+
+        let part_filename = format!("{}.part", task_id);
+        let part_path = self.cache_dir.join(&part_filename);
 
         let task = DownloadTask {
             id: task_id.clone(),
-            url: url.to_string(),
-            destination_path: dest_path.to_string_lossy().to_string(),
+            url: validated_url.to_string(),
+            destination_path: part_path.to_string_lossy().to_string(),
             expected_sha256: expected_sha256.map(|s| s.to_string()),
             status: "pending".to_string(),
             bytes_downloaded: 0,
@@ -115,10 +329,19 @@ impl AudioDownloader {
             map.insert(task_id.clone(), cancel_flag.clone());
         }
 
-        info!("Starting download for task '{}' from URL '{}'", task_id, url);
+        // Initialize RAII cleanup guard
+        let mut cleanup_guard = DownloadCleanupGuard {
+            part_path: part_path.clone(),
+            dest_path: None,
+            task_id: task_id.clone(),
+            cancellations: self.cancellations.clone(),
+            armed: true,
+        };
 
-        // Initiate HTTP request
-        let resp = match self.client.get(url).send().await {
+        info!("Starting download for task '{}' from URL '{}'", task_id, validated_url);
+
+        // 3. Initiate HTTP GET request
+        let resp = match self.client.get(validated_url.clone()).send().await {
             Ok(r) => r,
             Err(e) => {
                 let err_msg = format!("HTTP connection failed: {}", e);
@@ -133,20 +356,27 @@ impl AudioDownloader {
             return Err(anyhow!(err_msg));
         }
 
-        // Validate audio content-type if provided
+        // 4. Validate Content-Type header if present
         if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
             let lower_ct = ct.to_lowercase();
-            if lower_ct.starts_with("text/html") || lower_ct.starts_with("application/json") || lower_ct.starts_with("text/plain") {
+            if lower_ct.starts_with("text/html")
+                || lower_ct.starts_with("application/json")
+                || lower_ct.starts_with("text/plain")
+                || lower_ct.starts_with("application/xml")
+            {
                 let err_msg = format!("Invalid audio format: server returned non-audio Content-Type '{}'", ct);
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
             }
         }
 
-        // Enforce file size limit via Content-Length header
+        // 5. Enforce file size limit via Content-Length header
         if let Some(content_length) = resp.content_length() {
             if content_length as i64 > self.max_file_size_bytes {
-                let err_msg = format!("Remote file size ({} bytes) exceeds maximum allowed limit of {} bytes", content_length, self.max_file_size_bytes);
+                let err_msg = format!(
+                    "Remote file size ({} bytes) exceeds maximum allowable limit of {} bytes",
+                    content_length, self.max_file_size_bytes
+                );
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
             }
@@ -156,7 +386,7 @@ impl AudioDownloader {
         db.update_download_status(&task_id, "downloading", None)?;
         db.update_download_progress(&task_id, 0, total_bytes)?;
 
-        // Stream body to temporary .part file while calculating SHA-256
+        // 6. Stream chunks to temporary .part file while computing running SHA-256
         let mut file = match File::create(&part_path) {
             Ok(f) => f,
             Err(e) => {
@@ -175,7 +405,6 @@ impl AudioDownloader {
             // Check cancellation flag
             if cancel_flag.load(Ordering::SeqCst) {
                 drop(file);
-                let _ = fs::remove_file(&part_path);
                 db.update_download_status(&task_id, "cancelled", Some("Download cancelled by user"))?;
                 return Err(anyhow!("Download cancelled"));
             }
@@ -184,7 +413,6 @@ impl AudioDownloader {
                 Ok(c) => c,
                 Err(e) => {
                     drop(file);
-                    let _ = fs::remove_file(&part_path);
                     let err_msg = format!("Network streaming error: {}", e);
                     db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                     return Err(anyhow!(err_msg));
@@ -194,15 +422,16 @@ impl AudioDownloader {
             // Enforce max size limit during streaming chunks
             if downloaded + chunk.len() as i64 > self.max_file_size_bytes {
                 drop(file);
-                let _ = fs::remove_file(&part_path);
-                let err_msg = format!("Download exceeded maximum allowable file size ({} bytes)", self.max_file_size_bytes);
+                let err_msg = format!(
+                    "Download exceeded maximum allowable file size ({} bytes)",
+                    self.max_file_size_bytes
+                );
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
             }
 
             if let Err(e) = file.write_all(&chunk) {
                 drop(file);
-                let _ = fs::remove_file(&part_path);
                 let err_msg = format!("Disk write error: {}", e);
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
@@ -221,57 +450,68 @@ impl AudioDownloader {
         let _ = file.flush();
         drop(file);
 
-        // Finalize SHA-256 calculation
+        // 7. Finalize SHA-256 calculation
         let calculated_hash = format!("{:x}", hasher.finalize());
         db.update_download_status(&task_id, "verifying", None)?;
 
-        // Verify cryptographic hash if expected hash was provided
+        // Verify cryptographic hash against expected hash if provided
         if let Some(expected) = expected_sha256 {
             if !calculated_hash.eq_ignore_ascii_case(expected.trim()) {
-                let _ = fs::remove_file(&part_path);
                 let err_msg = format!("Hash mismatch: expected '{}', got '{}'", expected, calculated_hash);
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
             }
         }
 
-        // Atomically rename .part file to final destination path
+        // 8. Probe and verify that the downloaded payload is a genuine, decodable audio file
+        let detected_ext = match probe_and_verify_audio_file(&part_path) {
+            Ok(ext) => ext,
+            Err(e) => {
+                let err_msg = format!("Media validation failed: {}", e);
+                db.update_download_status(&task_id, "failed", Some(&err_msg))?;
+                return Err(anyhow!(err_msg));
+            }
+        };
+
+        // Construct final destination path using the verified codec extension
+        let final_filename = format!("{}.{}", safe_base_name, detected_ext);
+        let dest_path = self.cache_dir.join(&final_filename);
+        cleanup_guard.dest_path = Some(dest_path.clone());
+
+        // Atomically rename .part file to final cache destination
         if let Err(e) = fs::rename(&part_path, &dest_path) {
-            let _ = fs::remove_file(&part_path);
-            let err_msg = format!("Failed to move finished download: {}", e);
+            let err_msg = format!("Failed to move finished download to destination path: {}", e);
             db.update_download_status(&task_id, "failed", Some(&err_msg))?;
             return Err(anyhow!(err_msg));
         }
 
-        // Automatically ingest and analyze downloaded asset into DHUN library and managed cache
+        // 9. Automatically ingest and analyze into DHUN library and managed cache
         db.update_download_status(&task_id, "ingesting", None)?;
-        let ingest_res = match ingest_audio_asset(&dest_path, "url_download", Some(url), true, db) {
+        let ingest_res = match ingest_audio_asset(&dest_path, "url_download", Some(validated_url.as_str()), true, db) {
             Ok(res) => res,
             Err(e) => {
-                let _ = fs::remove_file(&dest_path);
                 let err_msg = format!("Ingestion/analysis failed: {}", e);
                 db.update_download_status(&task_id, "failed", Some(&err_msg))?;
                 return Err(anyhow!(err_msg));
             }
         };
 
-        // If this was detected as a duplicate asset, clean up the duplicate downloaded file from disk
+        // If duplicate detected, clean up redundant download from disk
         if ingest_res.is_duplicate {
             let _ = fs::remove_file(&dest_path);
             info!("Duplicate file removed from disk; reused existing asset '{}'", ingest_res.asset_id);
         }
 
+        // Disarm cleanup guard so successful files are kept
+        cleanup_guard.armed = false;
+
         db.update_download_status(&task_id, "completed", None)?;
         db.update_download_progress(&task_id, downloaded, Some(downloaded))?;
 
-        // Cleanup cancellation handle
-        {
-            let mut map = self.cancellations.lock().unwrap();
-            map.remove(&task_id);
-        }
-
-        info!("Successfully completed download task '{}' (Track: '{}', Hash: {}, Duplicate: {})",
-            task_id, ingest_res.title, calculated_hash, ingest_res.is_duplicate);
+        info!(
+            "Successfully completed download task '{}' (Track: '{}', Hash: {}, Duplicate: {})",
+            task_id, ingest_res.title, calculated_hash, ingest_res.is_duplicate
+        );
         Ok(ingest_res)
     }
 }

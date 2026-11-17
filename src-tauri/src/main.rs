@@ -54,8 +54,12 @@ async fn main() {
 
     let cache_dir = root_dir.join("cache");
     let cache = Arc::new(RollingCacheManager::new(&cache_dir, DEFAULT_MAX_CACHE_BYTES));
+    let _ = cache.reconcile_locks(&db);
+
     let downloader = Arc::new(AudioDownloader::new(&cache_dir));
-    let sync = Arc::new(MetadataSyncManager::new(None));
+    let sync = Arc::new(MetadataSyncManager::new_from_db(&db));
+    let _ = sync.recover_in_flight_items(&db);
+    sync.clone().start_background_worker(db.clone(), 30);
 
     let context = AppContext {
         db: db.clone(),

@@ -28,7 +28,7 @@ pub fn analyze_track_file<P: AsRef<Path>>(track_id: &str, file_path: P) -> Resul
     let (bpm, bpm_confidence) = BpmDetector::detect_bpm(&decoded.samples, decoded.sample_rate);
     let (key_name, camelot_key, key_confidence) = KeyDetector::detect_key(&decoded.samples, decoded.sample_rate);
     
-    let downbeat_offset_ms = 120; // Estimated primary downbeat offset in ms
+    let downbeat_offset_ms = BpmDetector::detect_downbeat_offset(&decoded.samples, decoded.sample_rate, bpm);
     let (phrase_markers, overall_energy, dance_suitability, mix_in_ms, mix_out_ms) =
         PhraseDetector::analyze_phrasing_and_energy(&decoded.samples, decoded.sample_rate, bpm, decoded.duration_ms);
 

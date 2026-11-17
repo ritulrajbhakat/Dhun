@@ -179,20 +179,30 @@ pub fn ingest_audio_asset(
         }
     };
 
-    // Duplicate detection: if an audio asset with this exact SHA-256 already exists, link and return without duplicating
+    // Duplicate detection: if an audio asset with this exact SHA-256 already exists, link and return canonical existing metadata
     if let Ok(Some(existing_asset)) = db.get_asset_by_sha256(&sha256_hash) {
         info!("Duplicate audio asset detected with SHA-256 {}. Linking to existing track '{}'", sha256_hash, existing_asset.track_id);
         if let Some(uri) = source_uri {
             let _ = db.insert_source_reference(&existing_asset.track_id, source_type, uri);
         }
+
+        let canonical_track = db.get_track_by_id(&existing_asset.track_id).ok().flatten();
+        let canonical_analysis = db.get_track_analysis_by_id(&existing_asset.track_id).ok().flatten();
+
+        let canon_title = canonical_track.as_ref().map(|t| t.title.clone()).unwrap_or(title);
+        let canon_artist = canonical_track.as_ref().map(|t| t.artist.clone()).unwrap_or(artist);
+        let canon_duration = canonical_track.as_ref().map(|t| t.duration_ms).unwrap_or((metadata.len() as f64 / 16000.0) as i64);
+        let canon_bpm = canonical_analysis.as_ref().map(|a| a.bpm).unwrap_or(128.0);
+        let canon_key = canonical_analysis.as_ref().map(|a| a.camelot_key.clone()).unwrap_or_else(|| "8B".to_string());
+
         return Ok(IngestResult {
             track_id: existing_asset.track_id,
             asset_id: existing_asset.id,
-            title: title.clone(),
-            artist: artist.clone(),
-            duration_ms: (metadata.len() as f64 / 16000.0) as i64,
-            bpm: 128.0,
-            key: "8B".to_string(),
+            title: canon_title,
+            artist: canon_artist,
+            duration_ms: canon_duration,
+            bpm: canon_bpm,
+            key: canon_key,
             sha256_hash,
             verification_status: existing_asset.verification_status,
             is_duplicate: true,
