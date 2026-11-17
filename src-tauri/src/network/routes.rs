@@ -75,16 +75,22 @@ pub async fn guest_auth(
     Json(payload): Json<AuthPayload>,
 ) -> Result<Json<AuthResponse>, (StatusCode, String)> {
     let clean_name = payload.display_name.trim();
-    if clean_name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Display name cannot be empty".to_string()));
+    if clean_name.is_empty() || clean_name.len() > 50 {
+        return Err((StatusCode::BAD_REQUEST, "Display name must be between 1 and 50 characters.".to_string()));
     }
+
+    let client_ip = addr.ip().to_string();
+    let auth_rate_key = format!("auth:{}", client_ip);
+    if !state.rate_limiter.check_and_record(&auth_rate_key) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Authentication rate limit reached. Please wait before creating a new session.".to_string()));
+    }
+
     let sanitized_name: String = clean_name.chars().filter(|c| !c.is_control()).take(50).collect();
     let token = format!("tok_{}", Uuid::new_v4().to_string().replace('-', ""));
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     let token_hash = format!("{:x}", hasher.finalize());
     let guest_id = format!("gst_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
-    let client_ip = addr.ip().to_string();
 
     state.db.register_guest(&guest_id, &state.session_id, &client_ip, &sanitized_name, &token_hash)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to register guest session: {}", e)))?;
@@ -132,41 +138,32 @@ pub async fn submit_request(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<CreateRequestPayload>,
 ) -> Result<Json<GuestRequest>, (StatusCode, String)> {
-    // 1. Authenticate guest via cryptographic token or validated guest parameters
-    let (clean_guest_id, sanitized_display_name) = if let Some(ref raw_token) = payload.token {
-        let clean_token = raw_token.trim();
-        let mut hasher = Sha256::new();
-        hasher.update(clean_token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
+    // 1. Mandatory guest authentication via cryptographic token (unauthenticated bypasses removed)
+    let raw_token = payload.token.as_deref().ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, "Authentication token is required to submit requests. Please authenticate via /api/auth first.".to_string())
+    })?;
+    let clean_token = raw_token.trim();
+    if clean_token.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "Authentication token cannot be empty.".to_string()));
+    }
 
-        let guest = state.db.lookup_guest_by_token_hash(&state.session_id, &token_hash)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired guest session token. Please re-authenticate.".to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(clean_token.as_bytes());
+    let token_hash = format!("{:x}", hasher.finalize());
 
-        if guest.is_blocked {
-            return Err((StatusCode::FORBIDDEN, "This device has been blocked from submitting requests.".to_string()));
-        }
-        if guest.request_count >= 10 {
-            return Err((StatusCode::TOO_MANY_REQUESTS, "Maximum song request limit reached (10 songs per guest).".to_string()));
-        }
+    let guest = state.db.lookup_guest_by_token_hash(&state.session_id, &token_hash)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired guest session token. Please re-authenticate.".to_string()))?;
 
-        let _ = state.db.increment_guest_request_count(&guest.id);
-        (guest.id, guest.display_name)
-    } else if let Some(ref gid) = payload.guest_id {
-        // Fallback for direct API / programmatic test compatibility
-        let clean_gid = gid.trim();
-        if clean_gid.len() < 3 || clean_gid.len() > 64 || !clean_gid.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-            return Err((StatusCode::BAD_REQUEST, "Invalid guest identifier format.".to_string()));
-        }
-        let clean_name = payload.display_name.as_deref().unwrap_or("Party Guest").trim();
-        if clean_name.is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "Guest display name cannot be empty.".to_string()));
-        }
-        let s_name: String = clean_name.chars().filter(|c| !c.is_control()).take(50).collect();
-        (clean_gid.to_string(), s_name)
-    } else {
-        return Err((StatusCode::UNAUTHORIZED, "Authentication token is required to submit requests.".to_string()));
-    };
+    if guest.is_blocked {
+        return Err((StatusCode::FORBIDDEN, "This device has been blocked from submitting requests.".to_string()));
+    }
+    if guest.request_count >= 10 {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "Maximum song request limit reached (10 songs per guest).".to_string()));
+    }
+
+    let clean_guest_id = guest.id.clone();
+    let sanitized_display_name = guest.display_name.clone();
 
     let clean_track_id = payload.track_id.trim();
     if clean_track_id.is_empty() || clean_track_id.len() > 100 {
@@ -219,7 +216,7 @@ pub async fn submit_request(
     let req = GuestRequest {
         id: format!("req_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string()),
         session_id: state.session_id.clone(),
-        guest_id: clean_guest_id,
+        guest_id: clean_guest_id.clone(),
         guest_name: Some(sanitized_display_name),
         track_id: target.track.id.clone(),
         track_title: Some(target.track.title),
@@ -234,6 +231,9 @@ pub async fn submit_request(
 
     state.db.insert_guest_request(&req).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // 5. Only increment guest request count AFTER validation and successful database insertion
+    let _ = state.db.increment_guest_request_count(&clean_guest_id);
+
     Ok(Json(req))
 }
 
@@ -241,23 +241,27 @@ pub async fn get_session_requests(
     State(state): State<Arc<AppState>>,
     Query(query): Query<GetRequestsQuery>,
 ) -> Result<Json<Vec<GuestRequest>>, (StatusCode, String)> {
+    let raw_token = query.token.as_deref().ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, "Guest session token required to view party request queue.".to_string())
+    })?;
+    let clean_token = raw_token.trim();
+    if clean_token.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "Session token cannot be empty.".to_string()));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(clean_token.as_bytes());
+    let token_hash = format!("{:x}", hasher.finalize());
+
+    let caller_guest = state.db.lookup_guest_by_token_hash(&state.session_id, &token_hash)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid or expired guest session token.".to_string()))?;
+
     let mut requests = state.db.get_session_requests(&state.session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    
-    // Identify requesting guest ID if token is provided
-    let caller_guest_id = if let Some(ref tok) = query.token {
-        let clean_token = tok.trim();
-        let mut hasher = Sha256::new();
-        hasher.update(clean_token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
-        state.db.lookup_guest_by_token_hash(&state.session_id, &token_hash).ok().flatten().map(|g| g.id)
-    } else {
-        None
-    };
 
     // Strict privacy filtering: mask other guests' identities and host notes
     for r in requests.iter_mut() {
-        let is_own = caller_guest_id.as_ref().map_or(false, |id| id == &r.guest_id);
+        let is_own = caller_guest.id == r.guest_id;
         if !is_own {
             r.guest_id = "anonymized".to_string();
             r.guest_name = Some("Party Guest".to_string());

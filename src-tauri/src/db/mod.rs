@@ -33,6 +33,10 @@ impl Database {
         })
     }
 
+    pub fn conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+
     // --- Diagnostic logging ---
     pub fn log_diagnostic(&self, session_id: Option<&str>, subsystem: &str, severity: &str, message: &str, context: Option<&str>) {
         if let Ok(conn) = self.conn.lock() {
@@ -142,6 +146,36 @@ impl Database {
         )?;
 
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_track_analysis(&self, analysis: &TrackAnalysis) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO track_analysis (
+                track_id, bpm, bpm_confidence, key_name, camelot_key, key_confidence,
+                time_signature_num, time_signature_den, downbeat_offset_ms, phrase_length_bars,
+                overall_energy, dance_suitability, recommended_mix_in_ms, recommended_mix_out_ms,
+                analysis_version, analyzed_at, manual_override
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            ON CONFLICT(track_id) DO UPDATE SET
+                bpm = excluded.bpm,
+                bpm_confidence = excluded.bpm_confidence,
+                key_name = excluded.key_name,
+                camelot_key = excluded.camelot_key,
+                key_confidence = excluded.key_confidence,
+                overall_energy = excluded.overall_energy,
+                analyzed_at = excluded.analyzed_at
+            WHERE manual_override = 0",
+            params![
+                analysis.track_id, analysis.bpm, analysis.bpm_confidence, analysis.key_name,
+                analysis.camelot_key, analysis.key_confidence, analysis.time_signature_num,
+                analysis.time_signature_den, analysis.downbeat_offset_ms, analysis.phrase_length_bars,
+                analysis.overall_energy, analysis.dance_suitability, analysis.recommended_mix_in_ms,
+                analysis.recommended_mix_out_ms, analysis.analysis_version, analysis.analyzed_at,
+                analysis.manual_override
+            ],
+        )?;
         Ok(())
     }
 

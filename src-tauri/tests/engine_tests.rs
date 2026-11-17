@@ -854,7 +854,7 @@ mod tests {
         let db = Database::new_in_memory().expect("Failed to init DB");
 
         // 1. Without endpoint configured: items must remain in 'pending' status (never falsely marked synced)
-        let offline_sync_mgr = MetadataSyncManager::new(None, None);
+        let offline_sync_mgr = MetadataSyncManager::new(None, None).expect("Init failed");
 
         let correction = TrackMetadataCorrection {
             track_id: "trk_01".to_string(),
@@ -901,6 +901,7 @@ mod tests {
                     assert!(headers.contains_key("x-dhun-idempotency-key"));
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer test_signing_key_12345");
                     assert!(headers.contains_key("x-dhun-signature"));
+                    assert!(headers.contains_key("x-dhun-timestamp"));
                     c.fetch_add(1, Ordering::SeqCst);
                     StatusCode::OK
                 }
@@ -911,6 +912,7 @@ mod tests {
                     assert!(headers.contains_key("x-dhun-idempotency-key"));
                     assert_eq!(headers.get("authorization").unwrap(), "Bearer test_signing_key_12345");
                     assert!(headers.contains_key("x-dhun-signature"));
+                    assert!(headers.contains_key("x-dhun-timestamp"));
                     c.fetch_add(1, Ordering::SeqCst);
                     StatusCode::OK
                 }
@@ -931,7 +933,7 @@ mod tests {
         if !loopback_permitted {
             // In a restricted sandbox with OS socket connect denied (WSAEACCES 10013),
             // verify outbox remains properly queued as pending with retry tracking
-            let live_sync_mgr = MetadataSyncManager::new(Some(endpoint), Some(test_secret.to_string()));
+            let live_sync_mgr = MetadataSyncManager::new(Some(endpoint), Some(test_secret.to_string())).expect("Init failed");
             let _ = live_sync_mgr.process_pending_outbox(10, &db).await;
             let overview = live_sync_mgr.get_sync_overview(&db).expect("Overview failed");
             assert!(overview.pending_count > 0 || overview.failed_count > 0);
@@ -940,7 +942,7 @@ mod tests {
         }
 
         // 3. Dispatch to the live HTTP server with authentication and request signing
-        let live_sync_mgr = MetadataSyncManager::new(Some(endpoint), Some(test_secret.to_string()));
+        let live_sync_mgr = MetadataSyncManager::new(Some(endpoint), Some(test_secret.to_string())).expect("Init failed");
         let live_synced = live_sync_mgr.process_pending_outbox(10, &db).await.expect("Outbox processing failed");
         assert_eq!(live_synced, 2, "Both pending items must be delivered and acknowledged by the test server");
 
@@ -1264,6 +1266,11 @@ mod tests {
 
         // Carrier-grade NAT rejections (RFC 6598)
         assert!(validate_safe_public_url("https://100.64.0.1/song.mp3").is_err());
+
+        // IPv4-mapped IPv6 rejections
+        assert!(validate_safe_public_url("https://[::ffff:127.0.0.1]/song.mp3").is_err());
+        assert!(validate_safe_public_url("https://[::ffff:192.168.1.1]/song.mp3").is_err());
+        assert!(validate_safe_public_url("https://[::ffff:10.0.0.1]/song.mp3").is_err());
     }
 
     #[test]
@@ -1403,7 +1410,21 @@ mod tests {
         assert!(!auth_data.token.is_empty());
         assert_eq!(auth_data.display_name, "Rohan Verma");
 
-        // 2. Reject request with invalid / forged token
+        // 2. Reject request with missing token or unauthenticated guest_id bypass attempt
+        let unauth_req = submit_request(
+            State(state.clone()),
+            ConnectInfo(dummy_addr),
+            axum::Json(CreateRequestPayload {
+                token: None,
+                guest_id: Some("gst_bypassed_attacker".to_string()),
+                display_name: Some("Hacker".to_string()),
+                track_id: "trk_wedding_01".to_string(),
+                host_note: Some("Should be rejected".to_string()),
+            }),
+        ).await;
+        assert_eq!(unauth_req.unwrap_err().0, StatusCode::UNAUTHORIZED, "Unauthenticated requests without token must be strictly rejected");
+
+        // Reject request with forged token
         let fake_req = submit_request(
             State(state.clone()),
             ConnectInfo(dummy_addr),
@@ -1445,16 +1466,31 @@ mod tests {
         assert_eq!(own_requests[0].guest_name, Some("Rohan Verma".to_string()));
         assert_eq!(own_requests[0].host_note, Some("Play this next please!".to_string()));
 
-        // 5. Privacy masking: Public caller without token sees masked "Party Guest" and None host_note
-        let public_requests = get_session_requests(
+        // 5. Unauthenticated callers cannot view queue
+        let unauth_queue = get_session_requests(
             State(state.clone()),
             Query(GetRequestsQuery { token: None }),
+        ).await;
+        assert_eq!(unauth_queue.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // 6. Another authenticated guest (Guest B) sees masked "Party Guest" and None host_note
+        let guest_b_auth = guest_auth(
+            State(state.clone()),
+            ConnectInfo("192.168.1.51:54322".parse().unwrap()),
+            axum::Json(AuthPayload {
+                display_name: "Ayesha Khan".to_string(),
+            }),
+        ).await.expect("Guest B auth failed").0;
+
+        let other_requests = get_session_requests(
+            State(state.clone()),
+            Query(GetRequestsQuery { token: Some(guest_b_auth.token) }),
         ).await.expect("Query failed").0;
 
-        assert_eq!(public_requests.len(), 1);
-        assert_eq!(public_requests[0].guest_id, "anonymized");
-        assert_eq!(public_requests[0].guest_name, Some("Party Guest".to_string()));
-        assert_eq!(public_requests[0].host_note, None);
+        assert_eq!(other_requests.len(), 1);
+        assert_eq!(other_requests[0].guest_id, "anonymized");
+        assert_eq!(other_requests[0].guest_name, Some("Party Guest".to_string()));
+        assert_eq!(other_requests[0].host_note, None);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -1558,7 +1594,7 @@ mod tests {
         use dhun_lib::sync::{MetadataSyncManager, TrackMetadataCorrection};
 
         let db = Database::new_in_memory().expect("Failed to init DB");
-        let sync_mgr = MetadataSyncManager::new(None, None);
+        let sync_mgr = MetadataSyncManager::new(None, None).expect("Init failed");
 
         let correction = TrackMetadataCorrection {
             track_id: "trk_rec_01".to_string(),
@@ -1723,6 +1759,149 @@ mod tests {
         // Must reject damaged audio with an error rather than accepting partial frames
         let res = decode_audio_file(&truncated_file);
         assert!(res.is_err(), "Decoder must strictly reject damaged/truncated audio streams");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_hmac_sha256_canonical_signing_and_tampering() {
+        use dhun_lib::sync::{sign_request, verify_signature};
+
+        let secret = "party_secret_key_98765";
+        let method = "POST";
+        let path = "/api/v1/sync/track_metadata";
+        let now = chrono::Utc::now().timestamp();
+        let payload = r#"{"track_id":"trk_test_01","bpm":128.0,"genre":"Bollywood"}"#;
+
+        // 1. Signature generation
+        let sig = sign_request(secret, method, path, now, payload);
+        assert_eq!(sig.len(), 64, "HMAC-SHA256 hex signature must be exactly 64 characters");
+
+        // 2. Positive verification
+        assert!(
+            verify_signature(secret, method, path, now, payload, &sig),
+            "Valid signature and un-tampered payload must verify successfully"
+        );
+        assert!(
+            verify_signature(secret, method, path, now, payload, &format!("sha256={}", sig)),
+            "Signature with sha256= prefix must verify"
+        );
+
+        // 3. Tampering: Altered payload must fail
+        let tampered_payload = r#"{"track_id":"trk_test_01","bpm":140.0,"genre":"Bollywood"}"#;
+        assert!(
+            !verify_signature(secret, method, path, now, tampered_payload, &sig),
+            "Tampered payload must fail signature verification"
+        );
+
+        // 4. Tampering: Altered HTTP path must fail
+        assert!(
+            !verify_signature(secret, method, "/api/v1/sync/other", now, payload, &sig),
+            "Tampered request path must fail signature verification"
+        );
+
+        // 5. Tampering: Wrong secret must fail
+        assert!(
+            !verify_signature("wrong_secret", method, path, now, payload, &sig),
+            "Incorrect API secret must fail signature verification"
+        );
+
+        // 6. Replay prevention: Expired timestamp (>300 seconds) must fail
+        let expired_timestamp = now - 301;
+        assert!(
+            !verify_signature(secret, method, path, expired_timestamp, payload, &sig),
+            "Expired timestamp beyond 300-second window must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_sync_endpoint_https_and_mandatory_key_enforcement() {
+        use dhun_lib::sync::MetadataSyncManager;
+
+        // Insecure HTTP remote endpoint rejected
+        let insecure = MetadataSyncManager::new(
+            Some("http://api.dhun-party.com/sync".to_string()),
+            Some("valid_key".to_string()),
+        );
+        assert!(insecure.is_err(), "Remote sync endpoint must enforce HTTPS");
+
+        // Missing API key rejected
+        let missing_key = MetadataSyncManager::new(
+            Some("https://api.dhun-party.com/sync".to_string()),
+            None,
+        );
+        assert!(missing_key.is_err(), "Configured remote sync endpoint requires mandatory API key");
+
+        // Blank API key rejected
+        let blank_key = MetadataSyncManager::new(
+            Some("https://api.dhun-party.com/sync".to_string()),
+            Some("   ".to_string()),
+        );
+        assert!(blank_key.is_err(), "Blank API key must be rejected");
+
+        // Valid HTTPS remote endpoint with non-empty key accepted
+        let valid = MetadataSyncManager::new(
+            Some("https://api.dhun-party.com/sync".to_string()),
+            Some("super_secret_key_123".to_string()),
+        );
+        assert!(valid.is_ok(), "Valid HTTPS endpoint and API key must succeed");
+
+        // Offline / local unconfigured mode accepted
+        let offline = MetadataSyncManager::new(None, None);
+        assert!(offline.is_ok(), "Offline unconfigured mode must succeed");
+    }
+
+    #[test]
+    fn test_duplicate_metadata_database_integrity() {
+        use dhun_lib::library::ingest::ingest_audio_asset;
+        use dhun_lib::db::models::AudioAsset;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let temp_dir = std::env::temp_dir().join(format!("dhun_dup_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let audio_path = temp_dir.join("sample.mp3");
+        std::fs::write(&audio_path, b"DUMMY_MP3_CONTENT_FOR_HASH").unwrap();
+
+        // Simulate corrupt DB state: audio_asset exists referencing non-existent track
+        let orphan_asset = AudioAsset {
+            id: "ast_orphan".to_string(),
+            track_id: "trk_nonexistent".to_string(),
+            file_path: audio_path.to_string_lossy().to_string(),
+            file_format: "mp3".to_string(),
+            file_size_bytes: 26,
+            sample_rate: 44100,
+            bit_depth: Some(16),
+            channels: 2,
+            sha256_hash: dhun_lib::library::ingest::compute_file_sha256(&audio_path).unwrap(),
+            verification_status: "verified".to_string(),
+            availability_status: "available".to_string(),
+            last_verified_at: 1000,
+        };
+
+        // Insert audio asset directly into DB without matching track record (disabling foreign keys temporarily to simulate data corruption)
+        {
+            let conn = db.conn();
+            let c = conn.lock().unwrap();
+            c.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            c.execute(
+                "INSERT INTO audio_assets (id, track_id, file_path, file_format, file_size_bytes, sample_rate, bit_depth, channels, sha256_hash, verification_status, availability_status, last_verified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    orphan_asset.id, orphan_asset.track_id, orphan_asset.file_path, orphan_asset.file_format,
+                    orphan_asset.file_size_bytes, orphan_asset.sample_rate, orphan_asset.bit_depth, orphan_asset.channels,
+                    orphan_asset.sha256_hash, orphan_asset.verification_status, orphan_asset.availability_status, orphan_asset.last_verified_at
+                ],
+            ).unwrap();
+            c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        }
+
+        // Ingestion of duplicate referencing orphan track must fail with DB integrity error rather than inventing fake metadata
+        let ingest_res = ingest_audio_asset(&audio_path, "local", None, false, &db);
+        assert!(
+            ingest_res.is_err(),
+            "Duplicate ingestion must fail with database integrity error if canonical track is missing"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

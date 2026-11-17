@@ -28,14 +28,27 @@ pub fn is_restricted_ip(ip: &IpAddr) -> bool {
                 || ipv4.is_link_local()
                 || ipv4.is_broadcast()
                 || ipv4.is_unspecified()
+                || (ipv4.octets()[0] == 0) // RFC 1122 "this network" (0.0.0.0/8)
                 // Carrier-grade NAT (100.64.0.0/10)
                 || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
         }
         IpAddr::V6(ipv6) => {
-            ipv6.is_loopback()
-                || ipv6.is_unspecified()
-                // Unique local address (fc00::/7)
-                || ((ipv6.segments()[0] & 0xfe00) == 0xfc00)
+            if ipv6.is_loopback() || ipv6.is_unspecified() {
+                return true;
+            }
+            // Check IPv4-mapped IPv6 addresses (::ffff:127.0.0.1, etc.)
+            let segs = ipv6.segments();
+            if segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0xffff {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segs[6] >> 8) as u8,
+                    (segs[6] & 0xff) as u8,
+                    (segs[7] >> 8) as u8,
+                    (segs[7] & 0xff) as u8,
+                );
+                return is_restricted_ip(&IpAddr::V4(v4));
+            }
+            // Unique local address (fc00::/7)
+            ((ipv6.segments()[0] & 0xfe00) == 0xfc00)
                 // Link-local unicast (fe80::/10)
                 || ((ipv6.segments()[0] & 0xffc0) == 0xfe80)
         }
@@ -43,8 +56,9 @@ pub fn is_restricted_ip(ip: &IpAddr) -> bool {
 }
 
 /// Strictly validates URL scheme (HTTPS only) and verifies that host does not resolve
-/// to loopback, private, or restricted IP addresses (SSRF mitigation)
-pub fn validate_safe_public_url(url_str: &str) -> Result<Url> {
+/// to loopback, private, or restricted IP addresses (SSRF mitigation), returning the parsed URL
+/// and the validated SocketAddr to pin for connection.
+pub fn validate_safe_public_url(url_str: &str) -> Result<(Url, std::net::SocketAddr)> {
     let parsed = Url::parse(url_str).map_err(|e| anyhow!("Malformed URL: {}", e))?;
 
     // 1. Strictly enforce HTTPS protocol
@@ -62,13 +76,19 @@ pub fn validate_safe_public_url(url_str: &str) -> Result<Url> {
         return Err(anyhow!("Security violation: Localhost and local domain targets are blocked: {}", host));
     }
 
-    // 3. Resolve host and block private, loopback, link-local, carrier NAT IPs
+    // 3. Resolve host and block private, loopback, link-local, carrier NAT IPs (fail closed)
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let socket_addrs = (host, port)
+    let socket_addrs: Vec<std::net::SocketAddr> = (host, port)
         .to_socket_addrs()
-        .map_err(|e| anyhow!("Failed to resolve hostname '{}': {}", host, e))?;
+        .map_err(|e| anyhow!("Failed to resolve hostname '{}': {}", host, e))?
+        .collect();
 
-    for addr in socket_addrs {
+    if socket_addrs.is_empty() {
+        return Err(anyhow!("Security violation: Host '{}' has no resolvable network addresses", host));
+    }
+
+    let mut first_valid = None;
+    for addr in &socket_addrs {
         let ip = addr.ip();
         if is_restricted_ip(&ip) {
             return Err(anyhow!(
@@ -77,9 +97,13 @@ pub fn validate_safe_public_url(url_str: &str) -> Result<Url> {
                 ip
             ));
         }
+        if first_valid.is_none() {
+            first_valid = Some(*addr);
+        }
     }
 
-    Ok(parsed)
+    let pinned = first_valid.ok_or_else(|| anyhow!("No valid address found for host '{}'", host))?;
+    Ok((parsed, pinned))
 }
 
 /// Sanitizes custom filenames to prevent path traversal and Windows reserved filename issues
@@ -203,23 +227,40 @@ impl AudioDownloader {
         let dir = cache_dir.into();
         let _ = fs::create_dir_all(&dir);
 
-        // Configure client with custom redirect policy that validates every redirect target
+        // Configure client with custom redirect policy that validates every redirect target (fail closed)
         let redirect_policy = Policy::custom(|attempt| {
             if attempt.previous().len() >= 3 {
                 return attempt.stop();
             }
-            let target_url = attempt.url();
-            if target_url.scheme() != "https" {
+            let scheme = attempt.url().scheme().to_string();
+            if scheme != "https" {
                 return attempt.error("Security violation: Redirect to insecure non-HTTPS scheme blocked");
             }
-            if let Some(host) = target_url.host_str() {
-                let port = target_url.port_or_known_default().unwrap_or(443);
-                if let Ok(addrs) = (host, port).to_socket_addrs() {
+            let host_opt = attempt.url().host_str().map(|h| h.to_string());
+            let port = attempt.url().port_or_known_default().unwrap_or(443);
+
+            let Some(host) = host_opt else {
+                return attempt.error("Security violation: Redirect URL missing host");
+            };
+            let lower = host.to_lowercase();
+            if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+                return attempt.error("Security violation: Redirect to localhost/local domain blocked");
+            }
+            match (host.as_str(), port).to_socket_addrs() {
+                Ok(addrs) => {
+                    let mut has_addr = false;
                     for addr in addrs {
+                        has_addr = true;
                         if is_restricted_ip(&addr.ip()) {
-                            return attempt.error("Security violation: Redirect to private/restricted IP blocked");
+                            return attempt.error("Security violation: Redirect to private or restricted network address blocked");
                         }
                     }
+                    if !has_addr {
+                        return attempt.error("Security violation: Redirect target has no resolvable IP addresses");
+                    }
+                }
+                Err(e) => {
+                    return attempt.error(format!("Security violation: Failed to resolve redirect host '{}': {}", host, e));
                 }
             }
             attempt.follow()
@@ -275,8 +316,8 @@ impl AudioDownloader {
         let task_id = format!("dl_{}", Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
         let now = chrono::Utc::now().timestamp_millis();
 
-        // 1. Validate URL security (strict HTTPS, anti-SSRF host/IP resolution)
-        let validated_url = match validate_safe_public_url(url_str) {
+        // 1. Validate URL security (strict HTTPS, anti-SSRF host/IP resolution, address pinning)
+        let (validated_url, pinned_addr) = match validate_safe_public_url(url_str) {
             Ok(u) => u,
             Err(e) => {
                 let err_msg = format!("URL security validation failed: {}", e);
@@ -338,10 +379,17 @@ impl AudioDownloader {
             armed: true,
         };
 
-        info!("Starting download for task '{}' from URL '{}'", task_id, validated_url);
+        info!("Starting download for task '{}' from URL '{}' (pinned: {})", task_id, validated_url, pinned_addr);
 
-        // 3. Initiate HTTP GET request
-        let resp = match self.client.get(validated_url.clone()).send().await {
+        // 3. Initiate HTTP GET request over DNS-pinned connection to defeat DNS-rebinding attacks
+        let host = validated_url.host_str().unwrap_or("");
+        let download_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .resolve(host, pinned_addr)
+            .build()
+            .unwrap_or_else(|_| self.client.clone());
+
+        let resp = match download_client.get(validated_url.clone()).send().await {
             Ok(r) => r,
             Err(e) => {
                 let err_msg = format!("HTTP connection failed: {}", e);

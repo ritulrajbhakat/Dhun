@@ -49,6 +49,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 
     let track_id = track.id;
     let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    let declared_n_frames = track.codec_params.n_frames;
 
     let dec_opts: DecoderOptions = Default::default();
     let mut decoder = symphonia::default::get_codecs()
@@ -64,12 +65,10 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 
     loop {
         if interleaved.len() >= max_samples {
-            tracing::info!(
-                "Reached maximum decoded audio memory budget ({} minutes); capping memory allocation.",
+            return Err(anyhow!(
+                "File exceeds maximum supported in-memory duration of {} minutes; streaming architecture required",
                 MAX_DECODED_AUDIO_MINUTES
-            );
-            clean_eof = true;
-            break;
+            ));
         }
 
         let packet = match format.next_packet() {
@@ -126,15 +125,25 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         ));
     }
 
-    // If an unrecoverable read or decode error caused loop termination before normal EOF,
-    // reject the file to prevent corrupted/truncated tracks from entering the performance queue
     if let Some(err) = fatal_error {
-        if !clean_eof {
-            return Err(anyhow!("Corrupt audio file rejected due to premature termination: {}", err));
-        }
+        return Err(anyhow!("Corrupt audio file rejected due to premature termination: {}", err));
+    }
+
+    if !clean_eof {
+        return Err(anyhow!("Corrupt audio file: stream ended prematurely without clean end-of-file indicator"));
     }
 
     let total_frames = interleaved.len() / 2;
+    // Validate decoded frame count against declared container frame count (with 15% tolerance for VBR container headers)
+    if let Some(declared_frames) = declared_n_frames {
+        if declared_frames > 0 && total_frames < (declared_frames as usize * 85 / 100) {
+            return Err(anyhow!(
+                "Premature stream truncation: decoded {} frames, but container declared {} frames",
+                total_frames, declared_frames
+            ));
+        }
+    }
+
     let duration_ms = ((total_frames as f64 / sample_rate as f64) * 1000.0).round() as u64;
 
     Ok(DecodedAudio {
@@ -181,41 +190,65 @@ fn append_audio_buffer(
             let total_samples = num_frames * 2;
             out.extend_from_slice(&raw_samples[..total_samples.min(raw_samples.len())]);
         }
-        ch => {
-            // Calibrated ITU-R BS.775 multi-channel downmix to stereo (e.g. 5.1 surround)
-            // L_out = (L + 0.7071 * Center + 0.7071 * Ls + 0.50 * LFE) * Norm
-            // R_out = (R + 0.7071 * Center + 0.7071 * Rs + 0.50 * LFE) * Norm
+        3 => {
+            // 3.0 Layout: 0=Left, 1=Right, 2=Center
             out.reserve(num_frames * 2);
-            let center_weight = 0.7071f32;
-            let surround_weight = 0.7071f32;
-
+            let norm = 0.5857f32; // 1.0 / (1.0 + 0.7071)
             for frame_idx in 0..num_frames {
-                let base = frame_idx * ch;
-                if base + 1 >= raw_samples.len() {
-                    break;
-                }
+                let base = frame_idx * 3;
                 let left = raw_samples[base];
                 let right = raw_samples[base + 1];
-
-                let (mix_l, mix_r) = if ch >= 6 {
-                    // Standard 5.1 surround: 0=Left, 1=Right, 2=Center, 3=LFE (subwoofer), 4=Left Surround, 5=Right Surround
-                    let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * center_weight;
-                    let lfe = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.50f32;
-                    let ls = raw_samples.get(base + 4).copied().unwrap_or(0.0) * surround_weight;
-                    let rs = raw_samples.get(base + 5).copied().unwrap_or(0.0) * surround_weight;
-                    let norm = 0.41f32; // Calibrated normalization preventing inter-sample peaks
-                    ((left + center + ls + lfe) * norm, (right + center + rs + lfe) * norm)
-                } else if ch >= 3 {
-                    // 3.0 / quadraphonic: 0=L, 1=R, 2=Center/Rear
-                    let extra = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
-                    let norm = 0.58f32;
-                    ((left + extra) * norm, (right + extra) * norm)
-                } else {
-                    (left, right)
-                };
-
-                out.push(mix_l.clamp(-1.0, 1.0));
-                out.push(mix_r.clamp(-1.0, 1.0));
+                let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
+                out.push(((left + center) * norm).clamp(-1.0, 1.0));
+                out.push(((right + center) * norm).clamp(-1.0, 1.0));
+            }
+        }
+        4 => {
+            // Quadraphonic 4.0 Layout: 0=Left, 1=Right, 2=Left Surround, 3=Right Surround
+            out.reserve(num_frames * 2);
+            let norm = 0.5857f32;
+            for frame_idx in 0..num_frames {
+                let base = frame_idx * 4;
+                let left = raw_samples[base];
+                let right = raw_samples[base + 1];
+                let ls = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
+                let rs = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.7071f32;
+                out.push(((left + ls) * norm).clamp(-1.0, 1.0));
+                out.push(((right + rs) * norm).clamp(-1.0, 1.0));
+            }
+        }
+        5 | 6 => {
+            // 5.1 Surround (ITU-R BS.775): 0=Left, 1=Right, 2=Center, 3=LFE, 4=Left Surround, 5=Right Surround
+            out.reserve(num_frames * 2);
+            let norm = 0.41f32; // Normalization prevents digital clipping
+            for frame_idx in 0..num_frames {
+                let base = frame_idx * num_channels;
+                let left = raw_samples[base];
+                let right = raw_samples[base + 1];
+                let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
+                let lfe = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.50f32;
+                let ls = raw_samples.get(base + 4).copied().unwrap_or(0.0) * 0.7071f32;
+                let rs = raw_samples.get(base + 5).copied().unwrap_or(0.0) * 0.7071f32;
+                out.push(((left + center + ls + lfe) * norm).clamp(-1.0, 1.0));
+                out.push(((right + center + rs + lfe) * norm).clamp(-1.0, 1.0));
+            }
+        }
+        ch => {
+            // 7.1+ Surround: 0=Left, 1=Right, 2=Center, 3=LFE, 4=Ls, 5=Rs, 6=Lb, 7=Rb
+            out.reserve(num_frames * 2);
+            let norm = 0.35f32;
+            for frame_idx in 0..num_frames {
+                let base = frame_idx * ch;
+                let left = raw_samples[base];
+                let right = raw_samples[base + 1];
+                let center = raw_samples.get(base + 2).copied().unwrap_or(0.0) * 0.7071f32;
+                let lfe = raw_samples.get(base + 3).copied().unwrap_or(0.0) * 0.50f32;
+                let ls = raw_samples.get(base + 4).copied().unwrap_or(0.0) * 0.7071f32;
+                let rs = raw_samples.get(base + 5).copied().unwrap_or(0.0) * 0.7071f32;
+                let lb = raw_samples.get(base + 6).copied().unwrap_or(0.0) * 0.50f32;
+                let rb = raw_samples.get(base + 7).copied().unwrap_or(0.0) * 0.50f32;
+                out.push(((left + center + ls + lb + lfe) * norm).clamp(-1.0, 1.0));
+                out.push(((right + center + rs + rb + lfe) * norm).clamp(-1.0, 1.0));
             }
         }
     }

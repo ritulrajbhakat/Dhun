@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -7,6 +8,63 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::db::models::{SyncOutboxItem, SyncStatusOverview};
+
+/// Computes SHA-256 digest of payload for canonical message binding
+pub fn compute_payload_hash(payload_json: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload_json.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Constructs canonical request string: METHOD\nPATH\nTIMESTAMP\nPAYLOAD_SHA256
+pub fn create_canonical_string(method: &str, path: &str, timestamp: i64, payload_hash: &str) -> String {
+    format!("{}\n{}\n{}\n{}", method.to_uppercase(), path, timestamp, payload_hash)
+}
+
+/// Computes true HMAC-SHA256 signature using NIST-standard ring::hmac
+pub fn sign_request(api_key: &str, method: &str, path: &str, timestamp: i64, payload_json: &str) -> String {
+    let payload_hash = compute_payload_hash(payload_json);
+    let canonical = create_canonical_string(method, path, timestamp, &payload_hash);
+    let key = hmac::Key::new(hmac::HMAC_SHA256, api_key.as_bytes());
+    let tag = hmac::sign(&key, canonical.as_bytes());
+    tag.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Constant-time verification of HMAC-SHA256 signature with replay window validation (±300 seconds)
+pub fn verify_signature(
+    api_key: &str,
+    method: &str,
+    path: &str,
+    timestamp: i64,
+    payload_json: &str,
+    signature_hex: &str,
+) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    // Replay attack prevention: timestamp must be within 300s of current server time
+    if (now - timestamp).abs() > 300 {
+        return false;
+    }
+
+    let clean_sig = signature_hex.strip_prefix("sha256=").unwrap_or(signature_hex);
+    if clean_sig.len() != 64 {
+        return false;
+    }
+
+    let sig_bytes = match (0..clean_sig.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean_sig[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    let payload_hash = compute_payload_hash(payload_json);
+    let canonical = create_canonical_string(method, path, timestamp, &payload_hash);
+    let key = hmac::Key::new(hmac::HMAC_SHA256, api_key.as_bytes());
+
+    hmac::verify(&key, canonical.as_bytes(), &sig_bytes).is_ok()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackMetadataCorrection {
@@ -38,8 +96,21 @@ pub struct MetadataSyncManager {
 }
 
 impl MetadataSyncManager {
-    pub fn new(remote_endpoint: Option<String>, api_key: Option<String>) -> Self {
-        Self {
+    pub fn new(remote_endpoint: Option<String>, api_key: Option<String>) -> Result<Self> {
+        if let Some(ref url) = remote_endpoint {
+            let lower = url.to_lowercase();
+            // Reject insecure HTTP endpoints (only HTTPS is permitted; loopback allowed for unit tests)
+            if !lower.starts_with("https://") && !lower.starts_with("http://127.0.0.1") && !lower.starts_with("http://localhost") {
+                return Err(anyhow!("Security violation: remote sync endpoint must use HTTPS (got '{}')", url));
+            }
+            // Enforce mandatory non-empty API key whenever a remote endpoint is configured
+            match &api_key {
+                Some(key) if !key.trim().is_empty() => {}
+                _ => return Err(anyhow!("Authentication required: remote sync endpoint requires a non-empty API key")),
+            }
+        }
+
+        Ok(Self {
             remote_endpoint,
             api_key,
             client: reqwest::Client::builder()
@@ -47,11 +118,11 @@ impl MetadataSyncManager {
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
-        }
+        })
     }
 
     /// Creates sync manager loading any persisted remote sync endpoint and API key from environment or SQLite
-    pub fn new_from_db(db: &Database) -> Self {
+    pub fn new_from_db(db: &Database) -> Result<Self> {
         let endpoint = std::env::var("DHUN_SYNC_ENDPOINT")
             .ok()
             .or_else(|| db.get_app_setting("sync_remote_endpoint").unwrap_or(None));
@@ -197,25 +268,22 @@ impl MetadataSyncManager {
         let Some(endpoint) = &self.remote_endpoint else {
             return Err(anyhow!("No remote sync service configured; item remains in local pending queue."));
         };
+        let Some(ref key) = self.api_key else {
+            return Err(anyhow!("Authentication required: remote sync endpoint configured but API key is missing."));
+        };
 
-        let url = format!("{}/api/v1/sync/{}", endpoint.trim_end_matches('/'), item.entity_type);
-        let mut req = self.client.post(&url)
+        let path = format!("/api/v1/sync/{}", item.entity_type);
+        let url = format!("{}{}", endpoint.trim_end_matches('/'), path);
+        let timestamp = chrono::Utc::now().timestamp();
+        let sig = sign_request(key, "POST", &path, timestamp, &item.payload_json);
+
+        let resp = self.client.post(&url)
             .header("Content-Type", "application/json")
             .header("X-Dhun-Idempotency-Key", &item.id)
-            .header("X-Dhun-Entity-Type", &item.entity_type);
-
-        if let Some(ref key) = self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
-
-            let mut hasher = Sha256::new();
-            hasher.update(key.as_bytes());
-            hasher.update(b":");
-            hasher.update(item.payload_json.as_bytes());
-            let sig = format!("{:x}", hasher.finalize());
-            req = req.header("X-Dhun-Signature", format!("sha256={}", sig));
-        }
-
-        let resp = req
+            .header("X-Dhun-Entity-Type", &item.entity_type)
+            .header("X-Dhun-Timestamp", timestamp.to_string())
+            .header("X-Dhun-Signature", format!("sha256={}", sig))
+            .header("Authorization", format!("Bearer {}", key))
             .body(item.payload_json.clone())
             .send()
             .await?;

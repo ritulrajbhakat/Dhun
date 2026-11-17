@@ -57,7 +57,10 @@ async fn main() {
     let _ = cache.reconcile_locks(&db);
 
     let downloader = Arc::new(AudioDownloader::new(&cache_dir));
-    let sync = Arc::new(MetadataSyncManager::new_from_db(&db));
+    let sync = Arc::new(MetadataSyncManager::new_from_db(&db).unwrap_or_else(|e| {
+        tracing::warn!("Sync initialization fallback: {}", e);
+        MetadataSyncManager::new(None, None).expect("Fallback sync init failed")
+    }));
     let _ = sync.recover_in_flight_items(&db);
     sync.clone().start_background_worker(db.clone(), 30);
 
