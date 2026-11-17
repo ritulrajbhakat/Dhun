@@ -25,8 +25,15 @@ jobs:
       - name: Run Backend Engine Tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --tests
 
-      - name: Build Native Windows Release Binary
-        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+      - name: Build Release Binaries (Cloud Server & Backend)
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --bins
+
+      - name: Upload Cloud Server Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhun-server-windows-x86_64
+          path: target/release/dhun-server.exe
+          if-no-files-found: error
 
       - name: Upload Windows Native Executable
         uses: actions/upload-artifact@v4

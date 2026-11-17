@@ -1034,5 +1034,412 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // ========================================================================
+    // Cloud Party Operations (Phase 1)
+    // ========================================================================
+
+    pub fn create_cloud_party(&self, party: &CloudParty, config: &PartyConfiguration) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO parties (id, party_name, status, host_token_hash, created_at, updated_at, started_at, ended_at, last_heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                party.id, party.party_name, party.status, party.host_token_hash,
+                party.created_at, party.updated_at, party.started_at, party.ended_at, party.last_heartbeat_at
+            ],
+        )?;
+
+        tx.execute(
+            "INSERT INTO party_configurations (party_id, dj_level, primary_mood_id, secondary_mood_id, energy_progression, allow_guest_requests, max_requests_per_guest, request_cooldown_mins, require_host_approval, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                config.party_id, config.dj_level, config.primary_mood_id, config.secondary_mood_id,
+                config.energy_progression, if config.allow_guest_requests { 1 } else { 0 },
+                config.max_requests_per_guest, config.request_cooldown_mins,
+                if config.require_host_approval { 1 } else { 0 }, config.updated_at
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_cloud_party(&self, party_id: &str) -> Result<Option<CloudParty>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, party_name, status, host_token_hash, created_at, updated_at, started_at, ended_at, last_heartbeat_at
+             FROM parties WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![party_id], |row| {
+            Ok(CloudParty {
+                id: row.get(0)?,
+                party_name: row.get(1)?,
+                status: row.get(2)?,
+                host_token_hash: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                started_at: row.get(6)?,
+                ended_at: row.get(7)?,
+                last_heartbeat_at: row.get(8)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_party_config(&self, party_id: &str) -> Result<Option<PartyConfiguration>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT party_id, dj_level, primary_mood_id, secondary_mood_id, energy_progression, allow_guest_requests, max_requests_per_guest, request_cooldown_mins, require_host_approval, updated_at
+             FROM party_configurations WHERE party_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![party_id], |row| {
+            let allow_req: i32 = row.get(5)?;
+            let req_approval: i32 = row.get(8)?;
+            Ok(PartyConfiguration {
+                party_id: row.get(0)?,
+                dj_level: row.get(1)?,
+                primary_mood_id: row.get(2)?,
+                secondary_mood_id: row.get(3)?,
+                energy_progression: row.get(4)?,
+                allow_guest_requests: allow_req != 0,
+                max_requests_per_guest: row.get(6)?,
+                request_cooldown_mins: row.get(7)?,
+                require_host_approval: req_approval != 0,
+                updated_at: row.get(9)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_cloud_party_status(&self, party_id: &str, status: &str, timestamp: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if status == "live" {
+            conn.execute(
+                "UPDATE parties SET status = ?1, updated_at = ?2, started_at = COALESCE(started_at, ?2), last_heartbeat_at = ?2 WHERE id = ?3",
+                params![status, timestamp, party_id],
+            )?;
+        } else if status == "ended" {
+            conn.execute(
+                "UPDATE parties SET status = ?1, updated_at = ?2, ended_at = ?2 WHERE id = ?3",
+                params![status, timestamp, party_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE parties SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status, timestamp, party_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn update_party_heartbeat(&self, party_id: &str, timestamp: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE parties SET last_heartbeat_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![timestamp, party_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_party_config(&self, config: &PartyConfiguration) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO party_configurations (party_id, dj_level, primary_mood_id, secondary_mood_id, energy_progression, allow_guest_requests, max_requests_per_guest, request_cooldown_mins, require_host_approval, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(party_id) DO UPDATE SET
+                dj_level = excluded.dj_level,
+                primary_mood_id = excluded.primary_mood_id,
+                secondary_mood_id = excluded.secondary_mood_id,
+                energy_progression = excluded.energy_progression,
+                allow_guest_requests = excluded.allow_guest_requests,
+                max_requests_per_guest = excluded.max_requests_per_guest,
+                request_cooldown_mins = excluded.request_cooldown_mins,
+                require_host_approval = excluded.require_host_approval,
+                updated_at = excluded.updated_at",
+            params![
+                config.party_id, config.dj_level, config.primary_mood_id, config.secondary_mood_id,
+                config.energy_progression, if config.allow_guest_requests { 1 } else { 0 },
+                config.max_requests_per_guest, config.request_cooldown_mins,
+                if config.require_host_approval { 1 } else { 0 }, config.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_party_source(&self, source: &PartySourceReference) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO party_source_references (
+                id, party_id, provider, original_url, provider_video_id, title, artist,
+                thumbnail_url, duration_seconds, verification_status, playback_method,
+                playability_status, metadata_status, error_reason, registered_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                artist = excluded.artist,
+                thumbnail_url = excluded.thumbnail_url,
+                duration_seconds = excluded.duration_seconds,
+                verification_status = excluded.verification_status,
+                playback_method = excluded.playback_method,
+                playability_status = excluded.playability_status,
+                metadata_status = excluded.metadata_status,
+                error_reason = excluded.error_reason,
+                updated_at = excluded.updated_at",
+            params![
+                source.id, source.party_id, source.provider, source.original_url, source.provider_video_id,
+                source.title, source.artist, source.thumbnail_url, source.duration_seconds,
+                source.verification_status, source.playback_method, source.playability_status,
+                source.metadata_status, source.error_reason, source.registered_at, source.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_party_sources(&self, party_id: &str) -> Result<Vec<PartySourceReference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, party_id, provider, original_url, provider_video_id, title, artist,
+                    thumbnail_url, duration_seconds, verification_status, playback_method,
+                    playability_status, metadata_status, error_reason, registered_at, updated_at
+             FROM party_source_references WHERE party_id = ?1 ORDER BY registered_at ASC"
+        )?;
+        let rows = stmt.query_map(params![party_id], |row| {
+            Ok(PartySourceReference {
+                id: row.get(0)?,
+                party_id: row.get(1)?,
+                provider: row.get(2)?,
+                original_url: row.get(3)?,
+                provider_video_id: row.get(4)?,
+                title: row.get(5)?,
+                artist: row.get(6)?,
+                thumbnail_url: row.get(7)?,
+                duration_seconds: row.get(8)?,
+                verification_status: row.get(9)?,
+                playback_method: row.get(10)?,
+                playability_status: row.get(11)?,
+                metadata_status: row.get(12)?,
+                error_reason: row.get(13)?,
+                registered_at: row.get(14)?,
+                updated_at: row.get(15)?,
+            })
+        })?;
+
+        let mut sources = Vec::new();
+        for r in rows {
+            sources.push(r?);
+        }
+        Ok(sources)
+    }
+
+    pub fn get_party_source_by_video_id(&self, party_id: &str, video_id: &str) -> Result<Option<PartySourceReference>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, party_id, provider, original_url, provider_video_id, title, artist,
+                    thumbnail_url, duration_seconds, verification_status, playback_method,
+                    playability_status, metadata_status, error_reason, registered_at, updated_at
+             FROM party_source_references WHERE party_id = ?1 AND provider_video_id = ?2"
+        )?;
+        let mut rows = stmt.query_map(params![party_id, video_id], |row| {
+            Ok(PartySourceReference {
+                id: row.get(0)?,
+                party_id: row.get(1)?,
+                provider: row.get(2)?,
+                original_url: row.get(3)?,
+                provider_video_id: row.get(4)?,
+                title: row.get(5)?,
+                artist: row.get(6)?,
+                thumbnail_url: row.get(7)?,
+                duration_seconds: row.get(8)?,
+                verification_status: row.get(9)?,
+                playback_method: row.get(10)?,
+                playability_status: row.get(11)?,
+                metadata_status: row.get(12)?,
+                error_reason: row.get(13)?,
+                registered_at: row.get(14)?,
+                updated_at: row.get(15)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn register_party_guest(&self, guest: &PartyGuest) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO party_guests (id, party_id, nickname, fingerprint, token_hash, client_ip, request_count, is_blocked, created_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                guest.id, guest.party_id, guest.nickname, guest.fingerprint, guest.token_hash,
+                guest.client_ip, guest.request_count, if guest.is_blocked { 1 } else { 0 },
+                guest.created_at, guest.last_seen_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn lookup_party_guest_by_token(&self, party_id: &str, token_hash: &str) -> Result<Option<PartyGuest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, party_id, nickname, fingerprint, token_hash, client_ip, request_count, is_blocked, created_at, last_seen_at
+             FROM party_guests WHERE party_id = ?1 AND token_hash = ?2"
+        )?;
+        let mut rows = stmt.query_map(params![party_id, token_hash], |row| {
+            let blocked: i32 = row.get(7)?;
+            Ok(PartyGuest {
+                id: row.get(0)?,
+                party_id: row.get(1)?,
+                nickname: row.get(2)?,
+                fingerprint: row.get(3)?,
+                token_hash: row.get(4)?,
+                client_ip: row.get(5)?,
+                request_count: row.get(6)?,
+                is_blocked: blocked != 0,
+                created_at: row.get(8)?,
+                last_seen_at: row.get(9)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn increment_party_guest_request_count(&self, guest_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE party_guests SET request_count = request_count + 1, last_seen_at = ?1 WHERE id = ?2",
+            params![now, guest_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_party_song_request(&self, req: &PartySongRequest) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO party_song_requests (id, party_id, guest_id, source_id, custom_note, status, rejection_reason, priority_score, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                req.id, req.party_id, req.guest_id, req.source_id, req.custom_note,
+                req.status, req.rejection_reason, req.priority_score, req.created_at, req.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_party_song_requests(&self, party_id: &str) -> Result<Vec<PartySongRequest>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.party_id, r.guest_id, g.nickname, r.source_id, s.title, s.artist, s.thumbnail_url,
+                    r.custom_note, r.status, r.rejection_reason, r.priority_score, r.created_at, r.updated_at
+             FROM party_song_requests r
+             LEFT JOIN party_guests g ON r.guest_id = g.id
+             LEFT JOIN party_source_references s ON r.source_id = s.id
+             WHERE r.party_id = ?1
+             ORDER BY r.priority_score DESC, r.created_at ASC"
+        )?;
+        let rows = stmt.query_map(params![party_id], |row| {
+            Ok(PartySongRequest {
+                id: row.get(0)?,
+                party_id: row.get(1)?,
+                guest_id: row.get(2)?,
+                guest_name: row.get(3)?,
+                source_id: row.get(4)?,
+                source_title: row.get(5)?,
+                source_artist: row.get(6)?,
+                thumbnail_url: row.get(7)?,
+                custom_note: row.get(8)?,
+                status: row.get(9)?,
+                rejection_reason: row.get(10)?,
+                priority_score: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn update_party_request_status(
+        &self,
+        request_id: &str,
+        party_id: &str,
+        new_status: &str,
+        reason: Option<&str>,
+        actor_type: &str,
+        actor_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let current_status: String = tx.query_row(
+            "SELECT status FROM party_song_requests WHERE id = ?1 AND party_id = ?2",
+            params![request_id, party_id],
+            |row| row.get(0),
+        )?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        tx.execute(
+            "UPDATE party_song_requests SET status = ?1, rejection_reason = ?2, updated_at = ?3 WHERE id = ?4 AND party_id = ?5",
+            params![new_status, reason, now, request_id, party_id],
+        )?;
+
+        let hist_id = format!("rh_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
+        tx.execute(
+            "INSERT INTO request_status_history (id, request_id, from_status, to_status, actor_type, actor_id, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![hist_id, request_id, current_status, new_status, actor_type, actor_id, reason, now],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn log_playback_event(&self, party_id: &str, event_type: &str, track_id: Option<&str>, payload_json: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let id = format!("pbe_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO playback_events (id, party_id, event_type, track_id, payload_json, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, party_id, event_type, track_id, payload_json, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn log_audit_event(&self, party_id: &str, action: &str, actor: &str, details_json: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let id = format!("aud_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..12].to_string());
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO audit_events (id, party_id, action, actor, details_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, party_id, action, actor, details_json, now],
+        )?;
+        Ok(())
+    }
 }
 

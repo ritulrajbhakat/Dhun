@@ -1,26 +1,31 @@
 import { create } from 'zustand';
-import { PartyStatus, MasterTelemetry, MoodProfile, AudioDeviceInfo, Track, GuestRequest, PlayableTrackCandidate } from '../types';
-import { webAudioEngine } from '../audio/WebAudioEngine';
 import {
-  isTauri,
-  apiGetPartyStatus,
-  apiGetTelemetry,
-  apiGetMoodProfiles,
-  apiGetAudioDevices,
-  apiGetTracks,
-  apiGetGuestRequests,
-  apiStartParty,
-  apiEmergencyFade,
-  apiUpdateRequest,
-  apiForceNext,
-  apiDeckControl,
-  apiSetCrossfader,
-  apiScanLibraryFolder,
-  apiSetDjLevel,
-  apiSetPartyMood,
-} from '../api/ipc';
+  CloudParty,
+  DjLevel,
+  GuestRequest,
+  MasterTelemetry,
+  MoodProfile,
+  PartyConfiguration,
+  PartyEventMessage,
+  PartySongRequest,
+  PartySourceReference,
+  PartyStatus,
+  Track,
+} from '../types';
+import { CURATED_MOODS } from '../api/ipc';
+import { apiClient } from '../api/client';
+import { partyWsClient } from '../api/websocket';
 
-export type ScreenView = 'home' | 'wizard' | 'live' | 'mixer' | 'library' | 'requests' | 'history' | 'settings' | 'diagnostics';
+export type ScreenView =
+  | 'home'
+  | 'wizard'
+  | 'live'
+  | 'mixer'
+  | 'library'
+  | 'requests'
+  | 'history'
+  | 'settings'
+  | 'diagnostics';
 
 interface DeckState {
   eqLow: number;
@@ -34,14 +39,44 @@ interface DeckState {
   hotCues: (number | null)[];
 }
 
+const DJ_LEVEL_TO_STR: Record<number, string> = {
+  1: 'hands_off',
+  2: 'balanced',
+  3: 'curated',
+  4: 'manual',
+};
+
+const STR_TO_DJ_LEVEL: Record<string, DjLevel> = {
+  hands_off: 1,
+  balanced: 2,
+  curated: 3,
+  manual: 4,
+};
+
 interface DhunState {
   currentView: ScreenView;
   setCurrentView: (view: ScreenView) => void;
 
+  // Real Backend & WebSocket Connectivity State
+  apiBaseUrl: string;
+  backendConnected: boolean;
+  backendVersion: string | null;
+  backendError: string | null;
+  wsConnected: boolean;
+
+  // Active Cloud Party State (Zero Mock Fallbacks)
+  cloudParty: CloudParty | null;
+  partyConfig: PartyConfiguration | null;
+  hostToken: string | null;
+  guestUrl: string | null;
+  qrSvg: string | null;
+  registeredSources: PartySourceReference[];
+  songRequests: PartySongRequest[];
+
+  // Derived / UI state
   partyStatus: PartyStatus;
   telemetry: MasterTelemetry | null;
   moodProfiles: MoodProfile[];
-  audioDevices: AudioDeviceInfo[];
   tracks: Track[];
   guestRequests: GuestRequest[];
 
@@ -49,29 +84,47 @@ interface DhunState {
   crossfader: number;
   crossfaderCurve: string;
   selectedDeckCount: 2 | 4;
-
   decks: DeckState[];
 
   // Actions
+  setApiBaseUrl: (url: string) => Promise<void>;
+  checkBackendHealth: () => Promise<boolean>;
   refreshAll: () => Promise<void>;
-  startParty: (name: string, level: number, primaryMood: string, secondaryMood?: string, outputDevice?: string) => Promise<void>;
+  createCloudParty: (
+    partyName: string,
+    moodId: string,
+    djLevel: string
+  ) => Promise<void>;
+  startCloudParty: () => Promise<void>;
+  endCloudParty: () => Promise<void>;
+  clearActiveParty: () => void;
+  registerYouTubeSource: (url: string) => Promise<PartySourceReference>;
+  refreshPartyData: () => Promise<void>;
+  approveSongRequest: (requestId: string) => Promise<void>;
+  rejectSongRequest: (requestId: string, reason?: string) => Promise<void>;
+  updatePartyConfig: (updates: Partial<PartyConfiguration>) => Promise<void>;
+  setDjLevel: (level: number) => Promise<void>;
+  setPartyMood: (moodId: string) => Promise<void>;
+  setCrossfaderPos: (pos: number) => void;
+  updateDeckEq: (deckId: number, low: number, mid: number, high: number) => void;
+  updateDeckGain: (deckId: number, gain: number) => void;
+  updateDeckFilter: (deckId: number, filter: number) => void;
+  updateDeckTempo: (deckId: number, tempo: number) => void;
+  setMasterVolume: (vol: number) => void;
+  setDeckCount: (count: 2 | 4) => void;
+
+  // Compatibility wrappers for auxiliary screens
+  startParty: (
+    name: string,
+    level: number,
+    primaryMood: string,
+    secondaryMood?: string
+  ) => Promise<void>;
   emergencyFade: () => Promise<void>;
   approveRequest: (requestId: string) => Promise<void>;
   rejectRequest: (requestId: string) => Promise<void>;
   forceNextRequest: (requestId: string) => Promise<void>;
-  setCrossfaderPos: (pos: number) => Promise<void>;
-  updateDeckEq: (deckId: number, low: number, mid: number, high: number) => Promise<void>;
-  updateDeckGain: (deckId: number, gain: number) => Promise<void>;
-  updateDeckFilter: (deckId: number, filter: number) => Promise<void>;
-  updateDeckTempo: (deckId: number, tempo: number) => Promise<void>;
   toggleDeckPlay: (deckId: number) => Promise<void>;
-  setMasterVolume: (vol: number) => void;
-  setDeckCount: (count: 2 | 4) => void;
-  loadLocalAudioFile: (deckId: number, file: File) => Promise<void>;
-  startBrowserAudio: () => Promise<void>;
-  scanFolder: (folderPath: string) => Promise<number>;
-  setDjLevel: (level: number) => Promise<void>;
-  setPartyMood: (moodId: string) => Promise<void>;
   pollTelemetry: () => Promise<void>;
 }
 
@@ -87,221 +140,411 @@ const defaultDeckState = (): DeckState => ({
   hotCues: [null, null, null, null, null, null, null, null],
 });
 
-export const useDhunStore = create<DhunState>((set, get) => ({
-  currentView: 'home',
-  setCurrentView: (view) => set({ currentView: view }),
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
-  partyStatus: { is_active: false },
-  telemetry: null,
-  moodProfiles: [],
-  audioDevices: [],
-  tracks: [],
-  guestRequests: [],
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
 
-  masterVolume: 1.0,
-  crossfader: 0.0,
-  crossfaderCurve: 'bass_swap',
-  selectedDeckCount: 2,
+function derivePartyStatus(
+  party: CloudParty | null,
+  config: PartyConfiguration | null,
+  guestUrl: string | null,
+  qrSvg: string | null
+): PartyStatus {
+  if (!party) {
+    return { is_active: false };
+  }
+  const djLvl = config ? STR_TO_DJ_LEVEL[config.dj_level] || 2 : 2;
+  return {
+    is_active: party.status === 'live',
+    session_id: party.id,
+    party_name: party.party_name,
+    primary_mood_id: config?.primary_mood_id || 'house_party',
+    dj_level: djLvl,
+    guest_url: guestUrl || undefined,
+    qr_svg: qrSvg || undefined,
+  };
+}
 
-  decks: [defaultDeckState(), defaultDeckState(), defaultDeckState(), defaultDeckState()],
+function mapRequests(requests: PartySongRequest[]): GuestRequest[] {
+  return requests.map((r) => ({
+    id: r.id,
+    session_id: r.party_id,
+    guest_id: r.guest_id,
+    guest_name: r.guest_name,
+    track_id: r.source_id,
+    track_title: r.source_title,
+    track_artist: r.source_artist,
+    submitted_at: r.created_at,
+    status: r.status as any,
+    priority_order: Math.round(r.priority_score),
+    host_note: r.custom_note,
+  }));
+}
 
-  refreshAll: async () => {
-    try {
-      const [partyStatus, moods, devices, tracks, requests] = await Promise.all([
-        apiGetPartyStatus(),
-        apiGetMoodProfiles(),
-        apiGetAudioDevices(),
-        apiGetTracks(),
-        apiGetGuestRequests(),
-      ]);
+export const useDhunStore = create<DhunState>((set, get) => {
+  const handleWsEvent = (event: PartyEventMessage) => {
+    const { cloudParty } = get();
+    if (!cloudParty || event.party_id !== cloudParty.id) return;
+
+    if (
+      event.event_type === 'party.status_changed' ||
+      event.event_type === 'party.config_updated' ||
+      event.event_type === 'party.source_added' ||
+      event.event_type === 'request.created' ||
+      event.event_type === 'request.status_changed'
+    ) {
+      get().refreshPartyData();
+    }
+  };
+
+  const startHeartbeatForParty = (partyId: string) => {
+    stopHeartbeat();
+    heartbeatInterval = setInterval(() => {
+      const { cloudParty, hostToken } = get();
+      if (cloudParty && cloudParty.id === partyId && cloudParty.status === 'live' && hostToken) {
+        apiClient.sendHeartbeat(partyId).catch(() => {});
+      }
+    }, 25000);
+  };
+
+  return {
+    currentView: 'home',
+    setCurrentView: (view) => set({ currentView: view }),
+
+    apiBaseUrl: apiClient.getBaseUrl(),
+    backendConnected: false,
+    backendVersion: null,
+    backendError: null,
+    wsConnected: false,
+
+    cloudParty: null,
+    partyConfig: null,
+    hostToken: apiClient.getHostToken(),
+    guestUrl: null,
+    qrSvg: null,
+    registeredSources: [],
+    songRequests: [],
+
+    partyStatus: { is_active: false },
+    telemetry: null,
+    moodProfiles: CURATED_MOODS,
+    tracks: [],
+    guestRequests: [],
+
+    masterVolume: 1.0,
+    crossfader: 0.0,
+    crossfaderCurve: 'bass_swap',
+    selectedDeckCount: 2,
+    decks: [defaultDeckState(), defaultDeckState(), defaultDeckState(), defaultDeckState()],
+
+    setApiBaseUrl: async (url: string) => {
+      apiClient.setBaseUrl(url);
+      set({ apiBaseUrl: apiClient.getBaseUrl() });
+      await get().refreshAll();
+    },
+
+    checkBackendHealth: async () => {
+      const res = await apiClient.checkHealth();
+      set({
+        backendConnected: res.connected,
+        backendVersion: res.version || null,
+        backendError: res.error || null,
+      });
+      return res.connected;
+    },
+
+    refreshAll: async () => {
+      const isHealthy = await get().checkBackendHealth();
+      if (!isHealthy) {
+        return;
+      }
+
+      const savedPartyId = apiClient.getSavedPartyId();
+      if (savedPartyId) {
+        try {
+          const details = await apiClient.getParty(savedPartyId);
+          const [sources, requests] = await Promise.all([
+            apiClient.listSources(savedPartyId),
+            apiClient.listRequests(savedPartyId).catch(() => []),
+          ]);
+
+          const derived = derivePartyStatus(
+            details.party,
+            details.config || null,
+            details.guest_url,
+            details.qr_svg
+          );
+
+          set({
+            cloudParty: details.party,
+            partyConfig: details.config || null,
+            guestUrl: details.guest_url,
+            qrSvg: details.qr_svg,
+            registeredSources: sources,
+            songRequests: requests,
+            guestRequests: mapRequests(requests),
+            partyStatus: derived,
+            selectedDeckCount: derived.dj_level && derived.dj_level >= 3 ? 4 : 2,
+          });
+
+          partyWsClient.connect(savedPartyId, handleWsEvent, (connected) => {
+            set({ wsConnected: connected });
+          });
+
+          if (details.party.status === 'live') {
+            startHeartbeatForParty(savedPartyId);
+          }
+        } catch (err) {
+          // Saved party no longer exists on this backend
+          apiClient.setSavedPartyId(null);
+          set({
+            cloudParty: null,
+            partyConfig: null,
+            guestUrl: null,
+            qrSvg: null,
+            registeredSources: [],
+            songRequests: [],
+            guestRequests: [],
+            partyStatus: { is_active: false },
+          });
+        }
+      }
+    },
+
+    refreshPartyData: async () => {
+      const { cloudParty } = get();
+      if (!cloudParty) return;
+      try {
+        const [details, sources, requests] = await Promise.all([
+          apiClient.getParty(cloudParty.id),
+          apiClient.listSources(cloudParty.id),
+          apiClient.listRequests(cloudParty.id).catch(() => []),
+        ]);
+
+        const derived = derivePartyStatus(
+          details.party,
+          details.config || null,
+          details.guest_url,
+          details.qr_svg
+        );
+
+        set({
+          cloudParty: details.party,
+          partyConfig: details.config || null,
+          guestUrl: details.guest_url,
+          qrSvg: details.qr_svg,
+          registeredSources: sources,
+          songRequests: requests,
+          guestRequests: mapRequests(requests),
+          partyStatus: derived,
+        });
+      } catch (err) {
+        console.error('Failed to refresh party data:', err);
+      }
+    },
+
+    createCloudParty: async (partyName: string, moodId: string, djLevel: string) => {
+      const created = await apiClient.createParty({
+        party_name: partyName,
+        primary_mood_id: moodId,
+        dj_level: djLevel,
+        allow_guest_requests: true,
+        max_requests_per_guest: 5,
+      });
+
+      const partyObj: CloudParty = {
+        id: created.party_id,
+        party_name: created.party_name,
+        status: created.status,
+        created_at: created.created_at,
+        updated_at: created.created_at,
+        last_heartbeat_at: created.created_at,
+      };
+
+      const derived = derivePartyStatus(
+        partyObj,
+        created.config,
+        created.guest_url,
+        created.qr_svg
+      );
 
       set({
-        partyStatus,
-        moodProfiles: moods,
-        audioDevices: devices,
-        tracks,
-        guestRequests: requests,
-        selectedDeckCount: (partyStatus.dj_level && partyStatus.dj_level >= 3) ? 4 : 2,
+        cloudParty: partyObj,
+        partyConfig: created.config,
+        hostToken: created.host_token,
+        guestUrl: created.guest_url,
+        qrSvg: created.qr_svg,
+        registeredSources: [],
+        songRequests: [],
+        guestRequests: [],
+        partyStatus: derived,
+        backendConnected: true,
+        backendError: null,
       });
-    } catch (err) {
-      console.error('Failed refreshing DHUN state:', err);
-    }
-  },
 
-  startParty: async (name, level, primaryMood, secondaryMood, outputDevice = 'Default') => {
-    const status = await apiStartParty({
-      party_name: name,
-      dj_level: level,
-      primary_mood_id: primaryMood,
-      secondary_mood_id: secondaryMood,
-      output_device_name: outputDevice,
-    });
+      partyWsClient.connect(created.party_id, handleWsEvent, (connected) => {
+        set({ wsConnected: connected });
+      });
+    },
 
-    // Start WebAudio playback only in browser mode (Tauri uses native CPAL audio)
-    if (!isTauri) {
-      const bpm = status.now_playing?.analysis.bpm || 128;
-      const key = status.now_playing?.analysis.key_name || 'D Major';
-      webAudioEngine.startPlayback(bpm, key);
-    }
+    startCloudParty: async () => {
+      const { cloudParty } = get();
+      if (!cloudParty) throw new Error('No party created yet.');
+      const updated = await apiClient.startParty(cloudParty.id);
+      const { partyConfig, guestUrl, qrSvg } = get();
+      set({
+        cloudParty: updated,
+        partyStatus: derivePartyStatus(updated, partyConfig, guestUrl, qrSvg),
+      });
+      startHeartbeatForParty(updated.id);
+    },
 
-    set({
-      partyStatus: status,
-      currentView: 'live',
-      selectedDeckCount: (level >= 3) ? 4 : 2,
-    });
-  },
+    endCloudParty: async () => {
+      const { cloudParty } = get();
+      if (!cloudParty) return;
+      const updated = await apiClient.endParty(cloudParty.id);
+      stopHeartbeat();
+      const { partyConfig, guestUrl, qrSvg } = get();
+      set({
+        cloudParty: updated,
+        partyStatus: derivePartyStatus(updated, partyConfig, guestUrl, qrSvg),
+      });
+    },
 
-  startBrowserAudio: async () => {
-    if (!isTauri) {
-      const bpm = get().partyStatus.now_playing?.analysis.bpm || 128;
-      const key = get().partyStatus.now_playing?.analysis.key_name || 'D Major';
-      await webAudioEngine.ensureRunning();
-      webAudioEngine.startPlayback(bpm, key);
-    }
-  },
+    clearActiveParty: () => {
+      stopHeartbeat();
+      partyWsClient.disconnect();
+      apiClient.setSavedPartyId(null);
+      apiClient.setHostToken(null);
+      set({
+        cloudParty: null,
+        partyConfig: null,
+        hostToken: null,
+        guestUrl: null,
+        qrSvg: null,
+        registeredSources: [],
+        songRequests: [],
+        guestRequests: [],
+        partyStatus: { is_active: false },
+        wsConnected: false,
+      });
+    },
 
-  emergencyFade: async () => {
-    if (!isTauri) {
-      webAudioEngine.emergencyFade(300);
-    }
-    await apiEmergencyFade(300);
-    set((state) => ({
-      partyStatus: { ...state.partyStatus, is_active: false },
-    }));
-  },
-
-  approveRequest: async (requestId) => {
-    await apiUpdateRequest(requestId, 'approved', 10);
-    const requests = await apiGetGuestRequests();
-    set({ guestRequests: requests });
-  },
-
-  rejectRequest: async (requestId) => {
-    await apiUpdateRequest(requestId, 'rejected');
-    const requests = await apiGetGuestRequests();
-    set({ guestRequests: requests });
-  },
-
-  forceNextRequest: async (requestId) => {
-    await apiForceNext(requestId);
-    const [requests, status] = await Promise.all([apiGetGuestRequests(), apiGetPartyStatus()]);
-    set({ guestRequests: requests, partyStatus: status });
-    if (!isTauri) {
-      const bpm = status.now_playing?.analysis.bpm || 128;
-      const key = status.now_playing?.analysis.key_name || 'D Major';
-      webAudioEngine.startPlayback(bpm, key);
-    }
-  },
-
-  setCrossfaderPos: async (pos) => {
-    set({ crossfader: pos });
-    if (!isTauri) {
-      webAudioEngine.setCrossfader(pos);
-    }
-    await apiSetCrossfader(pos, get().crossfaderCurve);
-  },
-
-  updateDeckEq: async (deckId, low, mid, high) => {
-    set((state) => {
-      const decks = [...state.decks];
-      decks[deckId] = { ...decks[deckId], eqLow: low, eqMid: mid, eqHigh: high };
-      return { decks };
-    });
-    if (!isTauri) {
-      webAudioEngine.setDeckEq(deckId, low, mid, high);
-    }
-    await apiDeckControl('eq', deckId, { lowDb: low, midDb: mid, highDb: high });
-  },
-
-  updateDeckGain: async (deckId, gain) => {
-    set((state) => {
-      const decks = [...state.decks];
-      decks[deckId] = { ...decks[deckId], gain };
-      return { decks };
-    });
-    if (!isTauri) {
-      webAudioEngine.setDeckGain(deckId, gain);
-    }
-    await apiDeckControl('gain', deckId, { gain });
-  },
-
-  updateDeckFilter: async (deckId, filter) => {
-    set((state) => {
-      const decks = [...state.decks];
-      decks[deckId] = { ...decks[deckId], filter };
-      return { decks };
-    });
-    if (!isTauri) {
-      webAudioEngine.setDeckFilter(deckId, filter);
-    }
-    await apiDeckControl('filter', deckId, { position: filter });
-  },
-
-  updateDeckTempo: async (deckId, tempo) => {
-    set((state) => {
-      const decks = [...state.decks];
-      decks[deckId] = { ...decks[deckId], tempo };
-      return { decks };
-    });
-    await apiDeckControl('tempo', deckId, { rate: tempo });
-  },
-
-  toggleDeckPlay: async (deckId) => {
-    const isPlaying = get().telemetry?.decks[deckId]?.is_playing ?? false;
-    if (!isTauri) {
-      if (isPlaying) {
-        webAudioEngine.stopPlayback();
-      } else {
-        const bpm = get().partyStatus.now_playing?.analysis.bpm || 128;
-        const key = get().partyStatus.now_playing?.analysis.key_name || 'D Major';
-        webAudioEngine.startPlayback(bpm, key);
+    registerYouTubeSource: async (url: string) => {
+      const { cloudParty } = get();
+      if (!cloudParty) {
+        throw new Error('Create a party first before registering music sources.');
       }
-    }
-    await apiDeckControl(isPlaying ? 'pause' : 'play', deckId);
-  },
+      const source = await apiClient.registerSource(cloudParty.id, url);
+      set((state) => {
+        const exists = state.registeredSources.some((s) => s.id === source.id);
+        return {
+          registeredSources: exists
+            ? state.registeredSources
+            : [...state.registeredSources, source],
+        };
+      });
+      return source;
+    },
 
-  setMasterVolume: (vol) => {
-    set({ masterVolume: vol });
-    if (!isTauri) {
-      webAudioEngine.setMasterVolume(vol);
-    }
-  },
+    approveSongRequest: async (requestId: string) => {
+      const { cloudParty } = get();
+      if (!cloudParty) return;
+      await apiClient.approveRequest(cloudParty.id, requestId);
+      await get().refreshPartyData();
+    },
 
-  setDeckCount: (count) => set({ selectedDeckCount: count }),
+    rejectSongRequest: async (requestId: string, reason?: string) => {
+      const { cloudParty } = get();
+      if (!cloudParty) return;
+      await apiClient.rejectRequest(cloudParty.id, requestId, reason);
+      await get().refreshPartyData();
+    },
 
-  loadLocalAudioFile: async (deckId: number, file: File) => {
-    await webAudioEngine.loadUserAudioFile(deckId, file);
-  },
+    updatePartyConfig: async (updates: Partial<PartyConfiguration>) => {
+      const { cloudParty } = get();
+      if (!cloudParty) return;
+      const updated = await apiClient.updateConfig(cloudParty.id, updates);
+      const { guestUrl, qrSvg } = get();
+      set({
+        partyConfig: updated,
+        partyStatus: derivePartyStatus(cloudParty, updated, guestUrl, qrSvg),
+        selectedDeckCount: (STR_TO_DJ_LEVEL[updated.dj_level] || 2) >= 3 ? 4 : 2,
+      });
+    },
 
-  scanFolder: async (folderPath: string) => {
-    const count = await apiScanLibraryFolder(folderPath);
-    const tracks = await apiGetTracks();
-    set({ tracks });
-    return count;
-  },
+    setDjLevel: async (level: number) => {
+      const levelStr = DJ_LEVEL_TO_STR[level] || 'balanced';
+      set({ selectedDeckCount: level >= 3 ? 4 : 2 });
+      const { cloudParty } = get();
+      if (cloudParty) {
+        await get().updatePartyConfig({ dj_level: levelStr });
+      }
+    },
 
-  setDjLevel: async (level: number) => {
-    await apiSetDjLevel(level);
-    set((state) => ({
-      partyStatus: { ...state.partyStatus, dj_level: level as any },
-      selectedDeckCount: level >= 3 ? 4 : 2,
-    }));
-  },
+    setPartyMood: async (moodId: string) => {
+      const { cloudParty } = get();
+      if (cloudParty) {
+        await get().updatePartyConfig({ primary_mood_id: moodId });
+      } else {
+        set((state) => ({
+          partyStatus: { ...state.partyStatus, primary_mood_id: moodId },
+        }));
+      }
+    },
 
-  setPartyMood: async (moodId: string) => {
-    await apiSetPartyMood(moodId);
-    set((state) => ({
-      partyStatus: { ...state.partyStatus, primary_mood_id: moodId },
-    }));
-  },
+    setCrossfaderPos: (pos) => set({ crossfader: pos }),
+    updateDeckEq: (deckId, low, mid, high) =>
+      set((state) => {
+        const decks = [...state.decks];
+        decks[deckId] = { ...decks[deckId], eqLow: low, eqMid: mid, eqHigh: high };
+        return { decks };
+      }),
+    updateDeckGain: (deckId, gain) =>
+      set((state) => {
+        const decks = [...state.decks];
+        decks[deckId] = { ...decks[deckId], gain };
+        return { decks };
+      }),
+    updateDeckFilter: (deckId, filter) =>
+      set((state) => {
+        const decks = [...state.decks];
+        decks[deckId] = { ...decks[deckId], filter };
+        return { decks };
+      }),
+    updateDeckTempo: (deckId, tempo) =>
+      set((state) => {
+        const decks = [...state.decks];
+        decks[deckId] = { ...decks[deckId], tempo };
+        return { decks };
+      }),
+    setMasterVolume: (vol) => set({ masterVolume: vol }),
+    setDeckCount: (count) => set({ selectedDeckCount: count }),
 
-  pollTelemetry: async () => {
-    try {
-      const telemetry = await apiGetTelemetry();
-      set({ telemetry });
-    } catch (e) {
-      // Telemetry poll silent
-    }
-  },
-}));
-
+    // Compatibility wrappers mapping directly to cloud party operations
+    startParty: async (name, level, primaryMood) => {
+      const levelStr = DJ_LEVEL_TO_STR[level] || 'balanced';
+      await get().createCloudParty(name, primaryMood, levelStr);
+      await get().startCloudParty();
+    },
+    emergencyFade: async () => {
+      await get().endCloudParty();
+    },
+    approveRequest: async (requestId) => {
+      await get().approveSongRequest(requestId);
+    },
+    rejectRequest: async (requestId) => {
+      await get().rejectSongRequest(requestId);
+    },
+    forceNextRequest: async (requestId) => {
+      await get().approveSongRequest(requestId);
+    },
+    toggleDeckPlay: async () => {},
+    pollTelemetry: async () => {},
+  };
+});

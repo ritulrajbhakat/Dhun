@@ -230,3 +230,87 @@ pub struct SyncStatusOverview {
     pub failed_count: usize,
 }
 
+// ========================================================================
+// Cloud Party Foundation Models (Phase 1)
+// ========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudParty {
+    pub id: String,
+    pub party_name: String,
+    pub status: String, // 'created', 'live', 'paused', 'ended'
+    pub host_token_hash: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub last_heartbeat_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyConfiguration {
+    pub party_id: String,
+    pub dj_level: String, // 'hands_off', 'balanced', 'curated', 'manual'
+    pub primary_mood_id: String,
+    pub secondary_mood_id: Option<String>,
+    pub energy_progression: String,
+    pub allow_guest_requests: bool,
+    pub max_requests_per_guest: i32,
+    pub request_cooldown_mins: i32,
+    pub require_host_approval: bool,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartySourceReference {
+    pub id: String,
+    pub party_id: String,
+    pub provider: String,
+    pub original_url: String,
+    pub provider_video_id: String,
+    pub title: String,
+    pub artist: String,
+    pub thumbnail_url: Option<String>,
+    pub duration_seconds: Option<u32>,
+    pub verification_status: String,
+    pub playback_method: String,
+    pub playability_status: String,
+    pub metadata_status: String,
+    pub error_reason: Option<String>,
+    pub registered_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyGuest {
+    pub id: String,
+    pub party_id: String,
+    pub nickname: String,
+    pub fingerprint: String,
+    pub token_hash: String,
+    pub client_ip: String,
+    pub request_count: i32,
+    pub is_blocked: bool,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartySongRequest {
+    pub id: String,
+    pub party_id: String,
+    pub guest_id: String,
+    pub guest_name: Option<String>,
+    pub source_id: String,
+    pub source_title: Option<String>,
+    pub source_artist: Option<String>,
+    pub thumbnail_url: Option<String>,
+    pub custom_note: Option<String>,
+    pub status: String, // 'pending', 'approved', 'rejected', 'played', 'cancelled'
+    pub rejection_reason: Option<String>,
+    pub priority_score: f64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+

@@ -111,3 +111,95 @@ export interface AudioDeviceInfo {
   channels: number;
 }
 
+// ========================================================================
+// Cloud Party Foundation Types (Phase 1)
+// ========================================================================
+
+export interface CloudParty {
+  id: string;
+  party_name: string;
+  status: 'created' | 'live' | 'paused' | 'ended';
+  created_at: number;
+  updated_at: number;
+  started_at?: number;
+  ended_at?: number;
+  last_heartbeat_at: number;
+}
+
+export interface PartyConfiguration {
+  party_id: string;
+  dj_level: string; // 'hands_off' | 'balanced' | 'curated' | 'manual'
+  primary_mood_id: string;
+  secondary_mood_id?: string;
+  energy_progression: string;
+  allow_guest_requests: boolean;
+  max_requests_per_guest: number;
+  request_cooldown_mins: number;
+  require_host_approval: boolean;
+  updated_at: number;
+}
+
+export interface PartySourceReference {
+  id: string;
+  party_id: string;
+  provider: string; // 'youtube' | 'youtube_music'
+  original_url: string;
+  provider_video_id: string;
+  title: string;
+  artist: string;
+  thumbnail_url?: string;
+  duration_seconds?: number;
+  verification_status: string;
+  playback_method: string;
+  playability_status: string; // 'playback_unverified' | 'playable' | 'unavailable'
+  metadata_status: string;
+  error_reason?: string;
+  registered_at: number;
+  updated_at: number;
+}
+
+export interface PartySongRequest {
+  id: string;
+  party_id: string;
+  guest_id: string;
+  guest_name?: string;
+  source_id: string;
+  source_title?: string;
+  source_artist?: string;
+  thumbnail_url?: string;
+  custom_note?: string;
+  status: 'pending' | 'approved' | 'rejected' | 'played' | 'cancelled';
+  rejection_reason?: string;
+  priority_score: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreatePartyResponse {
+  party_id: string;
+  party_name: string;
+  status: 'created' | 'live' | 'paused' | 'ended';
+  host_token: string;
+  guest_url: string;
+  qr_svg: string;
+  config: PartyConfiguration;
+  created_at: number;
+}
+
+export interface PartyDetailsResponse {
+  party: CloudParty;
+  config?: PartyConfiguration;
+  guest_url: string;
+  qr_svg: string;
+  sources_count: number;
+  pending_requests_count: number;
+}
+
+export interface PartyEventMessage {
+  party_id: string;
+  event_type: string;
+  payload: any;
+  timestamp: number;
+}
+
+

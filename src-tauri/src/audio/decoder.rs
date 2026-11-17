@@ -56,6 +56,27 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         .make(&track.codec_params, &dec_opts)
         .map_err(|e| anyhow!("Failed to instantiate codec: {}", e))?;
 
+    // Check container metadata for declared duration tags (ID3 TLEN, Vorbis DURATION, etc.)
+    let mut metadata_declared_frames: Option<usize> = None;
+    if let Some(metadata) = format.metadata().current() {
+        for tag in metadata.tags() {
+            let key = tag.key.to_uppercase();
+            if key == "TLEN" || key == "DURATION" || key == "LENGTH" {
+                let val_str = tag.value.to_string();
+                if let Ok(num) = val_str.trim().parse::<f64>() {
+                    if num > 0.0 {
+                        let ms = if num > 1000.0 { num } else { num * 1000.0 };
+                        let frames = (ms / 1000.0 * sample_rate as f64).round() as usize;
+                        if frames > 0 {
+                            metadata_declared_frames = Some(frames);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut interleaved = Vec::with_capacity(sample_rate as usize * 60 * 2); // Initial pre-allocation for ~1 min stereo
     let max_samples = (sample_rate as usize * 60 * MAX_DECODED_AUDIO_MINUTES as usize) * 2;
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
@@ -74,8 +95,13 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                let err_str = e.to_string();
+                if err_str.contains("failed to fill whole buffer") || err_str.contains("unexpected end of file") {
+                    fatal_error = Some(format!("Premature stream truncation: incomplete packet header/payload read ({})", e));
+                    break;
+                }
                 clean_eof = true;
-                break; // Clean EOF
+                break; // Clean EOF at packet boundary
             }
             Err(SymphoniaError::ResetRequired) => {
                 decoder.reset();
@@ -94,7 +120,10 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 consecutive_decode_errors = 0;
-                append_audio_buffer(&decoded, &mut sample_buf, &mut interleaved);
+                if let Err(e) = downmix_audio_buffer(&decoded, &mut sample_buf, &mut interleaved) {
+                    fatal_error = Some(format!("Channel downmixing error: {}", e));
+                    break;
+                }
             }
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 fatal_error = Some(format!("Decoder payload truncated mid-frame: {}", e));
@@ -143,12 +172,13 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         ));
     }
 
-    // 2. Validate decoded frame count against declared container frame count (with 15% tolerance for VBR container headers)
-    if let Some(declared_frames) = declared_n_frames {
-        if declared_frames > 0 && total_frames < (declared_frames as usize * 85 / 100) {
+    // 2. Validate decoded frame count against declared container frame count or metadata duration tags (85% tolerance)
+    let expected_frames_opt = declared_n_frames.map(|f| f as usize).or(metadata_declared_frames);
+    if let Some(expected_frames) = expected_frames_opt {
+        if expected_frames > 0 && total_frames < (expected_frames * 85 / 100) {
             return Err(anyhow!(
-                "Premature stream truncation: decoded {} frames, but container declared {} frames",
-                total_frames, declared_frames
+                "Premature stream truncation: decoded {} frames, but container/metadata declared {} frames",
+                total_frames, expected_frames
             ));
         }
     }
@@ -165,15 +195,15 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
 
 /// Robust conversion of any Symphonia sample format (U8, S16, S24, S32, F32, F64)
 /// with universal calibrated ITU-R BS.775 layout-aware downmixing/upmixing into standardized stereo [L, R]
-fn append_audio_buffer(
+pub fn downmix_audio_buffer(
     buf_ref: &AudioBufferRef,
     sample_buf: &mut Option<SampleBuffer<f32>>,
     out: &mut Vec<f32>,
-) {
+) -> Result<()> {
     let num_channels = buf_ref.spec().channels.count();
     let num_frames = buf_ref.frames();
     if num_frames == 0 || num_channels == 0 {
-        return;
+        return Ok(());
     }
 
     // Reuse or create the SampleBuffer<f32> converter
@@ -192,7 +222,7 @@ fn append_audio_buffer(
             out.push(sample);
             out.push(sample);
         }
-        return;
+        return Ok(());
     }
 
     let channels = buf_ref.spec().channels;
@@ -204,7 +234,7 @@ fn append_audio_buffer(
         // Direct stereo [L, R]
         let total_samples = num_frames * 2;
         out.extend_from_slice(&raw_samples[..total_samples.min(raw_samples.len())]);
-        return;
+        return Ok(());
     }
 
     // Layout-aware channel mapping: inspect the declared Channels bitflags to find exact channel positions
@@ -216,6 +246,7 @@ fn append_audio_buffer(
     let mut surround_right_idx = None;
     let mut rear_left_idx = None;
     let mut rear_right_idx = None;
+    let mut rear_center_idx = None;
 
     for (idx, ch) in channels.iter().enumerate() {
         if ch.contains(symphonia::core::audio::Channels::FRONT_LEFT) {
@@ -243,20 +274,41 @@ fn append_audio_buffer(
                 rear_right_idx = Some(idx);
             }
         } else if ch.contains(symphonia::core::audio::Channels::REAR_CENTRE) {
-            if center_idx.is_none() {
-                center_idx = Some(idx);
-            }
+            rear_center_idx = Some(idx);
         }
     }
 
-    let l_i = left_idx.unwrap_or(0);
-    let r_i = right_idx.unwrap_or(1.min(num_channels - 1));
+    // Enforce mandatory front-left and front-right channels
+    let (Some(l_i), Some(r_i)) = (left_idx, right_idx) else {
+        return Err(anyhow!(
+            "Unsupported multichannel layout: stream missing mandatory front-left or front-right channels ({:?})",
+            channels
+        ));
+    };
+
+    // Explicitly reject unrecognized channel layouts rather than silently dropping audio channels
+    let recognized_count = [
+        left_idx, right_idx, center_idx, lfe_idx,
+        surround_left_idx, surround_right_idx,
+        rear_left_idx, rear_right_idx, rear_center_idx,
+    ]
+    .iter()
+    .filter(|o| o.is_some())
+    .count();
+
+    if recognized_count != num_channels {
+        return Err(anyhow!(
+            "Unsupported multichannel layout: stream contains unrecognized channel configuration (recognized {} of {} channels in {:?})",
+            recognized_count, num_channels, channels
+        ));
+    }
 
     // Dynamic normalization factor based on present channel components to prevent digital clipping
     let mut max_sum = 1.0f32;
     if center_idx.is_some() { max_sum += 0.7071; }
     if surround_left_idx.is_some() || surround_right_idx.is_some() { max_sum += 0.7071; }
     if rear_left_idx.is_some() || rear_right_idx.is_some() { max_sum += 0.5000; }
+    if rear_center_idx.is_some() { max_sum += 0.5000; }
     if lfe_idx.is_some() { max_sum += 0.5000; }
     let norm = 1.0f32 / max_sum;
 
@@ -271,12 +323,15 @@ fn append_audio_buffer(
         let rs_val = surround_right_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.7071;
         let lb_val = rear_left_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.5000;
         let rb_val = rear_right_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.5000;
+        let rc_val = rear_center_idx.and_then(|idx| raw_samples.get(base + idx)).copied().unwrap_or(0.0) * 0.5000;
 
-        let mixed_l = ((l_val + c_val + ls_val + lb_val + lfe_val) * norm).clamp(-1.0, 1.0);
-        let mixed_r = ((r_val + c_val + rs_val + rb_val + lfe_val) * norm).clamp(-1.0, 1.0);
+        let mixed_l = ((l_val + c_val + ls_val + lb_val + rc_val + lfe_val) * norm).clamp(-1.0, 1.0);
+        let mixed_r = ((r_val + c_val + rs_val + rb_val + rc_val + lfe_val) * norm).clamp(-1.0, 1.0);
 
         out.push(mixed_l);
         out.push(mixed_r);
     }
+
+    Ok(())
 }
 

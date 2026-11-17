@@ -2061,5 +2061,490 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn test_youtube_url_parsing_and_security_validation() {
+        use dhun_lib::library::sources::{parse_youtube_url, MusicSourceProvider};
+
+        // 1. Valid Standard YouTube Watch URL
+        let res = parse_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+        assert_eq!(res.provider, MusicSourceProvider::YouTube);
+        assert_eq!(res.video_id, "dQw4w9WgXcQ");
+        assert_eq!(res.canonical_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+
+        // 2. Valid YouTube URL with additional query parameters (timestamps, playlists)
+        let res2 = parse_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s&list=PL12345").unwrap();
+        assert_eq!(res2.provider, MusicSourceProvider::YouTube);
+        assert_eq!(res2.video_id, "dQw4w9WgXcQ");
+
+        // 3. Valid Short URL (youtu.be)
+        let res3 = parse_youtube_url("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        assert_eq!(res3.provider, MusicSourceProvider::YouTube);
+        assert_eq!(res3.video_id, "dQw4w9WgXcQ");
+
+        // 4. Valid YouTube Music URL
+        let res4 = parse_youtube_url("https://music.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+        assert_eq!(res4.provider, MusicSourceProvider::YouTubeMusic);
+        assert_eq!(res4.video_id, "dQw4w9WgXcQ");
+
+        // 5. Valid Embed URL
+        let res5 = parse_youtube_url("https://youtube.com/embed/dQw4w9WgXcQ").unwrap();
+        assert_eq!(res5.provider, MusicSourceProvider::YouTube);
+        assert_eq!(res5.video_id, "dQw4w9WgXcQ");
+
+        // 6. Security Rejections: Unauthorized Domains
+        assert!(parse_youtube_url("https://vimeo.com/12345678901").is_err());
+        assert!(parse_youtube_url("https://attacker.com/watch?v=dQw4w9WgXcQ").is_err());
+        assert!(parse_youtube_url("https://not-youtube.com/watch?v=dQw4w9WgXcQ").is_err());
+
+        // 7. Security Rejections: Invalid Schemes
+        assert!(parse_youtube_url("ftp://youtube.com/watch?v=dQw4w9WgXcQ").is_err());
+        assert!(parse_youtube_url("file:///etc/passwd").is_err());
+        assert!(parse_youtube_url("javascript:alert(1)").is_err());
+
+        // 8. Security Rejections: Malformed Video IDs (not 11 chars or containing illegal characters)
+        assert!(parse_youtube_url("https://www.youtube.com/watch?v=short").is_err());
+        assert!(parse_youtube_url("https://www.youtube.com/watch?v=toolongvideoid1234").is_err());
+        assert!(parse_youtube_url("https://www.youtube.com/watch?v=invalid<char>").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cloud_party_lifecycle_and_db_persistence() {
+        let db = Database::new_in_memory().expect("Failed to initialize DB");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let party = CloudParty {
+            id: "pty_test123".to_string(),
+            party_name: "Aman Sangeet Night".to_string(),
+            status: "created".to_string(),
+            host_token_hash: "hash_test_token_456".to_string(),
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            ended_at: None,
+            last_heartbeat_at: now,
+        };
+
+        let config = PartyConfiguration {
+            party_id: "pty_test123".to_string(),
+            dj_level: "balanced".to_string(),
+            primary_mood_id: "sangeet".to_string(),
+            secondary_mood_id: Some("punjabi_tashan".to_string()),
+            energy_progression: "buildup".to_string(),
+            allow_guest_requests: true,
+            max_requests_per_guest: 4,
+            request_cooldown_mins: 10,
+            require_host_approval: true,
+            updated_at: now,
+        };
+
+        // 1. Create Party and Config
+        db.create_cloud_party(&party, &config).expect("Failed to create party");
+
+        // 2. Retrieve Party
+        let retrieved = db.get_cloud_party("pty_test123").unwrap().expect("Party should exist");
+        assert_eq!(retrieved.party_name, "Aman Sangeet Night");
+        assert_eq!(retrieved.status, "created");
+        assert_eq!(retrieved.host_token_hash, "hash_test_token_456");
+
+        let retrieved_config = db.get_party_config("pty_test123").unwrap().expect("Config should exist");
+        assert_eq!(retrieved_config.primary_mood_id, "sangeet");
+        assert_eq!(retrieved_config.max_requests_per_guest, 4);
+
+        // 3. Update Status to Live
+        let live_time = now + 5000;
+        db.update_cloud_party_status("pty_test123", "live", live_time).expect("Failed to start party");
+        let live_party = db.get_cloud_party("pty_test123").unwrap().unwrap();
+        assert_eq!(live_party.status, "live");
+        assert_eq!(live_party.started_at, Some(live_time));
+
+        // 4. Update Heartbeat
+        let hb_time = live_time + 10000;
+        db.update_party_heartbeat("pty_test123", hb_time).expect("Failed to update heartbeat");
+        let hb_party = db.get_cloud_party("pty_test123").unwrap().unwrap();
+        assert_eq!(hb_party.last_heartbeat_at, hb_time);
+
+        // 5. Update Status to Ended
+        let end_time = hb_time + 5000;
+        db.update_cloud_party_status("pty_test123", "ended", end_time).expect("Failed to end party");
+        let ended_party = db.get_cloud_party("pty_test123").unwrap().unwrap();
+        assert_eq!(ended_party.status, "ended");
+        assert_eq!(ended_party.ended_at, Some(end_time));
+    }
+
+    #[tokio::test]
+    async fn test_cloud_source_registration_and_playability_status() {
+        let db = Database::new_in_memory().expect("Failed to initialize DB");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // Create party first
+        let party = CloudParty {
+            id: "pty_src_test".to_string(),
+            party_name: "Source Test Party".to_string(),
+            status: "live".to_string(),
+            host_token_hash: "hash123".to_string(),
+            created_at: now,
+            updated_at: now,
+            started_at: Some(now),
+            ended_at: None,
+            last_heartbeat_at: now,
+        };
+        let config = PartyConfiguration {
+            party_id: "pty_src_test".to_string(),
+            dj_level: "balanced".to_string(),
+            primary_mood_id: "house_party".to_string(),
+            secondary_mood_id: None,
+            energy_progression: "buildup".to_string(),
+            allow_guest_requests: true,
+            max_requests_per_guest: 3,
+            request_cooldown_mins: 10,
+            require_host_approval: true,
+            updated_at: now,
+        };
+        db.create_cloud_party(&party, &config).unwrap();
+
+        // Register YouTube Source
+        let source = PartySourceReference {
+            id: "src_001".to_string(),
+            party_id: "pty_src_test".to_string(),
+            provider: "youtube".to_string(),
+            original_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            provider_video_id: "dQw4w9WgXcQ".to_string(),
+            title: "Never Gonna Give You Up".to_string(),
+            artist: "Rick Astley".to_string(),
+            thumbnail_url: Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".to_string()),
+            duration_seconds: None,
+            verification_status: "verified".to_string(),
+            playback_method: "youtube_iframe_embed".to_string(),
+            playability_status: "playback_unverified".to_string(),
+            metadata_status: "fetched".to_string(),
+            error_reason: Some("Queued for Phase 2 YouTube Player embed".to_string()),
+            registered_at: now,
+            updated_at: now,
+        };
+
+        db.insert_party_source(&source).expect("Failed to insert source");
+
+        // Verify lookup by party ID
+        let sources = db.get_party_sources("pty_src_test").unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].title, "Never Gonna Give You Up");
+        assert_eq!(sources[0].playability_status, "playback_unverified");
+        assert_eq!(sources[0].playback_method, "youtube_iframe_embed");
+
+        // Verify lookup by video ID
+        let found = db.get_party_source_by_video_id("pty_src_test", "dQw4w9WgXcQ").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, "src_001");
+    }
+
+    #[tokio::test]
+    async fn test_cloud_guest_authentication_and_privilege_isolation() {
+        let db = Database::new_in_memory().expect("Failed to initialize DB");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // 1. Create Party
+        let party = CloudParty {
+            id: "pty_guest_test".to_string(),
+            party_name: "Guest Test Party".to_string(),
+            status: "live".to_string(),
+            host_token_hash: "hash_host_token_abc".to_string(),
+            created_at: now,
+            updated_at: now,
+            started_at: Some(now),
+            ended_at: None,
+            last_heartbeat_at: now,
+        };
+        let config = PartyConfiguration {
+            party_id: "pty_guest_test".to_string(),
+            dj_level: "balanced".to_string(),
+            primary_mood_id: "house_party".to_string(),
+            secondary_mood_id: None,
+            energy_progression: "buildup".to_string(),
+            allow_guest_requests: true,
+            max_requests_per_guest: 2,
+            request_cooldown_mins: 10,
+            require_host_approval: true,
+            updated_at: now,
+        };
+        db.create_cloud_party(&party, &config).unwrap();
+
+        // 2. Register Source
+        let source = PartySourceReference {
+            id: "src_yt_100".to_string(),
+            party_id: "pty_guest_test".to_string(),
+            provider: "youtube".to_string(),
+            original_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            provider_video_id: "dQw4w9WgXcQ".to_string(),
+            title: "Kala Chashma".to_string(),
+            artist: "Badshah".to_string(),
+            thumbnail_url: None,
+            duration_seconds: None,
+            verification_status: "verified".to_string(),
+            playback_method: "youtube_iframe_embed".to_string(),
+            playability_status: "playback_unverified".to_string(),
+            metadata_status: "fetched".to_string(),
+            error_reason: None,
+            registered_at: now,
+            updated_at: now,
+        };
+        db.insert_party_source(&source).unwrap();
+
+        // 3. Register Guest
+        use sha2::{Digest, Sha256};
+        let guest_token = "dhun_guest_secret_123";
+        let mut hasher = Sha256::new();
+        hasher.update(guest_token.as_bytes());
+        let token_hash = format!("{:x}", hasher.finalize());
+
+        let guest = PartyGuest {
+            id: "gst_001".to_string(),
+            party_id: "pty_guest_test".to_string(),
+            nickname: "Rahul".to_string(),
+            fingerprint: "client_fp_xyz".to_string(),
+            token_hash: token_hash.clone(),
+            client_ip: "192.168.1.15".to_string(),
+            request_count: 0,
+            is_blocked: false,
+            created_at: now,
+            last_seen_at: now,
+        };
+        db.register_party_guest(&guest).unwrap();
+
+        // 4. Verify Guest Token Lookup
+        let found_guest = db.lookup_party_guest_by_token("pty_guest_test", &token_hash).unwrap();
+        assert!(found_guest.is_some());
+        assert_eq!(found_guest.as_ref().unwrap().nickname, "Rahul");
+
+        // Verify invalid token fails lookup
+        let invalid_lookup = db.lookup_party_guest_by_token("pty_guest_test", "wrong_hash").unwrap();
+        assert!(invalid_lookup.is_none());
+
+        // 5. Submit Song Request
+        let req = PartySongRequest {
+            id: "req_001".to_string(),
+            party_id: "pty_guest_test".to_string(),
+            guest_id: "gst_001".to_string(),
+            guest_name: Some("Rahul".to_string()),
+            source_id: "src_yt_100".to_string(),
+            source_title: Some("Kala Chashma".to_string()),
+            source_artist: Some("Badshah".to_string()),
+            thumbnail_url: None,
+            custom_note: Some("Play this for the bride!".to_string()),
+            status: "pending".to_string(),
+            rejection_reason: None,
+            priority_score: 100.0,
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_party_song_request(&req).unwrap();
+
+        let requests = db.get_party_song_requests("pty_guest_test").unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].status, "pending");
+        assert_eq!(requests[0].guest_name.as_deref(), Some("Rahul"));
+
+        // 6. Host Approves Request
+        db.update_party_request_status("req_001", "pty_guest_test", "approved", None, "host", "host_admin")
+            .expect("Failed to approve request");
+
+        let updated_requests = db.get_party_song_requests("pty_guest_test").unwrap();
+        assert_eq!(updated_requests[0].status, "approved");
+
+        // 7. Host Rejects Request
+        db.update_party_request_status("req_001", "pty_guest_test", "rejected", Some("Not suitable for dinner time"), "host", "host_admin")
+            .expect("Failed to reject request");
+
+        let rejected_requests = db.get_party_song_requests("pty_guest_test").unwrap();
+        assert_eq!(rejected_requests[0].status, "rejected");
+        assert_eq!(rejected_requests[0].rejection_reason.as_deref(), Some("Not suitable for dinner time"));
+    }
+
+    #[tokio::test]
+    async fn test_cloud_http_api_full_lifecycle_end_to_end() {
+        use axum::extract::{ConnectInfo, Path, State};
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use axum::Json;
+        use dhun_lib::network::cloud_routes::{
+            approve_request, create_party, create_request, end_party, guest_auth, health_check,
+            list_requests, list_sources, register_source, start_party, CloudServerState,
+            CreatePartyRequest, CreateSongRequestPayload, GuestAuthRequest, RegisterSourceRequest,
+        };
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        let db = Database::new_in_memory().expect("Failed to init DB");
+        let state = Arc::new(CloudServerState::new(
+            db,
+            "https://ritulrajbhakat.github.io/Dhun".to_string(),
+            "*".to_string(),
+        ));
+        let mut ws_rx = state.ws_broadcaster.subscribe();
+        let client_addr: SocketAddr = "127.0.0.1:45000".parse().unwrap();
+
+        // 1. Health Check
+        let Json(health_json) = health_check().await;
+        assert_eq!(health_json["status"], "ok");
+        assert_eq!(health_json["service"], "dhun-server");
+
+        // 2. Create Party
+        let Json(created) = create_party(
+            State(state.clone()),
+            Json(CreatePartyRequest {
+                party_name: "E2E Cloud Test Party".to_string(),
+                dj_level: Some("balanced".to_string()),
+                primary_mood_id: Some("shaadi".to_string()),
+                secondary_mood_id: None,
+                energy_progression: Some("buildup".to_string()),
+                allow_guest_requests: Some(true),
+                max_requests_per_guest: Some(5),
+            }),
+        )
+        .await
+        .expect("Create party must succeed");
+
+        let party_id = created.party_id.clone();
+        let host_token = created.host_token.clone();
+        assert_eq!(created.status, "created");
+        assert!(created.qr_svg.contains("<svg"));
+        assert!(created.guest_url.contains(&party_id));
+
+        // 3. Unauthenticated start must fail with 401
+        let unauth_start = start_party(
+            State(state.clone()),
+            Path(party_id.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(unauth_start.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // 4. Host starts party & broadcasts WebSocket event
+        let mut host_headers = HeaderMap::new();
+        host_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", host_token)).unwrap(),
+        );
+
+        let Json(started) = start_party(
+            State(state.clone()),
+            Path(party_id.clone()),
+            host_headers.clone(),
+        )
+        .await
+        .expect("Host start must succeed");
+        assert_eq!(started.status, "live");
+
+        let ws_evt = ws_rx.try_recv().expect("WebSocket broadcast expected on party start");
+        assert_eq!(ws_evt.event_type, "party.status_changed");
+        assert_eq!(ws_evt.payload["status"], "live");
+
+        // 5. Register valid YouTube source
+        let Json(source) = register_source(
+            State(state.clone()),
+            Path(party_id.clone()),
+            host_headers.clone(),
+            Json(RegisterSourceRequest {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            }),
+        )
+        .await
+        .expect("Valid YouTube link must register");
+
+        assert_eq!(source.provider, "youtube");
+        assert_eq!(source.provider_video_id, "dQw4w9WgXcQ");
+        assert_eq!(source.playability_status, "playback_unverified");
+        assert_eq!(source.playback_method, "youtube_iframe_embed");
+
+        let Json(all_sources) = list_sources(State(state.clone()), Path(party_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(all_sources.len(), 1);
+
+        // 6. Reject unauthorized non-YouTube domain with 400 Bad Request
+        let bad_src_res = register_source(
+            State(state.clone()),
+            Path(party_id.clone()),
+            host_headers.clone(),
+            Json(RegisterSourceRequest {
+                url: "https://vimeo.com/12345678901".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(bad_src_res.unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        // 7. Guest Auth & Request Submission
+        let Json(guest) = guest_auth(
+            State(state.clone()),
+            Path(party_id.clone()),
+            ConnectInfo(client_addr),
+            Json(GuestAuthRequest {
+                nickname: "Aarav".to_string(),
+                fingerprint: Some("mobile_browser_1".to_string()),
+            }),
+        )
+        .await
+        .expect("Guest auth must succeed");
+
+        let mut guest_headers = HeaderMap::new();
+        guest_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", guest.token)).unwrap(),
+        );
+
+        let Json(req) = create_request(
+            State(state.clone()),
+            Path(party_id.clone()),
+            guest_headers.clone(),
+            ConnectInfo(client_addr),
+            Json(CreateSongRequestPayload {
+                source_id: source.id.clone(),
+                custom_note: Some("Dance floor banger!".to_string()),
+            }),
+        )
+        .await
+        .expect("Guest request submission must succeed");
+        assert_eq!(req.status, "pending");
+
+        // 8. Privilege separation: Guest token MUST be rejected with 403 on host approve endpoint
+        let guest_approve_attempt = approve_request(
+            State(state.clone()),
+            Path((party_id.clone(), req.id.clone())),
+            guest_headers.clone(),
+        )
+        .await;
+        assert_eq!(guest_approve_attempt.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // 9. Host approves request & verifies list
+        let Json(approved) = approve_request(
+            State(state.clone()),
+            Path((party_id.clone(), req.id.clone())),
+            host_headers.clone(),
+        )
+        .await
+        .expect("Host approve must succeed");
+        assert_eq!(approved["status"], "approved");
+
+        let Json(host_requests) = list_requests(
+            State(state.clone()),
+            Path(party_id.clone()),
+            host_headers.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(host_requests.len(), 1);
+        assert_eq!(host_requests[0].status, "approved");
+        assert_eq!(host_requests[0].guest_name.as_deref(), Some("Aarav"));
+
+        // 10. Host ends party
+        let Json(ended) = end_party(
+            State(state.clone()),
+            Path(party_id.clone()),
+            host_headers,
+        )
+        .await
+        .expect("Host end must succeed");
+        assert_eq!(ended.status, "ended");
+    }
 }
+
 

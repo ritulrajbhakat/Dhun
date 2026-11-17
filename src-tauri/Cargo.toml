@@ -9,6 +9,14 @@ edition = "2021"
 name = "dhun_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "dhun-backend"
+path = "src/main.rs"
+
+[[bin]]
+name = "dhun-server"
+path = "src/bin/server.rs"
+
 [dependencies]
 tauri = { version = "2.0.0", features = [] }
 serde = { version = "1.0", features = ["derive"] }

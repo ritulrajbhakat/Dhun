@@ -76,6 +76,136 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         info!("Migration v2 applied successfully.");
     }
 
+    if current_version < 3 {
+        info!("Applying DHUN schema migration v3 (Cloud Party foundation & YouTube sources)...");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS parties (
+                id TEXT PRIMARY KEY NOT NULL,
+                party_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'created',
+                host_token_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                last_heartbeat_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_parties_status ON parties(status);
+
+            CREATE TABLE IF NOT EXISTS party_configurations (
+                party_id TEXT PRIMARY KEY NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+                dj_level TEXT NOT NULL DEFAULT 'balanced',
+                primary_mood_id TEXT NOT NULL DEFAULT 'house_party',
+                secondary_mood_id TEXT,
+                energy_progression TEXT NOT NULL DEFAULT 'buildup',
+                allow_guest_requests INTEGER NOT NULL DEFAULT 1,
+                max_requests_per_guest INTEGER NOT NULL DEFAULT 3,
+                request_cooldown_mins INTEGER NOT NULL DEFAULT 10,
+                require_host_approval INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS party_source_references (
+                id TEXT PRIMARY KEY NOT NULL,
+                party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+                provider TEXT NOT NULL,
+                original_url TEXT NOT NULL,
+                provider_video_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                thumbnail_url TEXT,
+                duration_seconds INTEGER,
+                verification_status TEXT NOT NULL DEFAULT 'verified',
+                playback_method TEXT NOT NULL DEFAULT 'youtube_iframe_embed',
+                playability_status TEXT NOT NULL DEFAULT 'playback_unverified',
+                metadata_status TEXT NOT NULL DEFAULT 'fetched',
+                error_reason TEXT,
+                registered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_party_sources_party ON party_source_references(party_id);
+            CREATE INDEX IF NOT EXISTS idx_party_sources_video_id ON party_source_references(party_id, provider_video_id);
+
+            CREATE TABLE IF NOT EXISTS party_guests (
+                id TEXT PRIMARY KEY NOT NULL,
+                party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+                nickname TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                client_ip TEXT NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_party_guests_lookup ON party_guests(party_id, token_hash);
+
+            CREATE TABLE IF NOT EXISTS party_song_requests (
+                id TEXT PRIMARY KEY NOT NULL,
+                party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+                guest_id TEXT NOT NULL REFERENCES party_guests(id) ON DELETE CASCADE,
+                source_id TEXT NOT NULL REFERENCES party_source_references(id) ON DELETE CASCADE,
+                custom_note TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                rejection_reason TEXT,
+                priority_score REAL NOT NULL DEFAULT 0.0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_party_requests_party_status ON party_song_requests(party_id, status);
+
+            CREATE TABLE IF NOT EXISTS request_status_history (
+                id TEXT PRIMARY KEY NOT NULL,
+                request_id TEXT NOT NULL REFERENCES party_song_requests(id) ON DELETE CASCADE,
+                from_status TEXT NOT NULL,
+                to_status TEXT NOT NULL,
+                actor_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_req_history_request ON request_status_history(request_id);
+
+            CREATE TABLE IF NOT EXISTS shared_track_metadata (
+                provider_video_id TEXT PRIMARY KEY NOT NULL,
+                provider TEXT NOT NULL,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                thumbnail_url TEXT,
+                duration_seconds INTEGER,
+                cached_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS playback_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                track_id TEXT,
+                payload_json TEXT,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_playback_events_party ON playback_events(party_id);
+
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id TEXT PRIMARY KEY NOT NULL,
+                party_id TEXT NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                details_json TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_events_party ON audit_events(party_id);
+            ",
+        )?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at, description) VALUES (3, ?1, 'Added Cloud Party foundation, YouTube sources, and guest request tables')",
+            params![now],
+        )?;
+        info!("Migration v3 applied successfully.");
+    }
+
     Ok(())
 }
 

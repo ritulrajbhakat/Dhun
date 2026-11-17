@@ -14,16 +14,14 @@ import {
 } from 'lucide-react';
 
 export const WizardScreen: React.FC = () => {
-  const { moodProfiles, audioDevices, startParty } = useDhunStore();
+  const { moodProfiles, startParty } = useDhunStore();
 
   const [step, setStep] = useState<number>(1);
   const [partyName, setPartyName] = useState('My Wedding Sangeet');
   const [djLevel, setDjLevel] = useState<number>(2);
   const [primaryMood, setPrimaryMood] = useState('shaadi');
   const [secondaryMood, setSecondaryMood] = useState<string | undefined>('punjabi_tashan');
-  const [outputDevice, setOutputDevice] = useState(
-    audioDevices[0]?.name || 'Speakers / Headphones (Realtek Audio)'
-  );
+  const [outputDevice] = useState('Host Browser Audio Output');
   const [requireApproval, setRequireApproval] = useState(true);
   const [maxRequests, setMaxRequests] = useState(3);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -54,7 +52,7 @@ export const WizardScreen: React.FC = () => {
   const handleLaunchParty = async () => {
     setIsSubmitting(true);
     try {
-      await startParty(partyName, djLevel, primaryMood, secondaryMood, outputDevice);
+      await startParty(partyName, djLevel, primaryMood, secondaryMood);
     } catch (err) {
       console.error(err);
     } finally {
@@ -207,43 +205,30 @@ export const WizardScreen: React.FC = () => {
           </div>
         )}
 
-        {/* Step 4: Audio Hardware Output */}
+        {/* Step 4: Host Browser Speaker Output */}
         {step === 4 && (
           <div className="space-y-4 animate-in fade-in duration-200">
             <div>
-              <h2 className="text-lg font-bold text-white">Audio Output &amp; Hardware Settings</h2>
-              <p className="text-xs text-slate-400">Direct low-latency output through dedicated CPAL audio engine.</p>
+              <h2 className="text-lg font-bold text-white">Host Laptop Audio Output</h2>
+              <p className="text-xs text-slate-400">
+                DHUN plays through your laptop browser&rsquo;s default system audio output (speakers, Bluetooth, or USB DJ interface). Guests do not stream party audio.
+              </p>
             </div>
 
             <div className="space-y-3">
-              <label className="text-xs font-semibold text-slate-300 block uppercase tracking-wider">Output Soundcard / Interface</label>
-              <div className="space-y-2">
-                {audioDevices.map((dev) => (
-                  <div
-                    key={dev.name}
-                    onClick={() => setOutputDevice(dev.name)}
-                    className={`p-4 rounded-xl border flex items-center justify-between cursor-pointer transition-all ${
-                      outputDevice === dev.name
-                        ? 'bg-rose-950/20 border-dhun-primary text-white'
-                        : 'bg-dhun-card border-dhun-border text-slate-300 hover:border-slate-600'
-                    }`}
-                  >
-                    <div className="flex items-center space-x-3">
-                      <Volume2 className="w-5 h-5 text-dhun-accent" />
-                      <div>
-                        <div className="text-sm font-bold">{dev.name}</div>
-                        <div className="text-xs text-slate-400 font-mono">
-                          {dev.default_sample_rate} Hz &bull; {dev.channels} channels &bull; ~11.6ms latency
-                        </div>
-                      </div>
+              <div className="p-4 rounded-xl border bg-rose-950/20 border-dhun-primary text-white flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  <Volume2 className="w-5 h-5 text-dhun-accent" />
+                  <div>
+                    <div className="text-sm font-bold">{outputDevice}</div>
+                    <div className="text-xs text-slate-400 font-mono">
+                      Managed by Host OS &bull; Prepared for Phase 2 YouTube IFrame Player
                     </div>
-                    {outputDevice === dev.name && (
-                      <div className="w-5 h-5 rounded-full bg-dhun-primary text-white flex items-center justify-center text-xs font-bold">
-                        <Check className="w-3.5 h-3.5" />
-                      </div>
-                    )}
                   </div>
-                ))}
+                </div>
+                <div className="w-5 h-5 rounded-full bg-dhun-primary text-white flex items-center justify-center text-xs font-bold">
+                  <Check className="w-3.5 h-3.5" />
+                </div>
               </div>
             </div>
           </div>

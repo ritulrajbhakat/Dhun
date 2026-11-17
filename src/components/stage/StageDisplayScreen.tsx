@@ -2,29 +2,30 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useDhunStore } from '../../store/useDhunStore';
 import { StageVisualFxCanvas, FX_NAMES } from './StageVisualFxCanvas';
 import { AnimatedDjCharacter } from './AnimatedDjCharacter';
-import { webAudioEngine } from '../../audio/WebAudioEngine';
-import { generateQrSvg } from '../../utils/qr';
-import { isTauri, apiDeckControl } from '../../api/ipc';
 import {
   Play,
-  Pause,
-  SkipForward,
-  SkipBack,
-  Volume2,
+  Square,
   Sliders,
   Music,
   Disc3,
   AlertTriangle,
-  FolderOpen,
+  Link2,
   Check,
   X,
-  Settings,
   Sparkles,
   Maximize2,
   Minimize2,
+  Radio,
+  Server,
+  RefreshCw,
+  ExternalLink,
+  QrCode,
+  CheckCircle2,
+  AlertCircle,
+  Copy,
 } from 'lucide-react';
 
-const AudioOscilloscopeWaveform: React.FC<{ isPlaying: boolean; bpm: number }> = ({ isPlaying, bpm }) => {
+const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({ isLive, bpm }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
@@ -35,30 +36,28 @@ const AudioOscilloscopeWaveform: React.FC<{ isPlaying: boolean; bpm: number }> =
 
     let animId: number;
     let waveTime = 0;
-    const waveData = new Uint8Array(128);
 
     const draw = () => {
       const w = canvas.width;
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
 
-      webAudioEngine.getWaveformData(waveData);
-      waveTime += 0.05 * (bpm / 128);
+      waveTime += (isLive ? 0.045 : 0.012) * (bpm / 128);
 
       ctx.save();
       ctx.beginPath();
       ctx.lineWidth = 2.5;
-      ctx.strokeStyle = '#2dd4bf'; // teal-400
-      ctx.shadowColor = '#14b8a6';
-      ctx.shadowBlur = 12;
+      ctx.strokeStyle = isLive ? '#2dd4bf' : 'rgba(148, 163, 184, 0.35)';
+      ctx.shadowColor = isLive ? '#14b8a6' : 'transparent';
+      ctx.shadowBlur = isLive ? 12 : 0;
 
       const sliceWidth = w / 64;
       let x = 0;
 
       for (let i = 0; i < 64; i++) {
-        const v = isPlaying ? waveData[i * 2] / 128.0 : 1.0;
-        const synthWobble = isPlaying ? Math.sin(waveTime * 3 + i * 0.18) * 10 : 0;
-        const y = (v * h) / 2 + synthWobble;
+        const envelope = Math.sin((i / 63) * Math.PI);
+        const amp = isLive ? 14 * envelope : 2 * envelope;
+        const y = h / 2 + Math.sin(waveTime * 2.5 + i * 0.22) * amp;
 
         if (i === 0) {
           ctx.moveTo(x, y);
@@ -70,21 +69,21 @@ const AudioOscilloscopeWaveform: React.FC<{ isPlaying: boolean; bpm: number }> =
 
       ctx.stroke();
 
-      // Mirror reflection glow
-      ctx.beginPath();
-      ctx.lineWidth = 1.0;
-      ctx.strokeStyle = 'rgba(45, 212, 191, 0.45)';
-      ctx.shadowBlur = 6;
-      x = 0;
-      for (let i = 0; i < 64; i++) {
-        const v = isPlaying ? waveData[i * 2] / 128.0 : 1.0;
-        const synthWobble = isPlaying ? Math.sin(waveTime * 3 + i * 0.18) * 5 : 0;
-        const y = h / 2 - (v * h / 2 - h / 2) - synthWobble;
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-        x += sliceWidth;
+      if (isLive) {
+        ctx.beginPath();
+        ctx.lineWidth = 1.0;
+        ctx.strokeStyle = 'rgba(45, 212, 191, 0.4)';
+        ctx.shadowBlur = 6;
+        x = 0;
+        for (let i = 0; i < 64; i++) {
+          const envelope = Math.sin((i / 63) * Math.PI);
+          const y = h / 2 - Math.sin(waveTime * 2.5 + i * 0.22) * (8 * envelope);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+          x += sliceWidth;
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
       ctx.restore();
 
       animId = requestAnimationFrame(draw);
@@ -92,102 +91,92 @@ const AudioOscilloscopeWaveform: React.FC<{ isPlaying: boolean; bpm: number }> =
 
     draw();
     return () => cancelAnimationFrame(animId);
-  }, [isPlaying, bpm]);
+  }, [isLive, bpm]);
 
   return (
     <canvas
       ref={canvasRef}
       width={720}
       height={80}
-      className="w-full max-w-2xl h-10 md:h-14 pointer-events-none opacity-90 mt-2 drop-shadow-[0_0_12px_rgba(45,212,191,0.6)]"
+      className="w-full max-w-2xl h-10 md:h-14 pointer-events-none opacity-90 mt-2 drop-shadow-[0_0_12px_rgba(45,212,191,0.5)]"
     />
   );
 };
 
 export const StageDisplayScreen: React.FC = () => {
   const {
-    partyStatus,
-    telemetry,
-    pollTelemetry,
-    startParty,
+    apiBaseUrl,
+    backendConnected,
+    backendVersion,
+    backendError,
+    wsConnected,
+    cloudParty,
+    partyConfig,
+    guestUrl,
+    qrSvg,
+    registeredSources,
+    songRequests,
+    moodProfiles,
+    setApiBaseUrl,
+    checkBackendHealth,
+    createCloudParty,
+    startCloudParty,
+    endCloudParty,
+    clearActiveParty,
+    registerYouTubeSource,
+    approveSongRequest,
+    rejectSongRequest,
     setDjLevel,
     setPartyMood,
-    setMasterVolume,
-    masterVolume,
-    emergencyFade,
-    toggleDeckPlay,
-    forceNextRequest,
-    guestRequests,
-    startBrowserAudio,
-    loadLocalAudioFile,
-    approveRequest,
-    rejectRequest,
-    scanFolder,
   } = useDhunStore();
 
   const [currentFxIndex, setCurrentFxIndex] = useState(0);
   const [autoCycleFx, setAutoCycleFx] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [localIsPlaying, setLocalIsPlaying] = useState(true);
-  const [localCurrentTimeSec, setLocalCurrentTimeSec] = useState(179); // 02:59 initial
-  const [selectedDjType, setSelectedDjType] = useState('Advanced');
-  const [selectedMood, setSelectedMood] = useState('house_party');
-  const [audioActive, setAudioActive] = useState(false);
   const [showHostDrawer, setShowHostDrawer] = useState(false);
-  const [activeDrawerTab, setActiveDrawerTab] = useState<'library' | 'mixer' | 'requests' | 'fx'>('library');
-  const [folderPathInput, setFolderPathInput] = useState('C:/Users/ritul/Music/Celebration_Tracks');
-  const [isScanning, setIsScanning] = useState(false);
+  const [activeDrawerTab, setActiveDrawerTab] = useState<'party' | 'sources' | 'requests' | 'fx'>('party');
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Form States
+  const [apiUrlDraft, setApiUrlDraft] = useState(apiBaseUrl);
+  const [partyNameInput, setPartyNameInput] = useState('DHUN Celebration Party');
+  const [selectedDjType, setSelectedDjType] = useState('Smart');
+  const [selectedMood, setSelectedMood] = useState('house_party');
+  const [youtubeUrlInput, setYoutubeUrlInput] = useState('');
 
-  const activeTrack = partyStatus.now_playing?.track;
-  const activeAnalysis = partyStatus.now_playing?.analysis;
+  // Action feedback states
+  const [isBusy, setIsBusy] = useState(false);
+  const [sourceFeedback, setSourceFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [partyFeedback, setPartyFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [copiedUrl, setCopiedUrl] = useState(false);
 
-  const currentTitle = activeTrack?.title || 'Chaiyya Chaiyya';
-  const currentArtist = activeTrack?.artist || 'Chaiyeyya';
-  const currentBpm = activeAnalysis?.bpm || 128;
-  const currentEnergy = activeAnalysis?.overall_energy || 0.88;
-
-  // Real-time audio playhead synchronization from native engine telemetry
-  const activeDeckTelem = telemetry?.decks?.find((d) => d.is_playing) || telemetry?.decks?.[0];
-  const isPlaying = isTauri && activeDeckTelem ? activeDeckTelem.is_playing : localIsPlaying;
-  const currentDurationSec = isTauri && activeDeckTelem && activeDeckTelem.duration_ms > 0
-    ? Math.floor(activeDeckTelem.duration_ms / 1000)
-    : (activeTrack?.duration_ms ? Math.floor(activeTrack.duration_ms / 1000) : 296);
-  const currentTimeSec = isTauri && activeDeckTelem && activeDeckTelem.duration_ms > 0
-    ? Math.min(currentDurationSec, Math.floor(activeDeckTelem.position_ms / 1000))
-    : localCurrentTimeSec;
-
-  const formatTime = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = Math.floor(secs % 60);
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  };
-
-  const handleTogglePlay = async () => {
-    if (!isTauri && !audioActive) {
-      await startBrowserAudio();
-      setAudioActive(true);
+  // Sync local dropdowns with real persisted party config when loaded
+  useEffect(() => {
+    if (partyConfig?.primary_mood_id) {
+      setSelectedMood(partyConfig.primary_mood_id);
     }
-    setLocalIsPlaying(!isPlaying);
-    await toggleDeckPlay(0);
-  };
-
-  const handleNextTrack = async () => {
-    if (partyStatus.next_track) {
-      await forceNextRequest(partyStatus.next_track.track.id);
-      setLocalCurrentTimeSec(0);
+    if (partyConfig?.dj_level) {
+      const map: Record<string, string> = {
+        hands_off: 'Pro',
+        balanced: 'Smart',
+        curated: 'Advanced',
+        manual: 'Creative',
+      };
+      setSelectedDjType(map[partyConfig.dj_level] || 'Smart');
     }
-  };
+  }, [partyConfig]);
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      await loadLocalAudioFile(0, file);
-      setAudioActive(true);
-      setLocalIsPlaying(true);
-    }
-  };
+  useEffect(() => {
+    setApiUrlDraft(apiBaseUrl);
+  }, [apiBaseUrl]);
+
+  const isPartyLive = cloudParty?.status === 'live';
+  const activeMoodProfile = moodProfiles.find((m) => m.id === selectedMood) || moodProfiles[0];
+  const stageBpm = activeMoodProfile ? Math.round((activeMoodProfile.min_bpm + activeMoodProfile.max_bpm) / 2) : 124;
+  const stageEnergy = activeMoodProfile ? activeMoodProfile.target_energy : 0.75;
+
+  // Honest lead source display (never hardcoded "Chaiyya Chaiyya")
+  const leadSource = registeredSources.length > 0 ? registeredSources[0] : null;
+  const pendingRequestsCount = songRequests.filter((r) => r.status === 'pending').length;
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -199,31 +188,7 @@ export const StageDisplayScreen: React.FC = () => {
     }
   };
 
-  // 0. Periodic telemetry polling in native Tauri desktop runtime
-  useEffect(() => {
-    if (!isTauri) return;
-    const telemTimer = setInterval(() => {
-      pollTelemetry();
-    }, 100);
-    return () => clearInterval(telemTimer);
-  }, [pollTelemetry]);
-
-  // 1. User interaction listener to start WebAudio in browser demo mode
-  useEffect(() => {
-    if (isTauri) return;
-    const unlockAudio = async () => {
-      await startBrowserAudio();
-      setAudioActive(true);
-    };
-    window.addEventListener('pointerdown', unlockAudio, { once: true });
-    window.addEventListener('keydown', unlockAudio, { once: true });
-    return () => {
-      window.removeEventListener('pointerdown', unlockAudio);
-      window.removeEventListener('keydown', unlockAudio);
-    };
-  }, [startBrowserAudio]);
-
-  // 2. Keyboard shortcuts: 'M' for host console, 'Space' for play/pause, 'F' for fullscreen
+  // Keyboard shortcuts: 'M' for Host Console, 'F' for Fullscreen, 'Escape' to close drawer
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['INPUT', 'SELECT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
@@ -235,19 +200,15 @@ export const StageDisplayScreen: React.FC = () => {
       if (e.key === 'Escape') {
         setShowHostDrawer(false);
       }
-      if (e.code === 'Space') {
-        e.preventDefault();
-        handleTogglePlay();
-      }
       if (e.key === 'f' || e.key === 'F') {
         toggleFullscreen();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isPlaying, audioActive]);
+  }, []);
 
-  // 3. Auto-cycle FX loops every 25 seconds if enabled
+  // Auto-cycle visual FX loops every 25 seconds when enabled
   useEffect(() => {
     if (!autoCycleFx) return;
     const fxTimer = setInterval(() => {
@@ -256,63 +217,136 @@ export const StageDisplayScreen: React.FC = () => {
     return () => clearInterval(fxTimer);
   }, [autoCycleFx]);
 
-  // 4. Track playback time progress (browser demo mode only - Tauri is driven by audio clock)
-  useEffect(() => {
-    if (isTauri || !localIsPlaying) return;
-    const progressTimer = setInterval(() => {
-      setLocalCurrentTimeSec((t) => (t >= currentDurationSec ? 0 : t + 1));
-    }, 1000);
-    return () => clearInterval(progressTimer);
-  }, [localIsPlaying, currentDurationSec]);
-
-  // 4 DJ Levels
   const djTypes = [
-    { id: 'Pro', name: 'DJ TYPE: Professional 2-Deck' },
-    { id: 'Smart', name: 'DJ TYPE: Smart Mixing' },
-    { id: 'Advanced', name: 'DJ TYPE: Advanced' },
-    { id: 'Creative', name: 'DJ TYPE: Creative Tools' },
+    { id: 'Pro', level: 1, key: 'hands_off', name: 'DJ TYPE: Hands-Off Auto' },
+    { id: 'Smart', level: 2, key: 'balanced', name: 'DJ TYPE: Balanced Smart' },
+    { id: 'Advanced', level: 3, key: 'curated', name: 'DJ TYPE: Curated Control' },
+    { id: 'Creative', level: 4, key: 'manual', name: 'DJ TYPE: Manual Assist' },
   ];
 
-  // All 14 Indian & International Mood Presets
-  const moodsList = [
-    { id: 'house_party', name: 'MOOD: House Party' },
-    { id: 'shaadi', name: 'MOOD: Shaadi' },
-    { id: 'baraat', name: 'MOOD: Baraat' },
-    { id: 'mehendi', name: 'MOOD: Mehendi' },
-    { id: 'haldi', name: 'MOOD: Haldi' },
-    { id: 'sangeet', name: 'MOOD: Sangeet' },
-    { id: 'desi_club', name: 'MOOD: Desi Club' },
-    { id: 'punjabi_tashan', name: 'MOOD: Punjabi Tashan' },
-    { id: 'garba', name: 'MOOD: Garba' },
-    { id: 'dandiya', name: 'MOOD: Dandiya' },
-    { id: 'retro_bollywood', name: 'MOOD: Retro Bollywood' },
-    { id: 'cocktail_night', name: 'MOOD: Cocktail Night' },
-    { id: 'festival_mode', name: 'MOOD: Festival Mode' },
-    { id: 'international_party', name: 'MOOD: International Party' },
-  ];
+  const handleCreateParty = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!partyNameInput.trim()) return;
+    setIsBusy(true);
+    setPartyFeedback(null);
+    try {
+      const djObj = djTypes.find((d) => d.id === selectedDjType) || djTypes[1];
+      await createCloudParty(partyNameInput.trim(), selectedMood, djObj.key);
+      setPartyFeedback({
+        type: 'ok',
+        text: 'Cloud party created! Register YouTube links and press "Go Live" to start.',
+      });
+    } catch (err: any) {
+      setPartyFeedback({
+        type: 'err',
+        text: err?.message || 'Failed to create party. Verify Cloud Backend connection.',
+      });
+    } finally {
+      setIsBusy(false);
+    }
+  };
 
-  const progressPercent = Math.min(100, (currentTimeSec / Math.max(1, currentDurationSec)) * 100);
+  const handleStartParty = async () => {
+    setIsBusy(true);
+    setPartyFeedback(null);
+    try {
+      await startCloudParty();
+      setPartyFeedback({ type: 'ok', text: 'Party is now LIVE! Guests can scan the QR code to request songs.' });
+    } catch (err: any) {
+      setPartyFeedback({ type: 'err', text: err?.message || 'Failed to start party.' });
+    } finally {
+      setIsBusy(false);
+    }
+  };
 
-  // Single source of truth for guest mobile requests (derived strictly from backend guest_url)
-  const rawGuestUrl = partyStatus.guest_url || (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1'
-    ? `http://${window.location.hostname}:3000/`
-    : 'http://192.168.1.15:3000/');
+  const handleEndParty = async () => {
+    setIsBusy(true);
+    setPartyFeedback(null);
+    try {
+      await endCloudParty();
+      setPartyFeedback({ type: 'ok', text: 'Party session ended gracefully.' });
+    } catch (err: any) {
+      setPartyFeedback({ type: 'err', text: err?.message || 'Failed to end party.' });
+    } finally {
+      setIsBusy(false);
+    }
+  };
 
-  const guestRequestUrl = rawGuestUrl.endsWith('/') ? `${rawGuestUrl}request` : `${rawGuestUrl}/request`;
-  const displayedLanAddress = guestRequestUrl.replace(/^https?:\/\//, '');
-  const qrSvgHtml = partyStatus.qr_svg || generateQrSvg(guestRequestUrl, 144);
+  const handleRegisterSource = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!youtubeUrlInput.trim()) return;
+    setIsBusy(true);
+    setSourceFeedback(null);
+    try {
+      const added = await registerYouTubeSource(youtubeUrlInput.trim());
+      setSourceFeedback({
+        type: 'ok',
+        text: `Registered "${added.title}" (${added.playability_status}).`,
+      });
+      setYoutubeUrlInput('');
+    } catch (err: any) {
+      setSourceFeedback({
+        type: 'err',
+        text: err?.message || 'Could not validate or register YouTube URL.',
+      });
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleSaveApiUrl = async () => {
+    setIsBusy(true);
+    await setApiBaseUrl(apiUrlDraft);
+    setIsBusy(false);
+  };
+
+  const handleCopyGuestUrl = () => {
+    if (!guestUrl) return;
+    navigator.clipboard.writeText(guestUrl);
+    setCopiedUrl(true);
+    setTimeout(() => setCopiedUrl(false), 2000);
+  };
+
+  // Honest connection status text and badge color
+  const connectionBadge = (() => {
+    if (!backendConnected) {
+      return {
+        dot: 'bg-rose-500',
+        textClass: 'text-rose-400',
+        label: 'Backend Offline',
+      };
+    }
+    if (isPartyLive) {
+      return {
+        dot: 'bg-emerald-400 animate-ping',
+        textClass: 'text-emerald-400',
+        label: wsConnected ? 'LIVE • Realtime Sync' : 'LIVE • Cloud Connected',
+      };
+    }
+    if (cloudParty) {
+      return {
+        dot: 'bg-amber-400 animate-pulse',
+        textClass: 'text-amber-300',
+        label: `Party ${cloudParty.status.toUpperCase()} • Ready`,
+      };
+    }
+    return {
+      dot: 'bg-sky-400',
+      textClass: 'text-sky-300',
+      label: 'Cloud Connected • Setup',
+    };
+  })();
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-black select-none font-sans text-white">
       {/* ============================================================ */}
       {/* LAYER 1: GIANT LED STAGE SCREEN PLAYING 15 VIDEO FX LOOPS    */}
-      {/* Positioned precisely inside the stage screen opening         */}
       {/* ============================================================ */}
       <div className="absolute top-[2.8%] left-[12.2%] right-[12.5%] bottom-[26.2%] overflow-hidden bg-black z-0">
         <StageVisualFxCanvas
-          bpm={currentBpm}
-          energy={currentEnergy}
-          isPlaying={isPlaying}
+          bpm={stageBpm}
+          energy={stageEnergy}
+          isPlaying={isPartyLive}
           activeFxIndex={currentFxIndex}
           onFxChange={(idx) => setCurrentFxIndex(idx)}
         />
@@ -329,11 +363,10 @@ export const StageDisplayScreen: React.FC = () => {
             धुन डीजे
           </h1>
           <p className="text-xs md:text-sm font-bold tracking-[0.35em] uppercase text-white/95 drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)] mt-1">
-            DHUN — PARTY REQUEST PLAYLIST
+            {cloudParty ? cloudParty.party_name : 'DHUN — PARTY REQUEST PLATFORM'}
           </p>
 
-          {/* Real Audio-Synthesizer Oscilloscope Waveform spanning across LED stage */}
-          <AudioOscilloscopeWaveform isPlaying={isPlaying} bpm={currentBpm} />
+          <StageOscilloscopeWaveform isLive={isPartyLive} bpm={stageBpm} />
         </div>
       </div>
 
@@ -347,14 +380,13 @@ export const StageDisplayScreen: React.FC = () => {
 
       {/* ============================================================ */}
       {/* LAYER 3: ANIMATED RESIDENT DJ CHARACTER                      */}
-      {/* Grooves, head-bobs, pumps arm, and bounces to mood & BPM     */}
       {/* ============================================================ */}
       <div className="absolute left-1/2 bottom-[17.5%] -translate-x-1/2 w-[460px] md:w-[540px] h-[480px] md:h-[560px] pointer-events-none z-20">
         <AnimatedDjCharacter
-          bpm={currentBpm}
-          energy={currentEnergy}
+          bpm={stageBpm}
+          energy={stageEnergy}
           moodId={selectedMood}
-          isPlaying={isPlaying}
+          isPlaying={isPartyLive}
         />
       </div>
 
@@ -368,22 +400,24 @@ export const StageDisplayScreen: React.FC = () => {
 
       {/* ============================================================ */}
       {/* LAYER 5: THREE FLOATING FROSTED GLASS UI CARDS               */}
-      {/* Pixel-matched to the user's reference artwork                */}
       {/* ============================================================ */}
 
-      {/* 5A. TOP-LEFT: SESSION STATUS, DJ TYPE, MOOD DROPDOWNS */}
+      {/* 5A. TOP-LEFT: HONEST CLOUD STATUS, DJ TYPE, MOOD DROPDOWNS */}
       <div className="absolute top-5 left-5 z-40 flex flex-col space-y-2 pointer-events-auto">
-        {/* Local Session Status Pill */}
+        {/* Cloud Session Status Pill */}
         <div
           onClick={() => setShowHostDrawer(true)}
-          title="Click to open Host DJ Console & Music Library (or press 'M')"
+          title="Click to open Host DJ Console & Cloud Party Settings (or press 'M')"
           className="inline-flex flex-col bg-zinc-950/75 backdrop-blur-xl border border-white/10 px-3.5 py-2 rounded-xl shadow-2xl cursor-pointer hover:border-amber-400/40 transition-all group"
         >
-          <span className="text-[11px] font-bold text-slate-300">Local Session Status</span>
+          <span className="text-[11px] font-bold text-slate-300 flex items-center justify-between gap-3">
+            <span>Cloud Party Status</span>
+            <span className="text-[9px] font-mono text-amber-300/80 uppercase">Press M</span>
+          </span>
           <div className="flex items-center space-x-1.5 mt-0.5">
-            <span className={`w-2 h-2 rounded-full ${partyStatus.is_active || !isTauri ? 'bg-emerald-400 animate-ping' : 'bg-amber-400 animate-pulse'}`} />
-            <span className={`text-[11px] font-semibold ${partyStatus.is_active || !isTauri ? 'text-emerald-400' : 'text-amber-400'}`}>
-              {partyStatus.is_active ? 'Connected' : (!isTauri ? 'Connected' : 'Offline / Setup')}
+            <span className={`w-2 h-2 rounded-full ${connectionBadge.dot}`} />
+            <span className={`text-[11px] font-semibold ${connectionBadge.textClass}`}>
+              {connectionBadge.label}
             </span>
           </div>
         </div>
@@ -395,10 +429,12 @@ export const StageDisplayScreen: React.FC = () => {
             onChange={async (e) => {
               const val = e.target.value;
               setSelectedDjType(val);
-              const levelMap: Record<string, number> = { Pro: 1, Smart: 2, Advanced: 3, Creative: 4 };
-              await setDjLevel(levelMap[val] || 2);
+              const found = djTypes.find((d) => d.id === val);
+              if (found) {
+                await setDjLevel(found.level);
+              }
             }}
-            className="w-52 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
+            className="w-56 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
             {djTypes.map((t) => (
               <option key={t.id} value={t.id} className="bg-zinc-950 text-white">
@@ -411,7 +447,7 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* MOOD Dropdown (All 14 Moods) */}
+        {/* MOOD Dropdown (All 14 Curated Moods) */}
         <div className="relative">
           <select
             value={selectedMood}
@@ -420,11 +456,11 @@ export const StageDisplayScreen: React.FC = () => {
               setSelectedMood(moodVal);
               await setPartyMood(moodVal);
             }}
-            className="w-52 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
+            className="w-56 appearance-none bg-zinc-950/75 backdrop-blur-xl border border-white/10 hover:border-amber-400/50 text-white text-xs font-bold px-3.5 py-2 rounded-xl focus:outline-none focus:ring-1 focus:ring-amber-400 cursor-pointer shadow-xl transition-all"
           >
-            {moodsList.map((m) => (
+            {moodProfiles.map((m) => (
               <option key={m.id} value={m.id} className="bg-zinc-950 text-white">
-                {m.name}
+                MOOD: {m.display_name}
               </option>
             ))}
           </select>
@@ -433,134 +469,176 @@ export const StageDisplayScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* Floating unmute notification if user has not yet interacted */}
-        {!audioActive && (
+        {/* Quick Launch Host Console CTA if no live party */}
+        {!isPartyLive && (
           <button
-            onClick={async () => {
-              await startBrowserAudio();
-              setAudioActive(true);
+            onClick={() => {
+              setActiveDrawerTab('party');
+              setShowHostDrawer(true);
             }}
-            className="flex items-center space-x-2 bg-gradient-to-r from-rose-600 to-amber-500 hover:from-rose-500 hover:to-amber-400 text-white text-xs font-black px-3.5 py-1.5 rounded-xl shadow-lg shadow-rose-950/60 animate-bounce"
+            className="flex items-center justify-center space-x-2 bg-gradient-to-r from-amber-500 to-rose-600 hover:from-amber-400 hover:to-rose-500 text-white text-xs font-black px-3.5 py-2 rounded-xl shadow-lg shadow-rose-950/60 transition-all"
           >
-            <Volume2 className="w-3.5 h-3.5" />
-            <span>🔊 Click to Unmute Live DJ Audio</span>
+            <Radio className="w-3.5 h-3.5" />
+            <span>{cloudParty ? 'Manage & Go Live' : 'Setup Cloud Party'}</span>
           </button>
         )}
       </div>
 
-      {/* 5B. BOTTOM-LEFT: NOW PLAYING FROSTED GLASS CARD */}
+      {/* 5B. BOTTOM-LEFT: HONEST NOW PLAYING / DECK STANDBY CARD */}
       <div className="absolute bottom-6 left-6 z-40 w-72 md:w-80 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.9)] pointer-events-auto">
         <div className="flex items-center justify-between text-xs text-slate-400 mb-2 font-bold">
           <span className="text-white flex items-center space-x-1.5">
-            <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
-            <span>Now Playing</span>
+            <span
+              className={`w-2 h-2 rounded-full ${
+                isPartyLive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
+              }`}
+            />
+            <span>{isPartyLive ? 'Active Stage Queue' : 'Party Standby'}</span>
           </span>
           <button
-            onClick={() => setShowHostDrawer(true)}
-            className="w-5 h-5 rounded-md bg-white/10 hover:bg-white/20 flex items-center justify-center text-slate-300 hover:text-white transition-colors"
-            title="Open Console Drawer (or press 'M')"
+            onClick={() => {
+              setActiveDrawerTab('sources');
+              setShowHostDrawer(true);
+            }}
+            className="px-2 py-0.5 rounded-md bg-white/10 hover:bg-white/20 text-[10px] font-bold text-amber-300 transition-colors"
+            title="Manage YouTube Music Sources"
           >
-            <span className="w-2 h-0.5 bg-current rounded-full" />
+            Sources ({registeredSources.length})
           </button>
         </div>
 
-        {/* Track Artwork & Metadata */}
-        <div className="flex items-center space-x-3 mb-2.5">
-          <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-red-600 via-orange-600 to-amber-500 flex items-center justify-center shadow-lg relative overflow-hidden">
-            <Disc3 className={`w-6 h-6 text-white ${isPlaying ? 'animate-[spin_4s_linear_infinite]' : ''}`} />
-          </div>
-          <div className="flex-1 min-w-0">
-            <h4 className="text-sm font-extrabold text-white truncate drop-shadow">{currentTitle}</h4>
-            <p className="text-xs text-slate-300 truncate">{currentArtist}</p>
-          </div>
-        </div>
-
-        {/* Progress Bar with Cyan/Teal fill & Seek Knob */}
-        <div className="space-y-1 mb-2.5">
-          <div
-            className="w-full h-1.5 bg-white/20 rounded-full overflow-visible cursor-pointer relative"
-            onClick={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const pct = (e.clientX - rect.left) / rect.width;
-              const targetSec = Math.floor(pct * currentDurationSec);
-              setLocalCurrentTimeSec(targetSec);
-              if (isTauri) {
-                apiDeckControl('seek', 0, { positionMs: targetSec * 1000 });
-              }
-            }}
-          >
-            <div
-              className="h-full bg-teal-400 rounded-full transition-all duration-300 relative"
-              style={{ width: `${progressPercent}%` }}
-            >
-              <div className="absolute right-0 top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full bg-teal-200 shadow-md shadow-teal-400" />
+        {leadSource ? (
+          <>
+            <div className="flex items-center space-x-3 mb-2.5">
+              {leadSource.thumbnail_url ? (
+                <img
+                  src={leadSource.thumbnail_url}
+                  alt={leadSource.title}
+                  className="w-11 h-11 rounded-xl object-cover shadow-lg border border-white/10"
+                />
+              ) : (
+                <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-red-600 via-orange-600 to-amber-500 flex items-center justify-center shadow-lg">
+                  <Disc3 className={`w-6 h-6 text-white ${isPartyLive ? 'animate-[spin_4s_linear_infinite]' : ''}`} />
+                </div>
+              )}
+              <div className="flex-1 min-w-0">
+                <h4 className="text-sm font-extrabold text-white truncate drop-shadow">
+                  {leadSource.title}
+                </h4>
+                <p className="text-xs text-slate-300 truncate">{leadSource.artist}</p>
+              </div>
             </div>
-          </div>
-          <div className="flex justify-between text-[10px] font-mono text-slate-400">
-            <span>{formatTime(currentTimeSec)}</span>
-            <span>{formatTime(currentDurationSec)}</span>
-          </div>
-        </div>
 
-        {/* Transport Controls (Clean 3-Button Center Layout Matching Mockup) */}
-        <div className="flex items-center justify-around pt-1 px-4">
+            <div className="bg-amber-500/10 border border-amber-400/25 rounded-xl px-2.5 py-1.5 mb-2.5">
+              <p className="text-[10px] text-amber-200 font-medium leading-tight">
+                Official YouTube Reference Registered &bull; Playability:{' '}
+                <span className="font-mono font-bold text-amber-300">{leadSource.playability_status}</span>
+                <br />
+                Phase 2 will enable embedded YouTube Player audio playback.
+              </p>
+            </div>
+          </>
+        ) : (
+          <div className="py-3 text-center space-y-1.5 mb-2">
+            <div className="w-10 h-10 mx-auto rounded-xl bg-white/5 border border-white/10 flex items-center justify-center">
+              <Music className="w-5 h-5 text-slate-400" />
+            </div>
+            <h4 className="text-sm font-bold text-slate-200">No Active Track Queued</h4>
+            <p className="text-[11px] text-slate-400 leading-snug">
+              {cloudParty
+                ? 'Add official YouTube links in Host Console to populate the party catalog.'
+                : 'Create a Cloud Party and register official YouTube tracks to begin.'}
+            </p>
+          </div>
+        )}
+
+        {/* Host Quick Action Controls */}
+        <div className="flex items-center justify-between pt-2 border-t border-white/10 gap-2">
           <button
             onClick={() => {
-              setLocalCurrentTimeSec(0);
-              if (isTauri) {
-                apiDeckControl('seek', 0, { positionMs: 0 });
-              }
+              setActiveDrawerTab('sources');
+              setShowHostDrawer(true);
             }}
-            className="p-2 text-slate-300 hover:text-white transition-colors"
-            title="Restart Track"
+            className="flex-1 py-1.5 rounded-xl bg-white/10 hover:bg-white/15 text-[11px] font-bold text-slate-200 flex items-center justify-center space-x-1.5 transition-colors"
           >
-            <SkipBack className="w-4 h-4" />
+            <Link2 className="w-3.5 h-3.5 text-amber-400" />
+            <span>Add YouTube Link</span>
           </button>
 
-          <button
-            onClick={handleTogglePlay}
-            className="w-10 h-10 rounded-full bg-teal-400 hover:bg-teal-300 text-black flex items-center justify-center shadow-lg shadow-teal-400/40 active:scale-95 transition-all"
-            title={isPlaying ? 'Pause Playback' : 'Play Audio'}
-          >
-            {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
-          </button>
+          {cloudParty && !isPartyLive && cloudParty.status !== 'ended' && (
+            <button
+              onClick={handleStartParty}
+              disabled={isBusy}
+              className="px-3 py-1.5 rounded-xl bg-teal-400 hover:bg-teal-300 text-black text-[11px] font-black flex items-center space-x-1 shadow-lg shadow-teal-400/30 transition-all"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" />
+              <span>Go Live</span>
+            </button>
+          )}
 
-          <button
-            onClick={handleNextTrack}
-            className="p-2 text-slate-300 hover:text-white transition-colors"
-            title="Next Track (Harmonic Mix)"
-          >
-            <SkipForward className="w-4 h-4" />
-          </button>
+          {isPartyLive && (
+            <button
+              onClick={handleEndParty}
+              disabled={isBusy}
+              className="px-3 py-1.5 rounded-xl bg-rose-600/80 hover:bg-rose-500 text-white text-[11px] font-bold flex items-center space-x-1 transition-all"
+            >
+              <Square className="w-3 h-3 fill-current" />
+              <span>End</span>
+            </button>
+          )}
         </div>
       </div>
 
-      {/* 5C. BOTTOM-RIGHT: SCAN TO REQUEST FROSTED GLASS QR CARD */}
+      {/* 5C. BOTTOM-RIGHT: HONEST SCAN TO REQUEST FROSTED GLASS QR CARD */}
       <div className="absolute bottom-6 right-6 z-40 w-64 md:w-72 bg-zinc-950/80 backdrop-blur-2xl border border-white/15 p-4 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.9)] pointer-events-auto flex flex-col items-center text-center">
-        <h4 className="text-xs font-bold tracking-wider text-slate-200 uppercase mb-2.5">
-          Scan to Request
+        <h4 className="text-xs font-bold tracking-wider text-slate-200 uppercase mb-2.5 flex items-center gap-1.5">
+          <QrCode className="w-3.5 h-3.5 text-amber-400" />
+          <span>Guest Request Portal</span>
         </h4>
 
-        {/* Authentic, High-Contrast QR Code Box */}
-        <div
-          className="w-32 h-32 md:w-36 md:h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-2.5 overflow-hidden [&>svg]:w-full [&>svg]:h-full"
-          dangerouslySetInnerHTML={{ __html: qrSvgHtml }}
-        />
-
-        <p className="text-xs font-black tracking-wide text-white uppercase drop-shadow">
-          SCAN TO REQUEST
-        </p>
-        <p className="text-[11px] font-bold text-amber-300 mt-0.5">
-          स्कैन कर गाना मांगें
-        </p>
-        <p className="text-[10px] font-mono text-slate-400 mt-1">
-          LAN: {displayedLanAddress}
-        </p>
+        {cloudParty && qrSvg ? (
+          <>
+            <div
+              className="w-32 h-32 md:w-36 md:h-36 bg-white p-2 rounded-2xl shadow-inner flex items-center justify-center mb-2.5 overflow-hidden [&>svg]:w-full [&>svg]:h-full"
+              dangerouslySetInnerHTML={{ __html: qrSvg }}
+            />
+            <p className="text-xs font-black tracking-wide text-white uppercase drop-shadow">
+              SCAN TO REQUEST
+            </p>
+            <p className="text-[11px] font-bold text-amber-300 mt-0.5">
+              स्कैन कर गाना मांगें
+            </p>
+            <button
+              onClick={handleCopyGuestUrl}
+              className="mt-1.5 px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-mono text-slate-300 flex items-center gap-1.5 max-w-full"
+              title="Copy Guest Join URL"
+            >
+              <span className="truncate">{guestUrl?.replace(/^https?:\/\//, '')}</span>
+              {copiedUrl ? <Check className="w-3 h-3 text-emerald-400 shrink-0" /> : <Copy className="w-3 h-3 shrink-0" />}
+            </button>
+          </>
+        ) : (
+          <div className="w-full py-5 px-3 rounded-2xl bg-black/50 border border-dashed border-white/15 flex flex-col items-center justify-center space-y-2 mb-1">
+            <QrCode className="w-10 h-10 text-slate-600" />
+            <p className="text-xs font-bold text-slate-300">QR Inactive</p>
+            <p className="text-[10px] text-slate-400 leading-relaxed">
+              Create &amp; connect a live Cloud Party to generate an authentic Guest QR code.
+            </p>
+            <button
+              onClick={() => {
+                setActiveDrawerTab('party');
+                setShowHostDrawer(true);
+              }}
+              className="mt-1 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-300 text-[11px] font-bold transition-colors"
+            >
+              Create Party
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ============================================================ */}
-      {/* DISCREET HOST SLIDE-OVER DRAWER (HOTKEY 'M' OR CLICK STATUS) */}
-      {/* Hidden by default so Stage Display is completely immersive  */}
+      {/* HOST SLIDE-OVER CONSOLE DRAWER (HOTKEY 'M' OR CLICK STATUS)  */}
       {/* ============================================================ */}
       {showHostDrawer && (
         <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-md flex justify-end transition-all">
@@ -569,7 +647,12 @@ export const StageDisplayScreen: React.FC = () => {
             <div className="flex items-center justify-between pb-4 border-b border-white/10">
               <div className="flex items-center space-x-2.5">
                 <Sliders className="w-5 h-5 text-amber-400" />
-                <h3 className="text-lg font-black text-white">DHUN Host DJ Console</h3>
+                <div>
+                  <h3 className="text-lg font-black text-white leading-none">DHUN Host Console</h3>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    Web Application &bull; Cloud Party Foundation (Phase 1)
+                  </p>
+                </div>
               </div>
               <button
                 onClick={() => setShowHostDrawer(false)}
@@ -580,43 +663,43 @@ export const StageDisplayScreen: React.FC = () => {
             </div>
 
             {/* Tab Navigation */}
-            <div className="flex space-x-2 my-4">
+            <div className="flex space-x-1.5 my-4">
               <button
-                onClick={() => setActiveDrawerTab('library')}
+                onClick={() => setActiveDrawerTab('party')}
                 className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
-                  activeDrawerTab === 'library'
+                  activeDrawerTab === 'party'
                     ? 'bg-amber-500/20 border-amber-400 text-amber-300'
-                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                    : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
                 }`}
               >
-                Music Library
+                Party &amp; Cloud
               </button>
               <button
-                onClick={() => setActiveDrawerTab('mixer')}
+                onClick={() => setActiveDrawerTab('sources')}
                 className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
-                  activeDrawerTab === 'mixer'
+                  activeDrawerTab === 'sources'
                     ? 'bg-amber-500/20 border-amber-400 text-amber-300'
-                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                    : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
                 }`}
               >
-                4-Deck Mixer
+                Sources ({registeredSources.length})
               </button>
               <button
                 onClick={() => setActiveDrawerTab('requests')}
                 className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
                   activeDrawerTab === 'requests'
                     ? 'bg-amber-500/20 border-amber-400 text-amber-300'
-                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                    : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
                 }`}
               >
-                Guest Requests ({guestRequests.length})
+                Requests ({pendingRequestsCount})
               </button>
               <button
                 onClick={() => setActiveDrawerTab('fx')}
                 className={`flex-1 py-2 text-xs font-bold rounded-lg border transition-all ${
                   activeDrawerTab === 'fx'
                     ? 'bg-amber-500/20 border-amber-400 text-amber-300'
-                    : 'bg-zinc-900 border-white/5 text-slate-400'
+                    : 'bg-zinc-900 border-white/5 text-slate-400 hover:text-white'
                 }`}
               >
                 15 Video FX
@@ -624,184 +707,358 @@ export const StageDisplayScreen: React.FC = () => {
             </div>
 
             {/* Tab Content */}
-            <div className="flex-1 overflow-y-auto">
-              {activeDrawerTab === 'library' && (
+            <div className="flex-1 overflow-y-auto space-y-4">
+              {/* TAB 1: PARTY & CLOUD BACKEND */}
+              {activeDrawerTab === 'party' && (
                 <div className="space-y-4">
-                  <div className="bg-zinc-900/80 p-4 rounded-xl border border-white/10">
-                    <h4 className="text-xs font-bold text-amber-300 uppercase mb-2">Local Music Folder Scanner</h4>
-                    <div className="flex space-x-2">
+                  {/* Cloud Backend Connection Configuration */}
+                  <div className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-bold text-sky-300 uppercase flex items-center gap-1.5">
+                        <Server className="w-3.5 h-3.5" />
+                        <span>Cloud Backend Endpoint</span>
+                      </h4>
+                      <span
+                        className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                          backendConnected
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                            : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                        }`}
+                      >
+                        {backendConnected ? `Connected v${backendVersion || '1.0'}` : 'Offline'}
+                      </span>
+                    </div>
+
+                    <div className="flex gap-2">
                       <input
-                        type="text"
-                        value={folderPathInput}
-                        onChange={(e) => setFolderPathInput(e.target.value)}
-                        placeholder="C:/Music or folder path..."
-                        className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono"
+                        type="url"
+                        value={apiUrlDraft}
+                        onChange={(e) => setApiUrlDraft(e.target.value)}
+                        placeholder="https://your-dhun-server.onrender.com"
+                        className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono outline-none focus:border-sky-400"
                       />
                       <button
-                        onClick={async () => {
-                          if (!folderPathInput.trim()) return;
-                          setIsScanning(true);
-                          try {
-                            await scanFolder(folderPathInput.trim());
-                          } catch (e) {
-                            console.error('Scan error:', e);
-                          } finally {
-                            setIsScanning(false);
-                          }
-                        }}
-                        className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs rounded-lg flex items-center space-x-1"
+                        onClick={handleSaveApiUrl}
+                        disabled={isBusy}
+                        className="px-3 py-1.5 bg-sky-500 hover:bg-sky-400 text-black font-extrabold text-xs rounded-lg flex items-center gap-1"
                       >
-                        <FolderOpen className="w-3.5 h-3.5" />
-                        <span>{isScanning ? 'Scanning...' : 'Scan Folder'}</span>
+                        <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
+                        <span>Connect</span>
                       </button>
                     </div>
+
+                    {!backendConnected && (
+                      <p className="text-[11px] text-rose-400 flex items-center gap-1.5">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        <span>
+                          {backendError || 'Backend unreachable.'} Deploy <code className="text-rose-200">dhun-server</code> (Render/Railway/Fly.io) or run locally on port 8080.
+                        </span>
+                      </p>
+                    )}
                   </div>
 
-                  {/* Manual Single MP3 Import */}
-                  <label className="flex items-center justify-center space-x-2 p-3 bg-zinc-900/60 hover:bg-zinc-900 border border-dashed border-white/20 rounded-xl cursor-pointer text-xs font-bold text-slate-300">
-                    <Music className="w-4 h-4 text-amber-400" />
-                    <span>Import Local MP3 File Directly</span>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="audio/*"
-                      onChange={handleFileUpload}
-                      className="hidden"
-                    />
-                  </label>
+                  {/* Party Lifecycle Panel */}
+                  <div className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-3">
+                    <h4 className="text-xs font-bold text-amber-300 uppercase flex items-center gap-1.5">
+                      <Radio className="w-3.5 h-3.5" />
+                      <span>Party Session Management</span>
+                    </h4>
 
-                  {/* Preloaded Celebration Library */}
-                  <div>
-                    <h4 className="text-xs font-bold text-slate-400 uppercase mb-2">Available Celebration Tracks</h4>
-                    <div className="space-y-1.5">
-                      {[
-                        { title: 'Chaiyya Chaiyya', artist: 'Sukhwinder Singh', bpm: 128, key: 'D Major', energy: '88%' },
-                        { title: 'Gallan Goodiyaan', artist: 'Diljit Dosanjh', bpm: 128, key: 'G Major', energy: '92%' },
-                        { title: 'Sauda Khara Khara', artist: 'Diljit Dosanjh, Sukhbir', bpm: 130, key: 'F Minor', energy: '95%' },
-                        { title: 'Kala Chashma', artist: 'Amar Arshi, Badshah', bpm: 126, key: 'C# Minor', energy: '96%' },
-                        { title: 'Chogada (Garba Dhol)', artist: 'Darshan Raval', bpm: 124, key: 'A Major', energy: '94%' },
-                        { title: 'Mundian To Bach Ke', artist: 'Panjabi MC', bpm: 100, key: 'Ab Minor', energy: '93%' },
-                        { title: 'Aankh Marey', artist: 'Mika Singh, Neha Kakkar', bpm: 124, key: 'F Major', energy: '91%' },
-                      ].map((t, idx) => (
-                        <div
-                          key={idx}
-                          className="flex items-center justify-between p-2.5 bg-zinc-900/60 hover:bg-zinc-900 rounded-lg border border-white/5"
+                    {!cloudParty ? (
+                      <form onSubmit={handleCreateParty} className="space-y-3">
+                        <div>
+                          <label className="text-[11px] text-slate-400 block mb-1">Party Name</label>
+                          <input
+                            type="text"
+                            value={partyNameInput}
+                            onChange={(e) => setPartyNameInput(e.target.value)}
+                            placeholder="e.g. Sharma Wedding Sangeet"
+                            className="w-full bg-black/60 border border-white/15 px-3 py-2 text-xs rounded-lg text-white outline-none focus:border-amber-400"
+                          />
+                        </div>
+                        <button
+                          type="submit"
+                          disabled={!backendConnected || isBusy || !partyNameInput.trim()}
+                          className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-black text-xs rounded-xl transition-all"
                         >
-                          <div>
-                            <p className="text-xs font-bold text-white">{t.title}</p>
-                            <p className="text-[11px] text-slate-400">{t.artist}</p>
+                          {isBusy ? 'Creating Party...' : 'Create Cloud Party & Generate Host Token'}
+                        </button>
+                      </form>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="p-3 rounded-lg bg-black/50 border border-white/10 space-y-1.5 text-xs">
+                          <div className="flex justify-between">
+                            <span className="text-slate-400">Party Name:</span>
+                            <span className="font-bold text-white">{cloudParty.party_name}</span>
                           </div>
-                          <div className="flex items-center space-x-3 text-[11px] font-mono text-amber-400">
-                            <span>{t.bpm} BPM</span>
-                            <span>{t.key}</span>
+                          <div className="flex justify-between">
+                            <span className="text-slate-400">Party ID:</span>
+                            <span className="font-mono text-amber-300">{cloudParty.id}</span>
+                          </div>
+                          <div className="flex justify-between">
+                            <span className="text-slate-400">Lifecycle Status:</span>
+                            <span className="font-bold uppercase text-emerald-400">{cloudParty.status}</span>
+                          </div>
+                          <div className="flex justify-between">
+                            <span className="text-slate-400">Realtime WebSocket:</span>
+                            <span className={wsConnected ? 'text-emerald-400 font-bold' : 'text-amber-400'}>
+                              {wsConnected ? 'Connected' : 'Reconnecting...'}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="flex gap-2">
+                          {cloudParty.status === 'created' && (
                             <button
-                              onClick={() => {
-                                handleTogglePlay();
-                              }}
-                              className="px-2 py-1 bg-amber-500/20 hover:bg-amber-500/40 border border-amber-400/40 rounded text-amber-300 font-bold"
+                              onClick={handleStartParty}
+                              disabled={isBusy}
+                              className="flex-1 py-2 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-xs rounded-xl flex items-center justify-center gap-1.5"
                             >
-                              Load Deck
+                              <Play className="w-3.5 h-3.5 fill-current" />
+                              <span>Go Live</span>
                             </button>
-                          </div>
+                          )}
+
+                          {cloudParty.status === 'live' && (
+                            <button
+                              onClick={handleEndParty}
+                              disabled={isBusy}
+                              className="flex-1 py-2 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5"
+                            >
+                              <Square className="w-3.5 h-3.5 fill-current" />
+                              <span>End Live Party</span>
+                            </button>
+                          )}
+
+                          <button
+                            onClick={clearActiveParty}
+                            className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-slate-200 font-bold text-xs rounded-xl"
+                          >
+                            New Party
+                          </button>
                         </div>
-                      ))}
-                    </div>
+                      </div>
+                    )}
+
+                    {partyFeedback && (
+                      <div
+                        className={`text-xs px-3 py-2 rounded-lg border flex items-center gap-2 ${
+                          partyFeedback.type === 'ok'
+                            ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
+                            : 'bg-rose-950/50 border-rose-500/40 text-rose-300'
+                        }`}
+                      >
+                        {partyFeedback.type === 'ok' ? (
+                          <CheckCircle2 className="w-4 h-4 shrink-0" />
+                        ) : (
+                          <AlertCircle className="w-4 h-4 shrink-0" />
+                        )}
+                        <span>{partyFeedback.text}</span>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
 
-              {activeDrawerTab === 'mixer' && (
+              {/* TAB 2: OFFICIAL ONLINE MUSIC SOURCES (ZERO LOCAL IMPORT) */}
+              {activeDrawerTab === 'sources' && (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-4">
-                    {/* Deck A Strip */}
-                    <div className="bg-zinc-900/80 p-3 rounded-xl border border-rose-500/30">
-                      <h4 className="text-xs font-bold text-rose-400 uppercase mb-2">Deck A (Active)</h4>
-                      <div className="space-y-2 text-xs">
-                        <div>
-                          <label className="text-[10px] text-slate-400">Low (Kill -36dB)</label>
-                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-rose-400" />
-                        </div>
-                        <div>
-                          <label className="text-[10px] text-slate-400">Mid (Sweep)</label>
-                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-rose-400" />
-                        </div>
-                        <div>
-                          <label className="text-[10px] text-slate-400">High (Air)</label>
-                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-rose-400" />
-                        </div>
-                      </div>
+                  <form
+                    onSubmit={handleRegisterSource}
+                    className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-2.5"
+                  >
+                    <h4 className="text-xs font-bold text-amber-300 uppercase flex items-center gap-1.5">
+                      <Link2 className="w-3.5 h-3.5" />
+                      <span>Register YouTube / YouTube Music Track</span>
+                    </h4>
+                    <p className="text-[11px] text-slate-400">
+                      Paste an official link from <code className="text-slate-300">youtube.com/watch</code>,{' '}
+                      <code className="text-slate-300">youtu.be</code>, or{' '}
+                      <code className="text-slate-300">music.youtube.com</code>. Official metadata is fetched via oEmbed.
+                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        value={youtubeUrlInput}
+                        onChange={(e) => setYoutubeUrlInput(e.target.value)}
+                        placeholder="https://www.youtube.com/watch?v=..."
+                        disabled={!cloudParty || !backendConnected || isBusy}
+                        className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono outline-none focus:border-amber-400 disabled:opacity-40"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!cloudParty || !backendConnected || isBusy || !youtubeUrlInput.trim()}
+                        className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-extrabold text-xs rounded-lg"
+                      >
+                        {isBusy ? 'Adding...' : 'Register'}
+                      </button>
                     </div>
 
-                    {/* Deck B Strip */}
-                    <div className="bg-zinc-900/80 p-3 rounded-xl border border-teal-500/30">
-                      <h4 className="text-xs font-bold text-teal-400 uppercase mb-2">Deck B (Preloaded)</h4>
-                      <div className="space-y-2 text-xs">
-                        <div>
-                          <label className="text-[10px] text-slate-400">Low (Kill -36dB)</label>
-                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-teal-400" />
-                        </div>
-                        <div>
-                          <label className="text-[10px] text-slate-400">Mid (Sweep)</label>
-                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-teal-400" />
-                        </div>
-                        <div>
-                          <label className="text-[10px] text-slate-400">High (Air)</label>
-                          <input type="range" min="-36" max="6" defaultValue="0" className="w-full accent-teal-400" />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
+                    {!cloudParty && (
+                      <p className="text-[11px] text-amber-400">
+                        Create a Cloud Party in the &ldquo;Party &amp; Cloud&rdquo; tab first to register sources.
+                      </p>
+                    )}
 
-                  <div className="bg-zinc-900/80 p-3 rounded-xl border border-white/10">
-                    <label className="text-xs font-bold text-amber-300 uppercase block mb-1">Smart Bass Swap Crossfader</label>
-                    <input type="range" min="-1" max="1" step="0.05" defaultValue="-0.9" className="w-full accent-amber-400" />
-                    <div className="flex justify-between text-[10px] text-slate-400 mt-1">
-                      <span>Deck A</span>
-                      <span>Center</span>
-                      <span>Deck B</span>
-                    </div>
+                    {sourceFeedback && (
+                      <div
+                        className={`text-xs px-3 py-2 rounded-lg border flex items-center gap-2 ${
+                          sourceFeedback.type === 'ok'
+                            ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300'
+                            : 'bg-rose-950/50 border-rose-500/40 text-rose-300'
+                        }`}
+                      >
+                        {sourceFeedback.type === 'ok' ? (
+                          <CheckCircle2 className="w-4 h-4 shrink-0" />
+                        ) : (
+                          <AlertCircle className="w-4 h-4 shrink-0" />
+                        )}
+                        <span>{sourceFeedback.text}</span>
+                      </div>
+                    )}
+                  </form>
+
+                  {/* Registered Sources Catalog */}
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-400 uppercase mb-2">
+                      Registered Party Catalog ({registeredSources.length})
+                    </h4>
+                    {registeredSources.length === 0 ? (
+                      <div className="p-6 text-center rounded-xl bg-zinc-900/50 border border-white/5 text-xs text-slate-500">
+                        No online music sources registered yet. Paste a YouTube link above to populate the party catalog.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {registeredSources.map((src) => (
+                          <div
+                            key={src.id}
+                            className="flex items-center justify-between gap-3 p-2.5 bg-zinc-900/70 rounded-xl border border-white/10"
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              {src.thumbnail_url ? (
+                                <img
+                                  src={src.thumbnail_url}
+                                  alt={src.title}
+                                  className="w-11 h-8 rounded-md object-cover bg-black shrink-0"
+                                />
+                              ) : (
+                                <div className="w-11 h-8 rounded-md bg-zinc-800 flex items-center justify-center shrink-0">
+                                  <Music className="w-4 h-4 text-slate-500" />
+                                </div>
+                              )}
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-white truncate">{src.title}</p>
+                                <p className="text-[11px] text-slate-400 truncate">
+                                  {src.artist} &bull; <span className="font-mono">{src.provider_video_id}</span>
+                                </p>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span className="px-1.5 py-0.5 rounded bg-red-500/20 border border-red-500/30 text-[9px] font-bold text-red-300 uppercase">
+                                {src.provider === 'youtube_music' ? 'YT Music' : 'YouTube'}
+                              </span>
+                              <span
+                                className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[9px] font-mono font-bold text-amber-300"
+                                title={src.error_reason || 'Prepared for Phase 2 YouTube IFrame Player'}
+                              >
+                                {src.playability_status}
+                              </span>
+                              <a
+                                href={src.original_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="p-1 text-slate-400 hover:text-white"
+                                title="Open on YouTube"
+                              >
+                                <ExternalLink className="w-3.5 h-3.5" />
+                              </a>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
 
+              {/* TAB 3: LIVE GUEST REQUESTS */}
               {activeDrawerTab === 'requests' && (
                 <div className="space-y-3">
-                  <h4 className="text-xs font-bold text-amber-300 uppercase">Live Guest Song Requests</h4>
-                  {guestRequests.length === 0 ? (
-                    <p className="text-xs text-slate-400">No requests yet. Guests can scan the QR code to submit songs!</p>
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-amber-300 uppercase">Live Guest Song Requests</h4>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      {songRequests.length} total
+                    </span>
+                  </div>
+
+                  {songRequests.length === 0 ? (
+                    <div className="p-6 text-center rounded-xl bg-zinc-900/50 border border-white/5 text-xs text-slate-400">
+                      No requests yet. Once the party is live, guests can scan the QR code to request songs from your registered YouTube catalog!
+                    </div>
                   ) : (
-                    guestRequests.map((req) => (
-                      <div key={req.id} className="p-3 bg-zinc-900 rounded-xl border border-white/10 flex items-center justify-between">
-                        <div>
-                          <p className="text-xs font-bold text-white">{req.track_title}</p>
-                          <p className="text-[11px] text-slate-400">{req.track_artist} • requested by <span className="text-amber-300">{req.guest_name}</span></p>
+                    songRequests.map((req) => (
+                      <div
+                        key={req.id}
+                        className="p-3 bg-zinc-900 rounded-xl border border-white/10 flex items-center justify-between gap-3"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="text-xs font-bold text-white truncate">
+                              {req.source_title || 'Requested Song'}
+                            </p>
+                            <span
+                              className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${
+                                req.status === 'approved'
+                                  ? 'bg-emerald-500/20 text-emerald-300'
+                                  : req.status === 'rejected'
+                                  ? 'bg-rose-500/20 text-rose-300'
+                                  : 'bg-amber-500/20 text-amber-300'
+                              }`}
+                            >
+                              {req.status}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400 truncate mt-0.5">
+                            {req.source_artist} &bull; by{' '}
+                            <span className="text-amber-300">{req.guest_name || 'Guest'}</span>
+                          </p>
+                          {req.custom_note && (
+                            <p className="text-[10px] italic text-slate-300 mt-1">
+                              &ldquo;{req.custom_note}&rdquo;
+                            </p>
+                          )}
                         </div>
-                        <div className="flex space-x-1.5">
-                          <button
-                            onClick={() => approveRequest(req.id)}
-                            className="p-1.5 bg-emerald-600/30 hover:bg-emerald-600 border border-emerald-500 rounded text-emerald-300"
-                            title="Approve (+1.5 score boost)"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => rejectRequest(req.id)}
-                            className="p-1.5 bg-rose-600/30 hover:bg-rose-600 border border-rose-500 rounded text-rose-300"
-                            title="Reject"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
+
+                        {req.status === 'pending' && (
+                          <div className="flex space-x-1.5 shrink-0">
+                            <button
+                              onClick={() => approveSongRequest(req.id)}
+                              className="p-1.5 bg-emerald-600/30 hover:bg-emerald-600 border border-emerald-500 rounded text-emerald-300 hover:text-white transition-colors"
+                              title="Approve Request"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={() => rejectSongRequest(req.id, 'Declined by host')}
+                              className="p-1.5 bg-rose-600/30 hover:bg-rose-600 border border-rose-500 rounded text-rose-300 hover:text-white transition-colors"
+                              title="Reject Request"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        )}
                       </div>
                     ))
                   )}
                 </div>
               )}
 
+              {/* TAB 4: 15 VIDEO FX LOOPS */}
               {activeDrawerTab === 'fx' && (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between pb-2 border-b border-white/10">
-                    <h4 className="text-xs font-bold text-amber-300 uppercase">15 Pre-Saved Video FX Loops</h4>
+                    <h4 className="text-xs font-bold text-amber-300 uppercase">15 Pre-Saved Stage Visual FX</h4>
                     <label className="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer">
                       <input
                         type="checkbox"
@@ -827,7 +1084,9 @@ export const StageDisplayScreen: React.FC = () => {
                         }`}
                       >
                         <span className="truncate">FX {idx + 1}: {name}</span>
-                        {currentFxIndex === idx && <Sparkles className="w-3 h-3 text-amber-400 flex-shrink-0 ml-1" />}
+                        {currentFxIndex === idx && (
+                          <Sparkles className="w-3 h-3 text-amber-400 flex-shrink-0 ml-1" />
+                        )}
                       </button>
                     ))}
                   </div>
@@ -835,21 +1094,36 @@ export const StageDisplayScreen: React.FC = () => {
               )}
             </div>
 
-            {/* Drawer Footer Emergency Controls */}
-            <div className="pt-4 mt-auto border-t border-white/10 flex items-center justify-between">
+            {/* Drawer Footer */}
+            <div className="pt-4 mt-4 border-t border-white/10 flex items-center justify-between">
               <button
-                onClick={emergencyFade}
-                className="px-4 py-2 bg-red-950 hover:bg-red-900 border border-red-700 rounded-xl text-xs font-bold text-red-200 flex items-center space-x-1.5"
+                onClick={async () => {
+                  await checkBackendHealth();
+                }}
+                className="px-3.5 py-2 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-xl text-xs font-bold text-slate-300 flex items-center space-x-1.5"
               >
-                <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
-                <span>Emergency 300ms Fade</span>
+                <RefreshCw className="w-3.5 h-3.5 text-sky-400" />
+                <span>Check Health</span>
               </button>
-              <button
-                onClick={toggleFullscreen}
-                className="p-2 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-xl text-slate-300"
-              >
-                {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-              </button>
+
+              <div className="flex items-center gap-2">
+                {isPartyLive && (
+                  <button
+                    onClick={handleEndParty}
+                    className="px-3.5 py-2 bg-red-950 hover:bg-red-900 border border-red-700 rounded-xl text-xs font-bold text-red-200 flex items-center space-x-1.5"
+                  >
+                    <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
+                    <span>End Party</span>
+                  </button>
+                )}
+                <button
+                  onClick={toggleFullscreen}
+                  className="p-2 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-xl text-slate-300"
+                  title="Toggle Fullscreen (F)"
+                >
+                  {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+                </button>
+              </div>
             </div>
           </div>
         </div>
