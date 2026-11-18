@@ -302,6 +302,29 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         info!("Migration v4 applied successfully.");
     }
 
+    if current_version < 5 {
+        info!("Applying DHUN schema migration v5 (Removing obsolete Phase 1 cloud-party tables)...");
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS audit_events;
+             DROP TABLE IF EXISTS playback_events;
+             DROP TABLE IF EXISTS shared_track_metadata;
+             DROP TABLE IF EXISTS request_status_history;
+             DROP TABLE IF EXISTS party_song_requests;
+             DROP TABLE IF EXISTS party_guests;
+             DROP TABLE IF EXISTS party_source_references;
+             DROP TABLE IF EXISTS party_configurations;
+             DROP TABLE IF EXISTS parties;
+            ",
+        )?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at, description) VALUES (5, ?1, 'Removed obsolete Phase 1 cloud-party tables; local party helper tables are authoritative')",
+            params![now],
+        )?;
+        info!("Migration v5 applied successfully.");
+    }
+
     Ok(())
 }
 

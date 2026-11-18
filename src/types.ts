@@ -55,9 +55,20 @@ export interface LocalRoomSubmission {
   acquisition_note?: string | null;
   dj_status: 'queued_for_dj' | 'prepared' | 'playing' | 'played' | 'skipped_unplayable' | string;
   dj_score: number;
-  local_cache_path?: string | null;
+  cache_id?: string | null;
   created_at: number;
   updated_at: number;
+}
+
+export interface PlayableCandidatePointer {
+  submission_id: string;
+  cache_id: string;
+  stream_url: string;
+  title: string;
+  artist: string;
+  bpm?: number | null;
+  camelot_key?: string | null;
+  duration_ms?: number | null;
 }
 
 export interface LocalTempCacheStats {
@@ -106,6 +117,8 @@ export interface HostRoomDashboardResponse {
   lan_reachable: boolean;
   detected_lan_ip: string | null;
   submissions: LocalRoomSubmission[];
+  next_playable_candidate: PlayableCandidatePointer | null;
+  transition_style: string;
   cache_stats: LocalTempCacheStats;
   sync_overview: SyncStatusOverview;
 }
@@ -121,6 +134,7 @@ export interface UnifiedSongSubmissionResponse {
   metadata_source: string;
   acquisition_status: string;
   acquisition_note: string;
+  cache_id?: string | null;
   dj_score: number;
   interrupted_current_track: boolean;
 }

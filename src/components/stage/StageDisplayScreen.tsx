@@ -124,6 +124,9 @@ export const StageDisplayScreen: React.FC = () => {
     guestUrl,
     qrSvg,
     submissions,
+    deckSnapshots,
+    autoDjPlaybackState,
+    autoDjStatusNote,
     cacheStats,
     syncOverview,
     moodProfiles,
@@ -187,6 +190,17 @@ export const StageDisplayScreen: React.FC = () => {
     submissions.find((s) => s.dj_status === 'prepared') ||
     submissions[0] ||
     null;
+
+  const activeWebAudioDeck = deckSnapshots.find((d) => d.isPlaying) || null;
+  const preloadedWebAudioDeck =
+    deckSnapshots.find((d) => !d.isPlaying && d.isLoaded && d.submissionId !== null) || null;
+
+  const formatSec = (secs: number) => {
+    const clean = Math.max(0, Math.floor(secs));
+    const m = Math.floor(clean / 60);
+    const s = clean % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
@@ -494,17 +508,68 @@ export const StageDisplayScreen: React.FC = () => {
           <span className="text-white flex items-center space-x-1.5">
             <span
               className={`w-2 h-2 rounded-full ${
-                isPartyLive ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
+                activeWebAudioDeck
+                  ? 'bg-emerald-400 animate-pulse'
+                  : isPartyLive
+                  ? 'bg-amber-400'
+                  : 'bg-slate-500'
               }`}
             />
-            <span>{isPartyLive ? 'Auto DJ Engine' : 'DJ Standby'}</span>
+            <span>
+              {activeWebAudioDeck
+                ? `Playing • Deck ${String.fromCharCode(65 + activeWebAudioDeck.deckId)}`
+                : isPartyLive
+                ? 'Auto DJ Active'
+                : 'DJ Standby'}
+            </span>
           </span>
           <span className="text-[10px] font-mono text-teal-300 bg-teal-500/10 border border-teal-500/30 px-2 py-0.5 rounded-full">
             {exposedDecks}/{internalDeckCapacity} Decks • {activeMoodProfile.transition_style}
           </span>
         </div>
 
-        {activeOrPreparedSubmission ? (
+        {activeWebAudioDeck ? (
+          <>
+            <div className="flex items-center space-x-3 mb-2">
+              <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-emerald-500 via-teal-600 to-sky-600 flex items-center justify-center shadow-lg">
+                <Disc3 className="w-6 h-6 text-white animate-[spin_4s_linear_infinite]" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h4 className="text-sm font-extrabold text-white truncate drop-shadow">
+                  {activeWebAudioDeck.title}
+                </h4>
+                <p className="text-xs text-slate-300 truncate">
+                  {activeWebAudioDeck.artist}
+                  {activeWebAudioDeck.bpm ? ` • ${Math.round(activeWebAudioDeck.bpm)} BPM` : ''}
+                  {activeWebAudioDeck.camelotKey ? ` • ${activeWebAudioDeck.camelotKey}` : ''}
+                </p>
+              </div>
+            </div>
+
+            {/* Genuine AudioContext.currentTime progress bar (zero fake timers) */}
+            <div className="space-y-1 mb-2.5">
+              <div className="w-full h-1.5 bg-white/15 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-teal-400 rounded-full transition-all duration-200"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (activeWebAudioDeck.positionSec / Math.max(0.1, activeWebAudioDeck.durationSec)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+              <div className="flex justify-between text-[10px] font-mono text-slate-400">
+                <span>{formatSec(activeWebAudioDeck.positionSec)}</span>
+                <span>
+                  {preloadedWebAudioDeck
+                    ? `Next: Deck ${String.fromCharCode(65 + preloadedWebAudioDeck.deckId)}`
+                    : formatSec(activeWebAudioDeck.durationSec)}
+                </span>
+              </div>
+            </div>
+          </>
+        ) : activeOrPreparedSubmission ? (
           <>
             <div className="flex items-center space-x-3 mb-2.5">
               {activeOrPreparedSubmission.thumbnail_url ? (
@@ -515,7 +580,7 @@ export const StageDisplayScreen: React.FC = () => {
                 />
               ) : (
                 <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-red-600 via-orange-600 to-amber-500 flex items-center justify-center shadow-lg">
-                  <Disc3 className={`w-6 h-6 text-white ${isPartyLive ? 'animate-[spin_4s_linear_infinite]' : ''}`} />
+                  <Disc3 className="w-6 h-6 text-white" />
                 </div>
               )}
               <div className="flex-1 min-w-0">
@@ -530,11 +595,11 @@ export const StageDisplayScreen: React.FC = () => {
               </div>
             </div>
 
-            <div className="bg-white/5 border border-white/10 rounded-xl px-2.5 py-1.5 mb-2.5">
-              <p className="text-[10px] text-slate-300 leading-tight">
-                Pool: <span className="font-bold text-amber-300">{submissions.length}</span> &bull; DJ Score:{' '}
-                <span className="font-mono text-teal-300">{activeOrPreparedSubmission.dj_score.toFixed(1)}</span> &bull;{' '}
-                <span className="font-mono text-amber-200">{activeOrPreparedSubmission.acquisition_status}</span>
+            <div className="bg-amber-500/10 border border-amber-400/25 rounded-xl px-2.5 py-1.5 mb-2.5">
+              <p className="text-[10px] text-amber-200 leading-tight">
+                {autoDjPlaybackState === 'awaiting_playable_audio' && autoDjStatusNote
+                  ? autoDjStatusNote
+                  : `Pool: ${submissions.length} • Score ${activeOrPreparedSubmission.dj_score.toFixed(1)} • ${activeOrPreparedSubmission.acquisition_status}`}
               </p>
             </div>
           </>

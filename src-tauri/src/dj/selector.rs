@@ -299,8 +299,29 @@ pub fn score_local_submission_for_dj(
     (score * 100.0).round() / 100.0
 }
 
-/// Evaluates all queued room submissions and selects the highest-scoring next candidate
-/// WITHOUT ever interrupting an actively playing track.
+/// Computes dynamic energy target based on the selected mood and elapsed party duration
+/// (gradual warm-up -> peak celebration -> wave modulation).
+pub fn compute_mood_energy_target(
+    primary_mood: &crate::dj::moods::MoodDefinition,
+    elapsed_mins: f64,
+) -> f64 {
+    let base = primary_mood.target_energy;
+    let progression_offset = if elapsed_mins < 20.0 {
+        // Gentle warmup (-0.10 ramping up toward base)
+        -0.10 * (1.0 - (elapsed_mins / 20.0))
+    } else if elapsed_mins < 90.0 {
+        // Peak build (+0.00 to +0.08)
+        ((elapsed_mins - 20.0) / 70.0) * 0.08
+    } else {
+        // Cyclic wave breathing to avoid crowd fatigue
+        ((elapsed_mins - 90.0) / 15.0).sin() * 0.06
+    };
+    (base + progression_offset).clamp(0.35, 1.0)
+}
+
+/// Evaluates all queued room submissions and selects the highest-scoring NEXT PLAYABLE candidate
+/// WITHOUT ever interrupting an actively playing track, avoiding unnecessary repeats, and
+/// strictly refusing to select restricted/unavailable metadata-only tracks as playable.
 pub fn select_next_submission_without_interrupting(
     submissions: &[crate::db::models::LocalRoomSubmission],
     primary_mood: &crate::dj::moods::MoodDefinition,
@@ -311,11 +332,17 @@ pub fn select_next_submission_without_interrupting(
     let current_bpm = currently_playing.and_then(|s| s.bpm);
     let current_camelot = currently_playing.and_then(|s| s.camelot_key.as_deref());
 
-    let mut scored: Vec<(String, f64)> = submissions
+    let recently_played_videos: std::collections::HashSet<&str> = submissions
+        .iter()
+        .filter(|s| s.dj_status == "played" || s.dj_status == "playing")
+        .map(|s| s.provider_video_id.as_str())
+        .collect();
+
+    let mut scored_with_meta: Vec<(String, f64, bool, bool)> = submissions
         .iter()
         .filter(|s| s.dj_status == "queued_for_dj" || s.dj_status == "prepared")
         .map(|s| {
-            let sc = score_local_submission_for_dj(
+            let mut sc = score_local_submission_for_dj(
                 s,
                 primary_mood,
                 secondary_mood,
@@ -323,12 +350,30 @@ pub fn select_next_submission_without_interrupting(
                 current_camelot,
                 target_energy,
             );
-            (s.id.clone(), sc)
+            let is_repeat = recently_played_videos.contains(s.provider_video_id.as_str());
+            if is_repeat {
+                sc = (sc - 40.0).max(0.0);
+            }
+            let is_playable = s.acquisition_status == "cached_authorized"
+                && (s.cache_id.is_some() || s.local_cache_path.is_some());
+            (s.id.clone(), sc, is_playable, is_repeat)
         })
         .collect();
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let best_next_id = scored.first().map(|(id, _)| id.clone());
-    (scored, best_next_id)
+    scored_with_meta.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Prefer unplayed playable tracks first; never select restricted/unavailable tracks as playable!
+    let best_playable_next_id = scored_with_meta
+        .iter()
+        .find(|(_, _, is_playable, is_repeat)| *is_playable && !*is_repeat)
+        .or_else(|| scored_with_meta.iter().find(|(_, _, is_playable, _)| *is_playable))
+        .map(|(id, _, _, _)| id.clone());
+
+    let scored: Vec<(String, f64)> = scored_with_meta
+        .into_iter()
+        .map(|(id, sc, _, _)| (id, sc))
+        .collect();
+
+    (scored, best_playable_next_id)
 }
 

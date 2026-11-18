@@ -2108,258 +2108,6 @@ mod tests {
         assert!(parse_youtube_url("https://www.youtube.com/watch?v=invalid<char>").is_err());
     }
 
-    #[tokio::test]
-    async fn test_cloud_party_lifecycle_and_db_persistence() {
-        let db = Database::new_in_memory().expect("Failed to initialize DB");
-        let now = chrono::Utc::now().timestamp_millis();
-
-        let party = CloudParty {
-            id: "pty_test123".to_string(),
-            party_name: "Aman Sangeet Night".to_string(),
-            status: "created".to_string(),
-            host_token_hash: "hash_test_token_456".to_string(),
-            created_at: now,
-            updated_at: now,
-            started_at: None,
-            ended_at: None,
-            last_heartbeat_at: now,
-        };
-
-        let config = PartyConfiguration {
-            party_id: "pty_test123".to_string(),
-            dj_level: "balanced".to_string(),
-            primary_mood_id: "sangeet".to_string(),
-            secondary_mood_id: Some("punjabi_tashan".to_string()),
-            energy_progression: "buildup".to_string(),
-            allow_guest_requests: true,
-            max_requests_per_guest: 4,
-            request_cooldown_mins: 10,
-            require_host_approval: true,
-            updated_at: now,
-        };
-
-        // 1. Create Party and Config
-        db.create_cloud_party(&party, &config).expect("Failed to create party");
-
-        // 2. Retrieve Party
-        let retrieved = db.get_cloud_party("pty_test123").unwrap().expect("Party should exist");
-        assert_eq!(retrieved.party_name, "Aman Sangeet Night");
-        assert_eq!(retrieved.status, "created");
-        assert_eq!(retrieved.host_token_hash, "hash_test_token_456");
-
-        let retrieved_config = db.get_party_config("pty_test123").unwrap().expect("Config should exist");
-        assert_eq!(retrieved_config.primary_mood_id, "sangeet");
-        assert_eq!(retrieved_config.max_requests_per_guest, 4);
-
-        // 3. Update Status to Live
-        let live_time = now + 5000;
-        db.update_cloud_party_status("pty_test123", "live", live_time).expect("Failed to start party");
-        let live_party = db.get_cloud_party("pty_test123").unwrap().unwrap();
-        assert_eq!(live_party.status, "live");
-        assert_eq!(live_party.started_at, Some(live_time));
-
-        // 4. Update Heartbeat
-        let hb_time = live_time + 10000;
-        db.update_party_heartbeat("pty_test123", hb_time).expect("Failed to update heartbeat");
-        let hb_party = db.get_cloud_party("pty_test123").unwrap().unwrap();
-        assert_eq!(hb_party.last_heartbeat_at, hb_time);
-
-        // 5. Update Status to Ended
-        let end_time = hb_time + 5000;
-        db.update_cloud_party_status("pty_test123", "ended", end_time).expect("Failed to end party");
-        let ended_party = db.get_cloud_party("pty_test123").unwrap().unwrap();
-        assert_eq!(ended_party.status, "ended");
-        assert_eq!(ended_party.ended_at, Some(end_time));
-    }
-
-    #[tokio::test]
-    async fn test_cloud_source_registration_and_playability_status() {
-        let db = Database::new_in_memory().expect("Failed to initialize DB");
-        let now = chrono::Utc::now().timestamp_millis();
-
-        // Create party first
-        let party = CloudParty {
-            id: "pty_src_test".to_string(),
-            party_name: "Source Test Party".to_string(),
-            status: "live".to_string(),
-            host_token_hash: "hash123".to_string(),
-            created_at: now,
-            updated_at: now,
-            started_at: Some(now),
-            ended_at: None,
-            last_heartbeat_at: now,
-        };
-        let config = PartyConfiguration {
-            party_id: "pty_src_test".to_string(),
-            dj_level: "balanced".to_string(),
-            primary_mood_id: "house_party".to_string(),
-            secondary_mood_id: None,
-            energy_progression: "buildup".to_string(),
-            allow_guest_requests: true,
-            max_requests_per_guest: 3,
-            request_cooldown_mins: 10,
-            require_host_approval: true,
-            updated_at: now,
-        };
-        db.create_cloud_party(&party, &config).unwrap();
-
-        // Register YouTube Source
-        let source = PartySourceReference {
-            id: "src_001".to_string(),
-            party_id: "pty_src_test".to_string(),
-            provider: "youtube".to_string(),
-            original_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
-            provider_video_id: "dQw4w9WgXcQ".to_string(),
-            title: "Never Gonna Give You Up".to_string(),
-            artist: "Rick Astley".to_string(),
-            thumbnail_url: Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".to_string()),
-            duration_seconds: None,
-            verification_status: "verified".to_string(),
-            playback_method: "youtube_iframe_embed".to_string(),
-            playability_status: "playback_unverified".to_string(),
-            metadata_status: "fetched".to_string(),
-            error_reason: Some("Queued for Phase 2 YouTube Player embed".to_string()),
-            registered_at: now,
-            updated_at: now,
-        };
-
-        db.insert_party_source(&source).expect("Failed to insert source");
-
-        // Verify lookup by party ID
-        let sources = db.get_party_sources("pty_src_test").unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].title, "Never Gonna Give You Up");
-        assert_eq!(sources[0].playability_status, "playback_unverified");
-        assert_eq!(sources[0].playback_method, "youtube_iframe_embed");
-
-        // Verify lookup by video ID
-        let found = db.get_party_source_by_video_id("pty_src_test", "dQw4w9WgXcQ").unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().id, "src_001");
-    }
-
-    #[tokio::test]
-    async fn test_cloud_guest_authentication_and_privilege_isolation() {
-        let db = Database::new_in_memory().expect("Failed to initialize DB");
-        let now = chrono::Utc::now().timestamp_millis();
-
-        // 1. Create Party
-        let party = CloudParty {
-            id: "pty_guest_test".to_string(),
-            party_name: "Guest Test Party".to_string(),
-            status: "live".to_string(),
-            host_token_hash: "hash_host_token_abc".to_string(),
-            created_at: now,
-            updated_at: now,
-            started_at: Some(now),
-            ended_at: None,
-            last_heartbeat_at: now,
-        };
-        let config = PartyConfiguration {
-            party_id: "pty_guest_test".to_string(),
-            dj_level: "balanced".to_string(),
-            primary_mood_id: "house_party".to_string(),
-            secondary_mood_id: None,
-            energy_progression: "buildup".to_string(),
-            allow_guest_requests: true,
-            max_requests_per_guest: 2,
-            request_cooldown_mins: 10,
-            require_host_approval: true,
-            updated_at: now,
-        };
-        db.create_cloud_party(&party, &config).unwrap();
-
-        // 2. Register Source
-        let source = PartySourceReference {
-            id: "src_yt_100".to_string(),
-            party_id: "pty_guest_test".to_string(),
-            provider: "youtube".to_string(),
-            original_url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
-            provider_video_id: "dQw4w9WgXcQ".to_string(),
-            title: "Kala Chashma".to_string(),
-            artist: "Badshah".to_string(),
-            thumbnail_url: None,
-            duration_seconds: None,
-            verification_status: "verified".to_string(),
-            playback_method: "youtube_iframe_embed".to_string(),
-            playability_status: "playback_unverified".to_string(),
-            metadata_status: "fetched".to_string(),
-            error_reason: None,
-            registered_at: now,
-            updated_at: now,
-        };
-        db.insert_party_source(&source).unwrap();
-
-        // 3. Register Guest
-        use sha2::{Digest, Sha256};
-        let guest_token = "dhun_guest_secret_123";
-        let mut hasher = Sha256::new();
-        hasher.update(guest_token.as_bytes());
-        let token_hash = format!("{:x}", hasher.finalize());
-
-        let guest = PartyGuest {
-            id: "gst_001".to_string(),
-            party_id: "pty_guest_test".to_string(),
-            nickname: "Rahul".to_string(),
-            fingerprint: "client_fp_xyz".to_string(),
-            token_hash: token_hash.clone(),
-            client_ip: "192.168.1.15".to_string(),
-            request_count: 0,
-            is_blocked: false,
-            created_at: now,
-            last_seen_at: now,
-        };
-        db.register_party_guest(&guest).unwrap();
-
-        // 4. Verify Guest Token Lookup
-        let found_guest = db.lookup_party_guest_by_token("pty_guest_test", &token_hash).unwrap();
-        assert!(found_guest.is_some());
-        assert_eq!(found_guest.as_ref().unwrap().nickname, "Rahul");
-
-        // Verify invalid token fails lookup
-        let invalid_lookup = db.lookup_party_guest_by_token("pty_guest_test", "wrong_hash").unwrap();
-        assert!(invalid_lookup.is_none());
-
-        // 5. Submit Song Request
-        let req = PartySongRequest {
-            id: "req_001".to_string(),
-            party_id: "pty_guest_test".to_string(),
-            guest_id: "gst_001".to_string(),
-            guest_name: Some("Rahul".to_string()),
-            source_id: "src_yt_100".to_string(),
-            source_title: Some("Kala Chashma".to_string()),
-            source_artist: Some("Badshah".to_string()),
-            thumbnail_url: None,
-            custom_note: Some("Play this for the bride!".to_string()),
-            status: "pending".to_string(),
-            rejection_reason: None,
-            priority_score: 100.0,
-            created_at: now,
-            updated_at: now,
-        };
-        db.insert_party_song_request(&req).unwrap();
-
-        let requests = db.get_party_song_requests("pty_guest_test").unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].status, "pending");
-        assert_eq!(requests[0].guest_name.as_deref(), Some("Rahul"));
-
-        // 6. Host Approves Request
-        db.update_party_request_status("req_001", "pty_guest_test", "approved", None, "host", "host_admin")
-            .expect("Failed to approve request");
-
-        let updated_requests = db.get_party_song_requests("pty_guest_test").unwrap();
-        assert_eq!(updated_requests[0].status, "approved");
-
-        // 7. Host Rejects Request
-        db.update_party_request_status("req_001", "pty_guest_test", "rejected", Some("Not suitable for dinner time"), "host", "host_admin")
-            .expect("Failed to reject request");
-
-        let rejected_requests = db.get_party_song_requests("pty_guest_test").unwrap();
-        assert_eq!(rejected_requests[0].status, "rejected");
-        assert_eq!(rejected_requests[0].rejection_reason.as_deref(), Some("Not suitable for dinner time"));
-    }
-
     /// In-process handler test: verifies local party room creation, hashed secrets (zero raw storage),
     /// genuine LAN QR generation (and honest lan_reachable=false when offline), explicit-only closure,
     /// guest token invalidation, and post-party temporary cache cleanup.
@@ -2371,7 +2119,7 @@ mod tests {
         use dhun_lib::library::cache::{CACHE_PRIORITY_PLAYING, DEFAULT_MAX_TEMP_TRACKS};
         use dhun_lib::network::local_helper_routes::{
             close_local_room, create_local_room, get_host_room_dashboard, local_health,
-            start_local_room, CreateLocalRoomRequest, LocalHelperState,
+            start_local_room, CloseLocalRoomRequest, CreateLocalRoomRequest, LocalHelperState,
         };
         use dhun_lib::sync::MetadataSyncManager;
         use std::net::SocketAddr;
@@ -2505,17 +2253,21 @@ mod tests {
         assert_eq!(dash.internal_deck_capacity, 4);
         assert!(dash.auto_dj_enabled);
 
-        // 4. Explicit host closure invalidates room and purges temporary cached audio file
+        // 4. Explicit host closure with force_release_audio=true invalidates room and purges temporary cached audio file
         let Json(closed) = close_local_room(
             State(state.clone()),
             Path(created.room.room_id.clone()),
             ConnectInfo(host_addr),
             host_headers,
+            Some(Json(CloseLocalRoomRequest {
+                force_release_audio: Some(true),
+            })),
         )
         .await
         .expect("Explicit close must succeed");
         assert_eq!(closed["status"], "closed");
         assert_eq!(closed["purged_cache_files"], 1);
+        assert_eq!(closed["deferred_locked_files"], 0);
         assert!(!dummy_temp_audio.exists(), "Temporary audio must be deleted on explicit party close");
 
         let evt_closed = ws_rx.try_recv().expect("WS broadcast expected on close");
@@ -3180,7 +2932,16 @@ mod tests {
             acquisition_note: None,
             dj_status: status.to_string(),
             dj_score: 0.0,
-            local_cache_path: None,
+            local_cache_path: if acq == "cached_authorized" {
+                Some(format!("/tmp/{}.wav", id))
+            } else {
+                None
+            },
+            cache_id: if acq == "cached_authorized" {
+                Some(format!("lcache_{}", id))
+            } else {
+                None
+            },
             created_at: now,
             updated_at: now,
         };
@@ -3197,6 +2958,608 @@ mod tests {
             "Currently playing track must NEVER be interrupted or re-queued during evaluation"
         );
         assert_eq!(best_next.as_deref(), Some("perfect_fit"));
+
+        // 4. Metadata-only restricted_by_provider tracks must NEVER be chosen as best_playable_next
+        let restricted_only_pool = vec![
+            make_sub("restricted_hit", "queued_for_dj", 124.0, "8B", r#"["shaadi"]"#, "restricted_by_provider"),
+        ];
+        let (_, best_from_restricted) =
+            select_next_submission_without_interrupting(&restricted_only_pool, &shaadi, None, shaadi.target_energy);
+        assert!(
+            best_from_restricted.is_none(),
+            "restricted_by_provider tracks must NEVER be selected as playable DJ candidates"
+        );
+    }
+
+    /// In-process audio streaming & security test: verifies `GET /api/local/rooms/:room_id/cache/:cache_id/stream`
+    /// enforces host-only auth (401/403), cross-room ownership (404), canonical path traversal blocking (403),
+    /// expired entry rejection (410 Gone), missing file handling (404), MIME sniffing, and Byte-Range (200/206/416).
+    #[tokio::test]
+    async fn test_local_cache_audio_streaming_auth_ownership_range_and_traversal_in_process() {
+        use axum::extract::{ConnectInfo, Path, State};
+        use axum::http::{HeaderMap, HeaderValue, StatusCode};
+        use axum::Json;
+        use dhun_lib::library::cache::{CACHE_PRIORITY_NEXT_DECK, DEFAULT_MAX_TEMP_TRACKS};
+        use dhun_lib::network::local_helper_routes::{
+            create_local_room, guest_join_local_room, stream_local_cached_audio,
+            CreateLocalRoomRequest, GuestJoinRoomRequest, LocalHelperState,
+        };
+        use dhun_lib::sync::MetadataSyncManager;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_root = std::env::temp_dir().join(format!("dhun_p3_stream_{}", uuid::Uuid::new_v4()));
+        let temp_cache = temp_root.join("cache");
+        let outside_dir = temp_root.join("outside_secret");
+        std::fs::create_dir_all(&temp_cache).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let state = Arc::new(LocalHelperState::new(
+            db.clone(),
+            47821,
+            temp_cache.clone(),
+            sync_mgr,
+            Some(Some("192.168.1.40".to_string())),
+            vec!["https://dhun.vercel.app".to_string()],
+        ));
+        let host_addr: SocketAddr = "127.0.0.1:52100".parse().unwrap();
+        let guest_addr: SocketAddr = "192.168.1.77:52101".parse().unwrap();
+
+        let Json(room_a) = create_local_room(
+            State(state.clone()),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Stream Room A".to_string(),
+                dj_level: Some(3),
+                primary_mood_id: Some("shaadi".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(room_b) = create_local_room(
+            State(state.clone()),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Stream Room B".to_string(),
+                dj_level: Some(2),
+                primary_mood_id: Some("baraat".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(guest_a) = guest_join_local_room(
+            State(state.clone()),
+            Path(room_a.room.room_id.clone()),
+            ConnectInfo(guest_addr),
+            HeaderMap::new(),
+            Json(GuestJoinRoomRequest {
+                nickname: "Ananya".to_string(),
+                room_access_token: Some(room_a.room_access_token.clone()),
+                room_code: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut host_a_headers = HeaderMap::new();
+        host_a_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", room_a.host_token)).unwrap(),
+        );
+        let mut host_b_headers = HeaderMap::new();
+        host_b_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", room_b.host_token)).unwrap(),
+        );
+        let mut guest_a_headers = HeaderMap::new();
+        guest_a_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", guest_a.guest_token)).unwrap(),
+        );
+
+        // Write valid 1.0s WAV file into Room A's managed cache dir
+        let wav_bytes = create_test_wav_bytes(44100, 2, 44100, 44100);
+        let wav_path = temp_cache.join("stream_ready_track.wav");
+        std::fs::write(&wav_path, &wav_bytes).unwrap();
+        let entry = state
+            .cache_manager
+            .register_temp_track(
+                &room_a.room.room_id,
+                None,
+                "gsng_stream_1",
+                &wav_path,
+                CACHE_PRIORITY_NEXT_DECK,
+                true,
+                None,
+                DEFAULT_MAX_TEMP_TRACKS,
+                &db,
+            )
+            .unwrap();
+
+        // 1. Unauthenticated caller -> 401 Unauthorized
+        let unauth = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), entry.id.clone())),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(unauth.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // 2. Guest caller -> 403 Forbidden (guests NEVER stream party audio!)
+        let guest_res = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), entry.id.clone())),
+            ConnectInfo(guest_addr),
+            guest_a_headers,
+        )
+        .await;
+        assert_eq!(guest_res.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // 3. Cross-room access (Host B requesting Room A's cache entry under Room B) -> 404 Not Found
+        let cross_room = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_b.room.room_id.clone(), entry.id.clone())),
+            ConnectInfo(host_addr),
+            host_b_headers,
+        )
+        .await;
+        assert_eq!(cross_room.unwrap_err().0, StatusCode::NOT_FOUND);
+
+        // 4. Authorized Host A full stream -> 200 OK with audio/wav + Accept-Ranges: bytes
+        let ok_resp = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), entry.id.clone())),
+            ConnectInfo(host_addr),
+            host_a_headers.clone(),
+        )
+        .await
+        .expect("Host must be able to stream authorized cached audio");
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        assert_eq!(ok_resp.headers().get("content-type").unwrap(), "audio/wav");
+        assert_eq!(ok_resp.headers().get("accept-ranges").unwrap(), "bytes");
+        let full_body = axum::body::to_bytes(ok_resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(full_body.len(), wav_bytes.len());
+        assert_eq!(&full_body[0..4], b"RIFF");
+
+        // 5. Byte-Range request (bytes=0-1023) -> 206 Partial Content
+        let mut range_headers = host_a_headers.clone();
+        range_headers.insert("range", HeaderValue::from_static("bytes=0-1023"));
+        let partial_resp = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), entry.id.clone())),
+            ConnectInfo(host_addr),
+            range_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(partial_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial_resp.headers().get("content-range").unwrap(),
+            &format!("bytes 0-1023/{}", wav_bytes.len())
+        );
+        let partial_body = axum::body::to_bytes(partial_resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(partial_body.len(), 1024);
+
+        // 6. Out-of-bounds Byte-Range -> 416 Range Not Satisfiable
+        let mut bad_range_headers = host_a_headers.clone();
+        bad_range_headers.insert("range", HeaderValue::from_static("bytes=99999999-"));
+        let unsatisfiable = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), entry.id.clone())),
+            ConnectInfo(host_addr),
+            bad_range_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        // 7. Path traversal outside cache_dir -> 403 Forbidden
+        let secret_file = outside_dir.join("host_secret.txt");
+        std::fs::write(&secret_file, b"TOP_SECRET_OUTSIDE_CACHE").unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        db.upsert_local_temp_cache(&LocalTempCacheEntry {
+            id: "lcache_traversal".to_string(),
+            room_id: room_a.room.room_id.clone(),
+            submission_id: None,
+            song_id: "gsng_evil".to_string(),
+            file_path: secret_file.to_string_lossy().to_string(),
+            size_bytes: 24,
+            priority_tier: 0,
+            is_locked: false,
+            created_at: now,
+            last_accessed_at: now,
+            expires_at: now + 3_600_000,
+        })
+        .unwrap();
+        let traversal = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), "lcache_traversal".to_string())),
+            ConnectInfo(host_addr),
+            host_a_headers.clone(),
+        )
+        .await;
+        assert_eq!(traversal.unwrap_err().0, StatusCode::FORBIDDEN);
+
+        // 8. Expired cache entry -> 410 Gone
+        let expired_wav_path = temp_cache.join("expired_stream_track.wav");
+        std::fs::write(&expired_wav_path, &wav_bytes).unwrap();
+        db.upsert_local_temp_cache(&LocalTempCacheEntry {
+            id: "lcache_expired_stream".to_string(),
+            room_id: room_a.room.room_id.clone(),
+            submission_id: None,
+            song_id: "gsng_exp".to_string(),
+            file_path: expired_wav_path.to_string_lossy().to_string(),
+            size_bytes: wav_bytes.len() as i64,
+            priority_tier: 0,
+            is_locked: false,
+            created_at: now - 7_200_000,
+            last_accessed_at: now - 7_200_000,
+            expires_at: now - 1_000,
+        })
+        .unwrap();
+        let expired = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), "lcache_expired_stream".to_string())),
+            ConnectInfo(host_addr),
+            host_a_headers.clone(),
+        )
+        .await;
+        assert_eq!(expired.unwrap_err().0, StatusCode::GONE);
+
+        // 9. Deleted/missing backing file -> 404 Not Found
+        std::fs::remove_file(&wav_path).unwrap();
+        let missing = stream_local_cached_audio(
+            State(state.clone()),
+            Path((room_a.room.room_id.clone(), entry.id.clone())),
+            ConnectInfo(host_addr),
+            host_a_headers,
+        )
+        .await;
+        assert_eq!(missing.unwrap_err().0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// In-process playback lifecycle test: verifies `POST /dj/playback-event` cache locking,
+    /// decode failure recovery without interrupting active deck, safe deferred room close
+    /// preserving locked in-use audio (60m expiry fallback) while deleting unlocked files,
+    /// `POST /cache/release` final cleanup, and repeat-avoiding DJ candidate selection.
+    #[tokio::test]
+    async fn test_playback_event_locking_safe_close_and_non_repeating_dj_in_process() {
+        use axum::extract::{ConnectInfo, Path, State};
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::Json;
+        use dhun_lib::library::cache::{
+            CACHE_PRIORITY_EVICTABLE, DEFAULT_MAX_TEMP_TRACKS, DEFAULT_TEMP_CACHE_TTL_MS,
+        };
+        use dhun_lib::network::local_helper_routes::{
+            close_local_room, create_local_room, get_host_room_dashboard, record_dj_playback_event,
+            release_room_cache, CreateLocalRoomRequest, LocalHelperState, PlaybackEventRequest,
+        };
+        use dhun_lib::sync::MetadataSyncManager;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        // Verify shortened cache TTL fallback is strictly 60 minutes (within 30m-2h window)
+        assert_eq!(DEFAULT_TEMP_CACHE_TTL_MS, 60 * 60 * 1000);
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_p3_life_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_cache).unwrap();
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let state = Arc::new(LocalHelperState::new(
+            db.clone(),
+            47821,
+            temp_cache.clone(),
+            sync_mgr,
+            Some(Some("192.168.1.41".to_string())),
+            vec![],
+        ));
+        let host_addr: SocketAddr = "127.0.0.1:52200".parse().unwrap();
+
+        let Json(created) = create_local_room(
+            State(state.clone()),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Safe Close Lifecycle Test".to_string(),
+                dj_level: Some(3),
+                primary_mood_id: Some("shaadi".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut host_headers = HeaderMap::new();
+        host_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", created.host_token)).unwrap(),
+        );
+
+        // Seed 3 cached tracks: sub_1 (will play), sub_2 (corrupt decode fail), sub_3 (clean next track)
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut paths = Vec::new();
+        for (idx, (sub_id, vid, title)) in [
+            ("sub_play_1", "vidAAA11111", "Track One"),
+            ("sub_bad_2", "vidBBB22222", "Track Two Broken"),
+            ("sub_good_3", "vidCCC33333", "Track Three Clean"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let p = temp_cache.join(format!("{}.wav", sub_id));
+            std::fs::write(&p, create_test_wav_bytes(44100, 2, 44100, 44100)).unwrap();
+            paths.push(p.clone());
+
+            db.insert_local_room_submission(&LocalRoomSubmission {
+                id: sub_id.to_string(),
+                room_id: created.room.room_id.clone(),
+                submitted_by_type: "host".to_string(),
+                submitted_by_id: "host".to_string(),
+                submitted_by_name: "Host".to_string(),
+                provider: "youtube".to_string(),
+                source_url: format!("https://www.youtube.com/watch?v={}", vid),
+                provider_video_id: vid.to_string(),
+                song_id: Some(format!("gsng_{}", idx)),
+                title: title.to_string(),
+                artist: "Artist".to_string(),
+                version_tag: "original".to_string(),
+                thumbnail_url: None,
+                duration_ms: Some(180_000),
+                bpm: Some(126.0),
+                half_time_bpm: Some(63.0),
+                double_time_bpm: Some(252.0),
+                musical_key: Some("C Major".to_string()),
+                camelot_key: Some("8B".to_string()),
+                overall_energy: Some(0.80),
+                danceability: Some(0.90),
+                genre_tags_json: r#"["Bollywood"]"#.to_string(),
+                mood_tags_json: r#"["shaadi"]"#.to_string(),
+                metadata_source: "local_analysis".to_string(),
+                acquisition_status: "cached_authorized".to_string(),
+                acquisition_note: None,
+                dj_status: "queued_for_dj".to_string(),
+                dj_score: 0.0,
+                local_cache_path: Some(p.to_string_lossy().to_string()),
+                cache_id: None,
+                created_at: now + idx as i64,
+                updated_at: now + idx as i64,
+            })
+            .unwrap();
+
+            state
+                .cache_manager
+                .register_temp_track(
+                    &created.room.room_id,
+                    Some(sub_id),
+                    &format!("gsng_{}", idx),
+                    &p,
+                    CACHE_PRIORITY_EVICTABLE,
+                    false,
+                    None,
+                    DEFAULT_MAX_TEMP_TRACKS,
+                    &db,
+                )
+                .unwrap();
+        }
+
+        // Verify dashboard exposes opaque `cache_id` and NEVER raw `local_cache_path` in JSON
+        let Json(dash) = get_host_room_dashboard(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+        )
+        .await
+        .unwrap();
+        let dash_json = serde_json::to_string(&dash).unwrap();
+        assert!(!dash_json.contains("local_cache_path"), "Raw filesystem paths must NEVER be serialized to API JSON");
+        assert!(dash.submissions.iter().all(|s| s.cache_id.is_some()));
+
+        // 1. Mark sub_play_1 as actively `playing` -> locks its cache file!
+        let Json(ev_play) = record_dj_playback_event(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+            Json(PlaybackEventRequest {
+                submission_id: "sub_play_1".to_string(),
+                event: "playing".to_string(),
+                deck_id: Some(0),
+                error_detail: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ev_play.dj_status, "playing");
+        let c1 = db
+            .get_temp_cache_entry_by_submission(&created.room.room_id, "sub_play_1")
+            .unwrap()
+            .unwrap();
+        assert!(c1.is_locked, "Actively playing track must be cache-locked");
+
+        // 2. Simulate decode failure on sub_bad_2 -> marked `skipped_unplayable`, sub_play_1 untouched, next playable advances to sub_good_3
+        let Json(ev_fail) = record_dj_playback_event(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+            Json(PlaybackEventRequest {
+                submission_id: "sub_bad_2".to_string(),
+                event: "decode_failed".to_string(),
+                deck_id: Some(1),
+                error_detail: Some("Simulated Web Audio decode error".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ev_fail.dj_status, "skipped_unplayable");
+        assert_eq!(
+            ev_fail.next_playable_candidate.as_ref().map(|c| c.submission_id.as_str()),
+            Some("sub_good_3"),
+            "Next playable candidate must cleanly recover to sub_good_3"
+        );
+
+        // 3. Safe room closure (`force_release_audio: false` / None):
+        //    deletes unlocked files (sub_bad_2, sub_good_3) immediately, preserves locked sub_play_1!
+        let Json(safe_closed) = close_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(safe_closed["status"], "closed");
+        assert_eq!(safe_closed["purged_cache_files"], 2);
+        assert_eq!(safe_closed["deferred_locked_files"], 1);
+        assert!(paths[0].exists(), "In-use locked audio file MUST NOT be deleted mid-playback on close");
+        assert!(!paths[1].exists(), "Unlocked cache file must be deleted immediately on close");
+        assert!(!paths[2].exists(), "Unlocked cache file must be deleted immediately on close");
+
+        // 4. Once Web Audio finishes fade-out, `release_room_cache` purges the deferred file cleanly
+        let Json(released) = release_room_cache(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(released["purged_cache_files"], 1);
+        assert!(!paths[0].exists(), "Deferred locked audio file must be deleted upon release");
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
+    /// In-process concurrency & schema hygiene test: verifies Migration v5 removed all obsolete
+    /// Phase 1 cloud-party tables and tests concurrent multi-guest song submissions against SQLite.
+    #[tokio::test]
+    async fn test_concurrent_song_submissions_and_migration_v5_cleanup_in_process() {
+        use axum::extract::{ConnectInfo, Path, State};
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::Json;
+        use dhun_lib::network::local_helper_routes::{
+            create_local_room, guest_join_local_room, submit_song_to_local_room,
+            CreateLocalRoomRequest, GuestJoinRoomRequest, LocalHelperState,
+            UnifiedSongSubmissionRequest,
+        };
+        use dhun_lib::sync::MetadataSyncManager;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        let db = Database::new_in_memory().unwrap();
+
+        // 1. Verify Migration v5 dropped obsolete Phase 1 cloud-party tables
+        {
+            let conn = db.conn();
+            let guard = conn.lock().unwrap();
+            let obsolete_count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
+                        'parties', 'party_configurations', 'party_source_references',
+                        'party_guests', 'party_song_requests', 'request_status_history'
+                    )",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                obsolete_count, 0,
+                "Migration v5 must drop all obsolete Phase 1 cloud-party tables"
+            );
+        }
+
+        let temp_cache = std::env::temp_dir().join(format!("dhun_p3_conc_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_cache).unwrap();
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let state = Arc::new(LocalHelperState::new(
+            db.clone(),
+            47821,
+            temp_cache.clone(),
+            sync_mgr,
+            Some(Some("192.168.1.42".to_string())),
+            vec![],
+        ));
+        let host_addr: SocketAddr = "127.0.0.1:52300".parse().unwrap();
+
+        let Json(room) = create_local_room(
+            State(state.clone()),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Concurrency Stress Party".to_string(),
+                dj_level: Some(2),
+                primary_mood_id: Some("desi_club".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Admit 4 guests on LAN and submit 4 different YouTube URLs concurrently
+        let mut guest_tokens = Vec::new();
+        for i in 0..4 {
+            let g_addr: SocketAddr = format!("192.168.1.{}:5500{}", 100 + i, i).parse().unwrap();
+            let Json(g) = guest_join_local_room(
+                State(state.clone()),
+                Path(room.room.room_id.clone()),
+                ConnectInfo(g_addr),
+                HeaderMap::new(),
+                Json(GuestJoinRoomRequest {
+                    nickname: format!("Guest_{}", i),
+                    room_access_token: Some(room.room_access_token.clone()),
+                    room_code: None,
+                }),
+            )
+            .await
+            .unwrap();
+            guest_tokens.push((g_addr, g.guest_token));
+        }
+
+        let video_ids = ["dQw4w9WgXcQ", "9bZkp7q19f0", "kJQP7kiw5Fk", "JGwWNGJdvx8"];
+        let mut futs = Vec::new();
+        for (idx, (g_addr, tok)) in guest_tokens.into_iter().enumerate() {
+            let st = state.clone();
+            let rid = room.room.room_id.clone();
+            let vid = video_ids[idx];
+            futs.push(tokio::spawn(async move {
+                let mut h = HeaderMap::new();
+                h.insert("authorization", HeaderValue::from_str(&format!("Bearer {}", tok)).unwrap());
+                submit_song_to_local_room(
+                    State(st),
+                    Path(rid),
+                    ConnectInfo(g_addr),
+                    h,
+                    Json(UnifiedSongSubmissionRequest {
+                        url: format!("https://www.youtube.com/watch?v={}", vid),
+                        authorized_stream: None,
+                    }),
+                )
+                .await
+            }));
+        }
+
+        for f in futs {
+            let res = f.await.expect("Task must not panic").expect("Concurrent submission must succeed");
+            assert_eq!(res.0.status, "received_by_dj");
+        }
+
+        let all_subs = db.get_local_room_submissions(&room.room.room_id).unwrap();
+        assert_eq!(all_subs.len(), 4, "All 4 concurrent guest submissions must be persisted cleanly");
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
     }
 }
 

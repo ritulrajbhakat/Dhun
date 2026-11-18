@@ -1,3 +1,4 @@
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,12 +11,48 @@ use dhun_lib::network::local_helper_routes::{
 };
 use dhun_lib::sync::MetadataSyncManager;
 
+/// Resolves safe OS-native storage directory for the local helper database and temporary cache:
+/// - Windows: `%LOCALAPPDATA%\DHUN\helper`
+/// - macOS:   `$HOME/Library/Application Support/DHUN/helper`
+/// - Linux:   `$XDG_DATA_HOME/dhun/helper` or `$HOME/.local/share/dhun/helper`
+fn resolve_default_helper_data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data).join("DHUN").join("helper");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("DHUN")
+                .join("helper");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg).join("dhun").join("helper");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".local").join("share").join("dhun").join("helper");
+        }
+    }
+    PathBuf::from(".").join("dhun_helper_data")
+}
+
 /// DHUN Local Helper Service (`dhun-local-helper`)
 ///
 /// Runs on the host laptop while the party is active:
 /// - Hosts the private local party room over host loopback + same-LAN Wi-Fi ONLY.
 /// - Generates real LAN QR codes with room_id + cryptographic room_access_token.
-/// - Manages temporary local audio cache (10-15 tracks max) with post-party & expiry cleanup.
+/// - Streams host-authenticated locally cached authorized audio to the 4-deck Web Audio engine.
+/// - Manages temporary local audio cache (10-15 tracks max) with post-party & 60m expiry cleanup.
 /// - Runs local song analysis & non-interrupting automated DJ candidate evaluation.
 /// - Syncs ONLY reusable song metadata (never audio or party state) to the Global Metadata Catalogue.
 #[tokio::main]
@@ -26,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     info!("=================================================================");
-    info!("DHUN धुन — Local Party Helper Service");
+    info!("DHUN धुन — Local Party Helper Service (v2.1.0)");
     info!("Private LAN Party Room • Local Temp Cache • Automated DJ Engine");
     info!("=================================================================");
 
@@ -36,19 +73,32 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_LOCAL_HELPER_PORT);
 
-    let db_path = PathBuf::from(
-        std::env::var("DHUN_LOCAL_DB_PATH").unwrap_or_else(|_| "dhun_local_helper.db".to_string()),
-    );
-    let cache_dir = PathBuf::from(
-        std::env::var("DHUN_CACHE_DIR").unwrap_or_else(|_| "dhun_temp_cache".to_string()),
-    );
+    let default_data_dir = resolve_default_helper_data_dir();
+    let _ = fs::create_dir_all(&default_data_dir);
 
-    info!("Local SQLite DB: {:?}", db_path);
-    info!("Temporary Audio Cache Dir: {:?}", cache_dir);
+    let db_path = std::env::var("DHUN_LOCAL_DB_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_data_dir.join("dhun_local_helper.db"));
+
+    let cache_dir = std::env::var("DHUN_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_data_dir.join("temp_cache"));
+
+    if let Some(parent) = db_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::create_dir_all(&cache_dir);
+
+    info!("Local SQLite DB:          {:?}", db_path);
+    info!("Temporary Cache Dir:      {:?}", cache_dir);
 
     let db = Database::new(&db_path)?;
 
-    // Configure engine-only Global Shared Song Metadata Catalogue sync client (optional — works 100% offline)
+    // Engine-only Global Shared Song Metadata Catalogue sync client (optional — works 100% offline)
     let catalogue_url = std::env::var("DHUN_GLOBAL_CATALOGUE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -99,9 +149,9 @@ async fn main() -> anyhow::Result<()> {
         info!("Cleaned up {} expired temporary cache file(s) on launch.", purged_expired);
     }
 
-    info!("Host Loopback API:  http://127.0.0.1:{}", port);
-    match &state.detected_lan_ip {
-        Some(lan) => info!("LAN Guest Endpoint: http://{}:{} (same Wi-Fi/LAN only)", lan, port),
+    info!("Host Loopback API:        http://127.0.0.1:{}", port);
+    match state.current_lan_ip() {
+        Some(lan) => info!("LAN Guest Endpoint:       http://{}:{} (same Wi-Fi/LAN only)", lan, port),
         None => warn!("No reachable RFC1918 LAN IP detected. Connect to Wi-Fi/LAN for guest smartphone access."),
     }
 

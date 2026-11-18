@@ -3,6 +3,7 @@ import {
   HostRoomDashboardResponse,
   LocalHelperHealth,
   LocalPartyRoom,
+  PlayableCandidatePointer,
   UnifiedSongSubmissionResponse,
 } from '../types';
 
@@ -187,16 +188,86 @@ export class LocalHelperClient {
     );
   }
 
-  public async closeLocalRoom(roomId: string): Promise<{
+  public async closeLocalRoom(
+    roomId: string,
+    forceReleaseAudio: boolean = false
+  ): Promise<{
     room_id: string;
     status: string;
     closed_at: number;
     invalidated_guests: number;
     purged_cache_files: number;
+    deferred_locked_files: number;
   }> {
     return this.request(
       `/api/local/rooms/${roomId}/close`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ force_release_audio: forceReleaseAudio }),
+      },
+      true
+    );
+  }
+
+  public async releaseRoomCache(roomId: string): Promise<{
+    room_id: string;
+    purged_cache_files: number;
+  }> {
+    return this.request(
+      `/api/local/rooms/${roomId}/cache/release`,
       { method: 'POST' },
+      true
+    );
+  }
+
+  /**
+   * Fetches locally cached authorized audio bytes from the host-only streaming route:
+   * `GET /api/local/rooms/:room_id/cache/:cache_id/stream`
+   * Returns raw ArrayBuffer directly to WebAudioEngine (never persisted in React state).
+   */
+  public async fetchAuthorizedCachedAudio(
+    roomId: string,
+    cacheId: string
+  ): Promise<ArrayBuffer> {
+    if (!this.hostToken) {
+      throw new Error('Host authentication token missing for protected cache stream.');
+    }
+    const url = `${this.baseUrl}/api/local/rooms/${roomId}/cache/${encodeURIComponent(cacheId)}/stream`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${this.hostToken}`,
+        'X-Host-Token': this.hostToken,
+      },
+    });
+    if (!res.ok) {
+      const msg = await res.text().catch(() => res.statusText);
+      throw new Error(`Cache stream failed (${res.status}): ${msg}`);
+    }
+    return res.arrayBuffer();
+  }
+
+  public async recordPlaybackEvent(
+    roomId: string,
+    payload: {
+      submission_id: string;
+      event: 'prepared' | 'playing' | 'played' | 'decode_failed';
+      deck_id?: number;
+      error_detail?: string;
+    }
+  ): Promise<{
+    submission_id: string;
+    dj_status: string;
+    cache_locked: boolean;
+    next_playable_candidate: PlayableCandidatePointer | null;
+    transition_style: string;
+  }> {
+    return this.request(
+      `/api/local/rooms/${roomId}/dj/playback-event`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
       true
     );
   }
@@ -237,6 +308,7 @@ export class LocalHelperClient {
   public async evaluateDjPool(roomId: string): Promise<{
     evaluated_count: number;
     prepared_next_submission_id: string | null;
+    next_playable_candidate: PlayableCandidatePointer | null;
     interrupted_current_track: boolean;
     transition_style: string;
   }> {

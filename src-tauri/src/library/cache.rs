@@ -11,8 +11,9 @@ use crate::db::models::{CacheStats, LocalTempCacheEntry, LocalTempCacheStats};
 pub const DEFAULT_MAX_CACHE_BYTES: i64 = 5 * 1024 * 1024 * 1024; // 5 GB
 /// Target maximum number of temporary local party audio tracks retained simultaneously (10-15 tracks).
 pub const DEFAULT_MAX_TEMP_TRACKS: usize = 15;
-/// Fallback expiry TTL for temporary party audio files (24 hours) in case the host crashes before explicit closure.
-pub const DEFAULT_TEMP_CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// Fallback expiry TTL for temporary party audio files (60 minutes — within 30 min to 2 hr policy)
+/// in case the host crashes before explicit closure or audio was locked during close.
+pub const DEFAULT_TEMP_CACHE_TTL_MS: i64 = 60 * 60 * 1000;
 
 pub const CACHE_PRIORITY_EVICTABLE: i32 = 0;
 pub const CACHE_PRIORITY_UPCOMING: i32 = 1;
@@ -207,14 +208,35 @@ impl RollingCacheManager {
         Ok(count)
     }
 
-    /// Deletes all temporary cached audio files belonging to a room when the host explicitly closes the party.
+    /// Deletes all UNLOCKED temporary cached audio files belonging to a room when the host explicitly closes the party.
+    /// Audio currently locked in active playback is NOT deleted until playback safely releases it,
+    /// and receives a shortened 60-minute expiry fallback for launch-time cleanup.
+    /// Returns `(deleted_immediately, deferred_locked)`.
+    pub fn purge_room_cache_safely(&self, room_id: &str, db: &Database) -> Result<(usize, usize)> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let fallback_expires_at = now + DEFAULT_TEMP_CACHE_TTL_MS;
+        let (unlocked_entries, deferred_locked) =
+            db.delete_unlocked_local_temp_cache_for_room(room_id, fallback_expires_at)?;
+        let count = unlocked_entries.len();
+        for (_id, path_str) in unlocked_entries {
+            self.safe_delete_within_cache(&path_str);
+        }
+        info!(
+            "Explicit party closure for room {}: deleted {} unlocked temp audio files immediately, {} locked file(s) deferred with 60m fallback TTL",
+            room_id, count, deferred_locked
+        );
+        Ok((count, deferred_locked))
+    }
+
+    /// Unlocks all remaining room tracks (after playback has safely stopped) and immediately purges them from disk.
     pub fn purge_room_cache(&self, room_id: &str, db: &Database) -> Result<usize> {
+        let _ = db.unlock_all_temp_cache_for_room(room_id)?;
         let entries = db.delete_local_temp_cache_for_room(room_id)?;
         let count = entries.len();
         for (_id, path_str) in entries {
             self.safe_delete_within_cache(&path_str);
         }
-        info!("Explicit party closure purged {} temporary audio files for room {}", count, room_id);
+        info!("Purged {} temporary audio files for room {} after playback release", count, room_id);
         Ok(count)
     }
 

@@ -6,13 +6,18 @@ import {
   LocalRoomSubmission,
   LocalTempCacheStats,
   MoodProfile,
+  PlayableCandidatePointer,
   SyncStatusOverview,
   UnifiedSongSubmissionResponse,
 } from '../types';
 import { CURATED_MOODS } from '../api/ipc';
 import { localHelperClient } from '../api/client';
 import { localRoomWsClient } from '../api/websocket';
-import { webAudioEngine } from '../audio/WebAudioEngine';
+import {
+  TransitionStyle,
+  WebAudioDeckStatus,
+  webAudioEngine,
+} from '../audio/WebAudioEngine';
 
 export type ScreenView =
   | 'home'
@@ -24,6 +29,14 @@ export type ScreenView =
   | 'history'
   | 'settings'
   | 'diagnostics';
+
+export type AutoDjPlaybackState =
+  | 'standby'
+  | 'awaiting_playable_audio'
+  | 'preparing'
+  | 'playing'
+  | 'transitioning'
+  | 'decode_error_recovered';
 
 interface DeckControlState {
   eqLow: number;
@@ -57,8 +70,15 @@ interface DhunState {
   guestUrl: string | null;
   qrSvg: string | null;
   submissions: LocalRoomSubmission[];
+  nextPlayableCandidate: PlayableCandidatePointer | null;
+  transitionStyle: TransitionStyle;
   cacheStats: LocalTempCacheStats;
   syncOverview: SyncStatusOverview;
+
+  // Real Web Audio 4-Deck Playback State (Driven strictly by actual AudioContext & decoded buffers)
+  deckSnapshots: WebAudioDeckStatus[];
+  autoDjPlaybackState: AutoDjPlaybackState;
+  autoDjStatusNote: string | null;
 
   // All 14 Curated Moods & 4-Deck Web Audio Controls
   moodProfiles: MoodProfile[];
@@ -80,14 +100,19 @@ interface DhunState {
     secondaryMoodId?: string
   ) => Promise<void>;
   startLocalRoom: () => Promise<void>;
-  closeLocalRoom: () => Promise<{ invalidated_guests: number; purged_cache_files: number } | null>;
+  closeLocalRoom: () => Promise<{
+    invalidated_guests: number;
+    purged_cache_files: number;
+    deferred_locked_files: number;
+  } | null>;
   clearLocalRoomSession: () => void;
   submitSong: (url: string) => Promise<UnifiedSongSubmissionResponse>;
   evaluateDjPool: () => Promise<void>;
+  driveAutoDjLoop: () => Promise<void>;
   setDjLevel: (level: DjLevel) => Promise<void>;
   setPartyMood: (moodId: string) => Promise<void>;
 
-  // 4-Deck Web Audio Controls (Isolated from network/DB callbacks)
+  // 4-Deck Web Audio Controls
   setCrossfaderPos: (pos: number) => void;
   updateDeckEq: (deckId: number, low: number, mid: number, high: number) => void;
   updateDeckGain: (deckId: number, gain: number) => void;
@@ -113,7 +138,32 @@ const DJ_LEVEL_NAMES: Record<DjLevel, string> = {
   4: 'Creative DJ Tools',
 };
 
+let httpFallbackTimer: ReturnType<typeof setInterval> | null = null;
+let isPreparingDeck = false;
+
+function stopHttpFallbackPolling() {
+  if (httpFallbackTimer) {
+    clearInterval(httpFallbackTimer);
+    httpFallbackTimer = null;
+  }
+}
+
 export const useDhunStore = create<DhunState>((set, get) => {
+  const ensureFallbackPolling = () => {
+    if (httpFallbackTimer) return;
+    httpFallbackTimer = setInterval(() => {
+      const { activeRoom, wsConnected, helperConnected } = get();
+      if (!activeRoom || activeRoom.status === 'closed') {
+        stopHttpFallbackPolling();
+        return;
+      }
+      // If a strict browser (e.g. Safari) blocks ws://127.0.0.1 from HTTPS, seamlessly poll REST
+      if (!wsConnected && helperConnected) {
+        void get().refreshRoomDashboard();
+      }
+    }, 5000);
+  };
+
   const handleLocalRoomEvent = (evt: LocalRoomEvent) => {
     const { activeRoom } = get();
     if (!activeRoom || evt.room_id !== activeRoom.room_id) return;
@@ -122,11 +172,89 @@ export const useDhunStore = create<DhunState>((set, get) => {
       evt.event_type === 'room.config_updated' ||
       evt.event_type === 'room.closed' ||
       evt.event_type === 'dj.submission_received' ||
-      evt.event_type === 'dj.evaluated'
+      evt.event_type === 'dj.evaluated' ||
+      evt.event_type === 'dj.playback_updated'
     ) {
-      get().refreshRoomDashboard();
+      void get().refreshRoomDashboard().then(() => {
+        if (get().activeRoom?.status === 'live') {
+          void get().driveAutoDjLoop();
+        }
+      });
     }
   };
+
+  // Wire real Web Audio engine clock callbacks to the Automated DJ controller
+  webAudioEngine.setCallbacks({
+    onSnapshot: (deckSnapshots) => {
+      set({ deckSnapshots });
+    },
+    onPreloadWindow: () => {
+      // Preload next playable candidate onto an idle deck before current track finishes
+      void get().driveAutoDjLoop();
+    },
+    onTransitionStarted: (_fromDeck, _fromSubId, toDeckId, toSubId) => {
+      const { activeRoom } = get();
+      set({
+        autoDjPlaybackState: 'transitioning',
+        autoDjStatusNote: `Transitioning automatically to Deck ${String.fromCharCode(65 + toDeckId)}`,
+      });
+      if (activeRoom) {
+        void localHelperClient
+          .recordPlaybackEvent(activeRoom.room_id, {
+            submission_id: toSubId,
+            event: 'playing',
+            deck_id: toDeckId,
+          })
+          .then(() => get().refreshRoomDashboard())
+          .catch(() => {});
+      }
+    },
+    onTrackEnded: (deckId, finishedSubId) => {
+      const { activeRoom } = get();
+      if (!activeRoom) return;
+      void localHelperClient
+        .recordPlaybackEvent(activeRoom.room_id, {
+          submission_id: finishedSubId,
+          event: 'played',
+          deck_id: deckId,
+        })
+        .then(async (res) => {
+          set({
+            nextPlayableCandidate: res.next_playable_candidate,
+            transitionStyle: (res.transition_style as TransitionStyle) || 'bass_swap',
+          });
+          await get().refreshRoomDashboard();
+
+          // If another deck is already playing (via overlap transition), keep state 'playing'
+          const activeDeck = webAudioEngine.getActivePlayingDeck();
+          if (activeDeck) {
+            set({ autoDjPlaybackState: 'playing', autoDjStatusNote: `Playing ${activeDeck.title}` });
+            return;
+          }
+
+          // Otherwise start any prepared deck immediately or fetch next playable candidate
+          const prepared = webAudioEngine.getPreparedIdleDeck();
+          if (prepared && prepared.submissionId) {
+            const started = webAudioEngine.startDeck(prepared.deckId, 1.0);
+            if (started) {
+              set({
+                autoDjPlaybackState: 'playing',
+                autoDjStatusNote: `Auto-advanced to ${prepared.title}`,
+              });
+              await localHelperClient.recordPlaybackEvent(activeRoom.room_id, {
+                submission_id: prepared.submissionId,
+                event: 'playing',
+                deck_id: prepared.deckId,
+              });
+              return;
+            }
+          }
+
+          await get().driveAutoDjLoop();
+        })
+        .catch(() => {});
+    },
+  });
 
   return {
     currentView: 'home',
@@ -149,8 +277,14 @@ export const useDhunStore = create<DhunState>((set, get) => {
     guestUrl: null,
     qrSvg: null,
     submissions: [],
+    nextPlayableCandidate: null,
+    transitionStyle: 'bass_swap',
     cacheStats: { track_count: 0, max_tracks: 15, total_bytes: 0, locked_tracks: 0 },
     syncOverview: { pending_count: 0, in_flight_count: 0, synced_count: 0, failed_count: 0 },
+
+    deckSnapshots: [],
+    autoDjPlaybackState: 'standby',
+    autoDjStatusNote: null,
 
     moodProfiles: CURATED_MOODS,
     selectedMoodId: 'house_party',
@@ -199,6 +333,9 @@ export const useDhunStore = create<DhunState>((set, get) => {
       try {
         const dash = await localHelperClient.getRoomDashboard(savedRoomId);
         const savedQr = localHelperClient.getSavedGuestQr();
+        const style = (dash.transition_style as TransitionStyle) || 'bass_swap';
+        webAudioEngine.setTransitionStyle(style);
+
         set({
           activeRoom: dash.room,
           djLevelName: dash.dj_level_name,
@@ -207,6 +344,8 @@ export const useDhunStore = create<DhunState>((set, get) => {
           lanReachable: dash.lan_reachable,
           detectedLanIp: dash.detected_lan_ip,
           submissions: dash.submissions,
+          nextPlayableCandidate: dash.next_playable_candidate,
+          transitionStyle: style,
           cacheStats: dash.cache_stats,
           syncOverview: dash.sync_overview,
           selectedMoodId: dash.room.primary_mood_id,
@@ -219,6 +358,10 @@ export const useDhunStore = create<DhunState>((set, get) => {
           localRoomWsClient.connect(savedRoomId, handleLocalRoomEvent, (connected) => {
             set({ wsConnected: connected });
           });
+          ensureFallbackPolling();
+          if (dash.room.status === 'live') {
+            void get().driveAutoDjLoop();
+          }
         }
       } catch {
         localHelperClient.setSavedRoomSession(null);
@@ -228,6 +371,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
           guestUrl: null,
           qrSvg: null,
           submissions: [],
+          nextPlayableCandidate: null,
         });
       }
     },
@@ -237,6 +381,8 @@ export const useDhunStore = create<DhunState>((set, get) => {
       if (!activeRoom) return;
       try {
         const dash = await localHelperClient.getRoomDashboard(activeRoom.room_id);
+        const style = (dash.transition_style as TransitionStyle) || 'bass_swap';
+        webAudioEngine.setTransitionStyle(style);
         set({
           activeRoom: dash.room,
           djLevelName: dash.dj_level_name,
@@ -245,6 +391,8 @@ export const useDhunStore = create<DhunState>((set, get) => {
           lanReachable: dash.lan_reachable,
           detectedLanIp: dash.detected_lan_ip,
           submissions: dash.submissions,
+          nextPlayableCandidate: dash.next_playable_candidate,
+          transitionStyle: style,
           cacheStats: dash.cache_stats,
           syncOverview: dash.sync_overview,
           selectedMoodId: dash.room.primary_mood_id,
@@ -275,6 +423,9 @@ export const useDhunStore = create<DhunState>((set, get) => {
         qrSvg: res.qr_svg,
         lanNotice: res.lan_notice,
         submissions: [],
+        nextPlayableCandidate: null,
+        autoDjPlaybackState: 'standby',
+        autoDjStatusNote: null,
         helperConnected: true,
         helperError: null,
       });
@@ -282,6 +433,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
       localRoomWsClient.connect(res.room.room_id, handleLocalRoomEvent, (connected) => {
         set({ wsConnected: connected });
       });
+      ensureFallbackPolling();
     },
 
     startLocalRoom: async () => {
@@ -291,13 +443,16 @@ export const useDhunStore = create<DhunState>((set, get) => {
       const updated = await localHelperClient.startLocalRoom(activeRoom.room_id);
       set({ activeRoom: updated });
       await get().refreshRoomDashboard();
+      await get().driveAutoDjLoop();
     },
 
     closeLocalRoom: async () => {
       const { activeRoom } = get();
       if (!activeRoom) return null;
-      webAudioEngine.emergencyFade(250);
-      const res = await localHelperClient.closeLocalRoom(activeRoom.room_id);
+      stopHttpFallbackPolling();
+      // Gracefully fade out & stop all Web Audio decks BEFORE purging room cache files
+      await webAudioEngine.emergencyFadeAndStop(250);
+      const res = await localHelperClient.closeLocalRoom(activeRoom.room_id, true);
       localRoomWsClient.disconnect();
       set((state) => ({
         activeRoom: state.activeRoom
@@ -306,15 +461,21 @@ export const useDhunStore = create<DhunState>((set, get) => {
         guestUrl: null,
         qrSvg: null,
         wsConnected: false,
+        nextPlayableCandidate: null,
+        autoDjPlaybackState: 'standby',
+        autoDjStatusNote: null,
+        deckSnapshots: webAudioEngine.getDeckSnapshots(),
       }));
       await get().checkHelperHealth();
       return {
         invalidated_guests: res.invalidated_guests,
         purged_cache_files: res.purged_cache_files,
+        deferred_locked_files: res.deferred_locked_files,
       };
     },
 
     clearLocalRoomSession: () => {
+      stopHttpFallbackPolling();
       localRoomWsClient.disconnect();
       localHelperClient.setSavedRoomSession(null);
       localHelperClient.setHostToken(null);
@@ -324,6 +485,9 @@ export const useDhunStore = create<DhunState>((set, get) => {
         qrSvg: null,
         lanNotice: null,
         submissions: [],
+        nextPlayableCandidate: null,
+        autoDjPlaybackState: 'standby',
+        autoDjStatusNote: null,
         wsConnected: false,
       });
     },
@@ -335,14 +499,149 @@ export const useDhunStore = create<DhunState>((set, get) => {
       }
       const res = await localHelperClient.submitSong(activeRoom.room_id, url);
       await get().refreshRoomDashboard();
+      if (get().activeRoom?.status === 'live') {
+        await get().driveAutoDjLoop();
+      }
       return res;
     },
 
     evaluateDjPool: async () => {
       const { activeRoom } = get();
       if (!activeRoom) return;
-      await localHelperClient.evaluateDjPool(activeRoom.room_id);
+      const evalRes = await localHelperClient.evaluateDjPool(activeRoom.room_id);
+      const style = (evalRes.transition_style as TransitionStyle) || 'bass_swap';
+      webAudioEngine.setTransitionStyle(style);
+      set({
+        nextPlayableCandidate: evalRes.next_playable_candidate,
+        transitionStyle: style,
+      });
       await get().refreshRoomDashboard();
+      if (get().activeRoom?.status === 'live') {
+        await get().driveAutoDjLoop();
+      }
+    },
+
+    /**
+     * Core Automated DJ Playback Controller:
+     * Fetches authorized cached audio from `GET /api/local/rooms/:room_id/cache/:cache_id/stream`,
+     * prepares an idle Web Audio deck via `prepareAuthorizedDeckBuffer()`, starts playback if idle
+     * or stages it for automatic transition without interrupting the currently playing track.
+     */
+    driveAutoDjLoop: async () => {
+      if (isPreparingDeck) return;
+      const { activeRoom, nextPlayableCandidate, exposedDecks, submissions } = get();
+      if (!activeRoom || activeRoom.status !== 'live') return;
+
+      const playingDeck = webAudioEngine.getActivePlayingDeck();
+      const preparedDeck = webAudioEngine.getPreparedIdleDeck();
+
+      // Already have both a playing track AND a preloaded next track ready
+      if (playingDeck && preparedDeck) {
+        set({ autoDjPlaybackState: 'playing' });
+        return;
+      }
+
+      // No playable cached candidate exists right now
+      if (!nextPlayableCandidate) {
+        if (!playingDeck) {
+          const hasRestricted = submissions.some((s) => s.acquisition_status === 'restricted_by_provider');
+          set({
+            autoDjPlaybackState: 'awaiting_playable_audio',
+            autoDjStatusNote: hasRestricted
+              ? 'Queued YouTube links are metadata-only (restricted_by_provider). Playable playback requires an authorised audio source.'
+              : 'Waiting for a playable authorised cached track to enter the DJ pool.',
+          });
+        }
+        return;
+      }
+
+      // Avoid re-loading a candidate already active or preloaded on a deck
+      if (
+        playingDeck?.submissionId === nextPlayableCandidate.submission_id ||
+        preparedDeck?.submissionId === nextPlayableCandidate.submission_id
+      ) {
+        return;
+      }
+
+      const idleDeckId = webAudioEngine.findIdleDeck(exposedDecks);
+      if (idleDeckId === null) return;
+
+      isPreparingDeck = true;
+      if (!playingDeck) {
+        set({
+          autoDjPlaybackState: 'preparing',
+          autoDjStatusNote: `Preparing "${nextPlayableCandidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)}...`,
+        });
+      }
+
+      try {
+        const audioBytes = await localHelperClient.fetchAuthorizedCachedAudio(
+          activeRoom.room_id,
+          nextPlayableCandidate.cache_id
+        );
+
+        const ok = await webAudioEngine.prepareAuthorizedDeckBuffer(idleDeckId, audioBytes, {
+          submissionId: nextPlayableCandidate.submission_id,
+          cacheId: nextPlayableCandidate.cache_id,
+          title: nextPlayableCandidate.title,
+          artist: nextPlayableCandidate.artist,
+          bpm: nextPlayableCandidate.bpm,
+          camelotKey: nextPlayableCandidate.camelot_key,
+        });
+
+        if (!ok) {
+          return;
+        }
+
+        if (!webAudioEngine.getActivePlayingDeck()) {
+          const started = webAudioEngine.startDeck(idleDeckId, 1.0);
+          if (started) {
+            set({
+              autoDjPlaybackState: 'playing',
+              autoDjStatusNote: `Playing "${nextPlayableCandidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)}`,
+            });
+            const evRes = await localHelperClient.recordPlaybackEvent(activeRoom.room_id, {
+              submission_id: nextPlayableCandidate.submission_id,
+              event: 'playing',
+              deck_id: idleDeckId,
+            });
+            set({ nextPlayableCandidate: evRes.next_playable_candidate });
+          }
+        } else {
+          // Track preloaded onto idle deck for seamless transition without interrupting current playback
+          await localHelperClient.recordPlaybackEvent(activeRoom.room_id, {
+            submission_id: nextPlayableCandidate.submission_id,
+            event: 'prepared',
+            deck_id: idleDeckId,
+          });
+          set({
+            autoDjPlaybackState: 'playing',
+            autoDjStatusNote: `Preloaded "${nextPlayableCandidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)} for transition`,
+          });
+        }
+      } catch (err: any) {
+        // Failed preload/decode MUST NOT interrupt currently playing audio!
+        const errMsg = err?.message || 'Audio decode or cache stream failure';
+        await localHelperClient
+          .recordPlaybackEvent(activeRoom.room_id, {
+            submission_id: nextPlayableCandidate.submission_id,
+            event: 'decode_failed',
+            deck_id: idleDeckId,
+            error_detail: errMsg,
+          })
+          .then((res) => {
+            set({
+              nextPlayableCandidate: res.next_playable_candidate,
+              autoDjPlaybackState: webAudioEngine.getActivePlayingDeck()
+                ? 'playing'
+                : 'decode_error_recovered',
+              autoDjStatusNote: `Skipped unplayable/corrupt cache entry (${errMsg}) without interrupting playback.`,
+            });
+          })
+          .catch(() => {});
+      } finally {
+        isPreparingDeck = false;
+      }
     },
 
     setDjLevel: async (level: DjLevel) => {
@@ -368,8 +667,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
           primary_mood_id: moodId,
         });
         set({ activeRoom: updated });
-        await localHelperClient.evaluateDjPool(activeRoom.room_id).catch(() => {});
-        await get().refreshRoomDashboard();
+        await get().evaluateDjPool().catch(() => {});
       }
     },
 

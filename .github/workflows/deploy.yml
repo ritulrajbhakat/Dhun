@@ -28,11 +28,19 @@ jobs:
       - name: Build Release Binaries (Local Helper, Metadata Service & Backend)
         run: cargo build --manifest-path src-tauri/Cargo.toml --release --bins
 
-      - name: Upload Local Helper Executable
+      - name: Package Windows Local Helper Bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-helper-win | Out-Null
+          Copy-Item target/release/dhun-local-helper.exe dist-helper-win/
+          Copy-Item packaging/windows/*.ps1 dist-helper-win/
+          Copy-Item docs/LOCAL_HELPER_INSTALL.md dist-helper-win/
+
+      - name: Upload Local Helper Windows Bundle
         uses: actions/upload-artifact@v4
         with:
           name: dhun-local-helper-windows-x86_64
-          path: target/release/dhun-local-helper.exe
+          path: dist-helper-win/
           if-no-files-found: error
 
       - name: Upload Global Metadata Catalogue Executable
@@ -47,6 +55,35 @@ jobs:
         with:
           name: dhun-backend-windows-x86_64
           path: target/release/dhun-backend.exe
+          if-no-files-found: error
+
+  build-linux-helper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux Audio/Build Libraries
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libssl-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux Local Helper & Global Metadata Catalogue
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --bin dhun-local-helper --bin dhun-server
+
+      - name: Package Linux Local Helper Bundle
+        run: |
+          mkdir -p dist-helper-linux
+          cp target/release/dhun-local-helper dist-helper-linux/
+          cp packaging/unix/*.sh dist-helper-linux/
+          cp docs/LOCAL_HELPER_INSTALL.md dist-helper-linux/
+
+      - name: Upload Local Helper Linux Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhun-local-helper-linux-x86_64
+          path: dist-helper-linux/
           if-no-files-found: error
 
   build-and-deploy:
