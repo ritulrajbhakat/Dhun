@@ -1,19 +1,37 @@
-# DHUN Local Helper — Stop Script (Windows)
-$PidFile = Join-Path $env:LOCALAPPDATA "DHUN\helper\helper.pid"
+# DHUN Local Helper + yt-dlp Resolver — Stop Script (Windows)
+$DataDir = Join-Path $env:LOCALAPPDATA "DHUN\helper"
+$Services = @(
+    @{ Name = "DHUN Local Helper"; PidFile = (Join-Path $DataDir "helper.pid");   ProcName = "dhun-local-helper" },
+    @{ Name = "Cloudflare Tunnel"; PidFile = (Join-Path $DataDir "tunnel.pid");   ProcName = "cloudflared" },
+    @{ Name = "yt-dlp Resolver";   PidFile = (Join-Path $DataDir "resolver.pid"); ProcName = $null }
+)
 
-if (Test-Path $PidFile) {
-    $savedPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-    if ($savedPid) {
-        Stop-Process -Id $savedPid -ErrorAction SilentlyContinue
-        Write-Host "Stopped DHUN Local Helper (PID: $savedPid)." -ForegroundColor Green
+foreach ($svc in $Services) {
+    $stopped = $false
+
+    if (Test-Path $svc.PidFile) {
+        $savedPid = (Get-Content $svc.PidFile -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
+        if ($savedPid -and (Get-Process -Id $savedPid -ErrorAction SilentlyContinue)) {
+            Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped $($svc.Name) (PID: $savedPid)." -ForegroundColor Green
+            $stopped = $true
+        }
+        Remove-Item -Force $svc.PidFile -ErrorAction SilentlyContinue
     }
-    Remove-Item -Force $PidFile -ErrorAction SilentlyContinue
-} else {
-    $procs = Get-Process -Name "dhun-local-helper" -ErrorAction SilentlyContinue
-    if ($procs) {
-        $procs | Stop-Process -ErrorAction SilentlyContinue
-        Write-Host "Stopped running dhun-local-helper process(es)." -ForegroundColor Green
-    } else {
-        Write-Host "DHUN Local Helper is not currently running." -ForegroundColor Yellow
+
+    if (-not $stopped -and $svc.ProcName) {
+        $procs = Get-Process -Name $svc.ProcName -ErrorAction SilentlyContinue
+        if ($procs) {
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped running $($svc.Name) process(es)." -ForegroundColor Green
+            $stopped = $true
+        }
+    }
+
+    if (-not $stopped) {
+        Write-Host "$($svc.Name) is not currently running." -ForegroundColor Yellow
     }
 }
+
+# Clean up temporary tunnel log files
+Remove-Item (Join-Path $DataDir "tunnel_*.log") -Force -ErrorAction SilentlyContinue
