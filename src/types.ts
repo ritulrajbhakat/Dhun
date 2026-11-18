@@ -62,12 +62,110 @@ export interface DjRecommendation {
 }
 
 export interface TrackSectionMarker {
-  section_type: 'intro' | 'groove' | 'breakdown' | 'build' | 'drop' | 'peak' | 'outro' | 'phrase' | string;
+  section_type:
+    | 'intro'
+    | 'verse'
+    | 'chorus'
+    | 'instrumental'
+    | 'groove'
+    | 'breakdown'
+    | 'build'
+    | 'drop'
+    | 'peak'
+    | 'outro'
+    | 'phrase'
+    | string;
   start_ms: number;
   end_ms: number;
   energy_level: number;
   bass_energy?: number;
+  vocal_activity?: number;
   confidence?: number;
+  bar_index?: number;
+}
+
+export interface TempoSegment {
+  start_ms: number;
+  end_ms: number;
+  bpm: number;
+  confidence: number;
+}
+
+export interface MeterAnalysis {
+  beats_per_bar: number;
+  meter_label: '4/4' | '3/4' | '6/8' | 'uncertain' | string;
+  confidence: number;
+}
+
+export interface TrackTimingProfile {
+  average_bpm: number;
+  beatgrid_confidence: number;
+  downbeat_offset_ms: number;
+  is_variable_tempo: boolean;
+  tempo_drift_bpm: number;
+  meter: MeterAnalysis;
+  tempo_map: TempoSegment[];
+  beat_timestamps_ms: number[];
+  downbeat_timestamps_ms: number[];
+}
+
+export type BpmRelationshipType =
+  | 'direct'
+  | 'half_time'
+  | 'double_time'
+  | 'three_quarter_bridge'
+  | 'gradual_tempo_ramp'
+  | 'no_beatmatch';
+
+export interface EqBassHandoverSchedule {
+  incoming_low_cut_until_frac: number;
+  bass_swap_at_frac: number;
+  outgoing_low_cut_at_frac: number;
+  mid_carve_db: number;
+  high_handover_frac: number;
+}
+
+export interface RejectedTechniqueAlternative {
+  technique: string;
+  reason: string;
+}
+
+export interface TransitionDecisionPlan {
+  status: 'planned' | 'rejected' | 'deferred' | 'cancelled' | 'executed' | string;
+  outgoing_track_id: string;
+  outgoing_deck_id: number;
+  incoming_track_id: string;
+  incoming_deck_id: number;
+  outgoing_mix_out_sec: number;
+  outgoing_phrase_boundary_sec: number;
+  incoming_mix_in_sec: number;
+  incoming_phrase_boundary_sec: number;
+  outgoing_section_type: string;
+  incoming_section_type: string;
+  current_bpm?: number | null;
+  incoming_bpm?: number | null;
+  target_bpm?: number | null;
+  bpm_relationship: BpmRelationshipType;
+  tempo_adjustment_pct: number;
+  tempo_direction: 'up' | 'down' | 'none' | string;
+  incoming_playback_rate: number;
+  outgoing_target_rate: number;
+  beat_alignment_offset_sec: number;
+  meter_compatible: boolean;
+  meter_summary: string;
+  beatgrid_confidence: number;
+  duration_beats: number;
+  duration_bars: number;
+  duration_sec: number;
+  vocal_overlap_policy: string;
+  energy_progression: string;
+  eq_bass_handover_schedule: EqBassHandoverSchedule;
+  selected_technique: DjTechniqueId;
+  scheduled_execution_sec: number;
+  confidence: number;
+  reasons: string[];
+  rejected_alternatives: RejectedTechniqueAlternative[];
+  rejection_reason?: string | null;
 }
 
 export interface DjTechniqueExecutionRecord {
@@ -161,7 +259,9 @@ export interface PlayableCandidatePointer {
   camelot_key?: string | null;
   duration_ms?: number | null;
   overall_energy?: number | null;
+  genre_tags?: string[];
   sections?: TrackSectionMarker[];
+  timing_profile?: TrackTimingProfile | null;
 }
 
 export interface LocalTempCacheStats {
@@ -214,6 +314,7 @@ export interface HostRoomDashboardResponse {
   recommendations?: DjRecommendation[];
   pending_intake_jobs?: number;
   next_playable_candidate: PlayableCandidatePointer | null;
+  transition_plan?: TransitionDecisionPlan | null;
   transition_style: string;
   cache_stats: LocalTempCacheStats;
   sync_overview: SyncStatusOverview;

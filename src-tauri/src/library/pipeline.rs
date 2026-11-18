@@ -255,7 +255,7 @@ pub fn stage_5_local_audio_analysis(file_path: &Path, song_id: &str) -> Result<L
         musical_key: analysis.key_name,
         camelot_key: analysis.camelot_key,
         key_confidence: analysis.key_confidence,
-        beat_grid_json: serde_json::to_string(&full.beat_grid).unwrap_or_else(|_| "[]".to_string()),
+        beat_grid_json: serde_json::to_string(&full.timing_profile).unwrap_or_else(|_| "{}".to_string()),
         phrase_markers_json: serde_json::to_string(&full.phrase_markers).unwrap_or_else(|_| "[]".to_string()),
         overall_energy: analysis.overall_energy,
         danceability: analysis.dance_suitability,

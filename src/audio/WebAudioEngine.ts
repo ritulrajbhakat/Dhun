@@ -16,7 +16,14 @@ import {
   DjTechniqueExecutionRecord,
   DjTechniqueId,
   TrackSectionMarker,
+  TrackTimingProfile,
+  TransitionDecisionPlan,
 } from '../types';
+import {
+  TransitionTimelineScheduler,
+  createTempoPolicyForLevel,
+  TrackDecisionInput,
+} from './TransitionDecisionEngine';
 
 export type TransitionStyle = DjTechniqueId;
 
@@ -28,7 +35,9 @@ export interface DeckTrackMetadata {
   bpm?: number | null;
   camelotKey?: string | null;
   overallEnergy?: number | null;
+  genreTags?: string[];
   sections?: TrackSectionMarker[];
+  timingProfile?: TrackTimingProfile | null;
 }
 
 export interface IntraTrackJumpPlan {
@@ -480,11 +489,14 @@ export class FourDeckWebAudioEngine {
   private decks: WebAudioDeckChain[] = [];
   private crossfaderPos = -1.0;
   private djLevel: DjLevel = 2;
+  private activeMoodId = 'house_party';
   private targetEnergy = 0.75;
   private activeTransitionStyle: TransitionStyle = 'timed_bass_swap';
   private callbacks: AutoDjEngineCallbacks = {};
   private clockMonitorId: ReturnType<typeof setInterval> | null = null;
   private playedSectionSignatures: Set<string> = new Set();
+  private timelineScheduler = new TransitionTimelineScheduler();
+  private recentTechniques: string[] = [];
 
   public init(customCtx?: BaseAudioContext): void {
     if (this.ctx) return;
@@ -620,8 +632,103 @@ export class FourDeckWebAudioEngine {
     this.djLevel = level;
   }
 
+  public setMoodId(moodId: string): void {
+    this.activeMoodId = moodId || 'house_party';
+  }
+
   public setTargetEnergy(energy: number): void {
     this.targetEnergy = Math.max(0.2, Math.min(1.0, energy));
+  }
+
+  public getActiveTransitionPlan(): TransitionDecisionPlan | null {
+    return this.timelineScheduler.getActivePlan();
+  }
+
+  public getTransitionDiagnostics(): TransitionDecisionPlan[] {
+    return this.timelineScheduler.getDiagnosticLog();
+  }
+
+  public cancelPendingTransition(reason: string): TransitionDecisionPlan | null {
+    return this.timelineScheduler.cancelActivePlan(reason);
+  }
+
+  private buildDeckDecisionInput(deck: WebAudioDeckChain): TrackDecisionInput | null {
+    if (!deck.buffer || !deck.meta) return null;
+    const now = this.ctx?.currentTime ?? 0;
+    const currentPosSec = deck.isPlaying ? Math.max(0, now - deck.startedAtCtxTime) : deck.offsetSec;
+    return {
+      trackId: deck.meta.submissionId,
+      deckId: deck.deckId,
+      title: deck.meta.title,
+      artist: deck.meta.artist,
+      durationSec: deck.buffer.duration,
+      currentPosSec,
+      bpm: deck.meta.bpm ?? null,
+      camelotKey: deck.meta.camelotKey ?? null,
+      overallEnergy: deck.meta.overallEnergy ?? null,
+      genreTags: deck.meta.genreTags || [],
+      sections: deck.meta.sections || [],
+      timingProfile: deck.meta.timingProfile ?? null,
+    };
+  }
+
+  /**
+   * Plans ahead using the dedicated Transition Decision Engine (WHEN, WHERE, HOW, HOW LONG, BPM relationship)
+   * without triggering audio until the scheduled musical boundary arrives on `AudioContext.currentTime`.
+   */
+  public schedulePlannedTransition(
+    fromDeckId: number,
+    toDeckId: number
+  ): TransitionDecisionPlan | null {
+    const fromDeck = this.decks[fromDeckId];
+    const toDeck = this.decks[toDeckId];
+    if (!fromDeck || !toDeck) return null;
+    const outInput = this.buildDeckDecisionInput(fromDeck);
+    const inInput = this.buildDeckDecisionInput(toDeck);
+    if (!outInput || !inInput) return null;
+
+    const plan = this.timelineScheduler.scheduleOrReplan(outInput, inInput, {
+      djLevel: this.djLevel,
+      moodId: this.activeMoodId,
+      targetEnergy: this.targetEnergy,
+      recentTechniques: this.recentTechniques,
+      tempoPolicy: createTempoPolicyForLevel(this.djLevel),
+    });
+
+    if (plan.status === 'planned') {
+      // Align incoming deck cue-in to the planner's chosen musical entry point!
+      toDeck.cueInSec = plan.incoming_mix_in_sec;
+      toDeck.offsetSec = plan.incoming_mix_in_sec;
+    }
+    return plan;
+  }
+
+  /**
+   * Executes a pre-computed `TransitionDecisionPlan` cleanly through the existing 14-technique DSP graph.
+   */
+  public executePlannedTransition(plan: TransitionDecisionPlan): boolean {
+    if (plan.status !== 'planned') return false;
+    const toDeck = this.decks[plan.incoming_deck_id];
+    if (!toDeck || !toDeck.buffer || !toDeck.meta) {
+      this.timelineScheduler.cancelActivePlan('Incoming deck unavailable at execution time');
+      return false;
+    }
+    toDeck.cueInSec = plan.incoming_mix_in_sec;
+    toDeck.offsetSec = plan.incoming_mix_in_sec;
+
+    const ok = this.triggerAutomatedTransition(
+      plan.outgoing_deck_id,
+      plan.incoming_deck_id,
+      plan.duration_sec,
+      plan.selected_technique,
+      plan
+    );
+    if (ok) {
+      this.recentTechniques.unshift(plan.selected_technique);
+      if (this.recentTechniques.length > 12) this.recentTechniques.length = 12;
+      this.timelineScheduler.markExecuted();
+    }
+    return ok;
   }
 
   public setTransitionStyle(style: TransitionStyle): void {
@@ -886,7 +993,8 @@ export class FourDeckWebAudioEngine {
     fromDeckId: number,
     toDeckId: number,
     durationSec: number,
-    requestedStyle: TransitionStyle
+    requestedStyle: TransitionStyle,
+    plan?: TransitionDecisionPlan
   ): boolean {
     if (!this.ctx) return false;
     const fromDeck = this.decks[fromDeckId];
@@ -895,28 +1003,37 @@ export class FourDeckWebAudioEngine {
     // Overlapping transition guard: never corrupt an already-active outgoing fade
     if (fromDeck.transitionTriggered) return false;
 
-    const { technique, fallbackUsed, reason, tempoRatio } = resolveTechniqueForLevel(
+    const resolved = resolveTechniqueForLevel(
       this.djLevel,
       fromDeck.meta,
       toDeck.meta,
-      requestedStyle
+      plan ? plan.selected_technique : requestedStyle
     );
+    const technique = plan ? plan.selected_technique : resolved.technique;
+    const fallbackUsed = plan ? plan.bpm_relationship === 'no_beatmatch' : resolved.fallbackUsed;
+    const reason = plan ? plan.reasons.join(' | ') : resolved.reason;
+    const tempoRatio = plan ? plan.incoming_playback_rate : resolved.tempoRatio;
 
     const now = this.ctx.currentTime;
-    const refBpm = fromDeck.meta?.bpm || toDeck.meta?.bpm || 124;
+    const refBpm = plan?.current_bpm || fromDeck.meta?.bpm || toDeck.meta?.bpm || 124;
     const beatSec = Math.max(0.3, Math.min(0.85, 60 / refBpm));
 
-    // Duration tailored to each genuine DJ technique
+    // Duration tailored to each genuine DJ technique (honoring planned beat/bar duration when supplied!)
     const playableSpan = Math.max(2.0, (toDeck.cueOutSec || toDeck.buffer.duration) - toDeck.cueInSec);
-    let dur = Math.max(0.8, Math.min(durationSec, playableSpan * 0.35));
-    if (technique === 'safe_quick_cut') dur = 0.32;
-    else if (technique === 'backspin_cut') dur = Math.min(1.1, beatSec * 2);
-    else if (technique === 'phrase_long_blend') dur = Math.min(12.0, Math.max(dur, 8.0), playableSpan * 0.35);
-    else if (technique === 'four_deck_layer' || technique === 'creative_mashup_layer') {
-      dur = Math.min(14.0, Math.max(dur, 10.0), playableSpan * 0.4);
+    let dur = plan
+      ? Math.max(0.3, Math.min(plan.duration_sec, playableSpan * 0.45))
+      : Math.max(0.8, Math.min(durationSec, playableSpan * 0.35));
+    if (!plan) {
+      if (technique === 'safe_quick_cut') dur = 0.32;
+      else if (technique === 'backspin_cut') dur = Math.min(1.1, beatSec * 2);
+      else if (technique === 'phrase_long_blend') dur = Math.min(12.0, Math.max(dur, 8.0), playableSpan * 0.35);
+      else if (technique === 'four_deck_layer' || technique === 'creative_mashup_layer') {
+        dur = Math.min(14.0, Math.max(dur, 10.0), playableSpan * 0.4);
+      }
     }
 
-    const mid = now + dur * 0.5;
+    const bassSwapFrac = plan?.eq_bass_handover_schedule?.bass_swap_at_frac ?? 0.5;
+    const mid = now + dur * bassSwapFrac;
 
     // Atomically start incoming deck at gain 0.0 and its planned phrase-aligned cueInSec (zero click/pop!)
     if (!toDeck.isPlaying) {
@@ -1455,15 +1572,13 @@ export class FourDeckWebAudioEngine {
           continue;
         }
 
-        const preloadThreshold = Math.min(20, Math.max(6, (targetExit - deck.cueInSec) * 0.38));
+        const preloadThreshold = Math.min(28, Math.max(10, (targetExit - deck.cueInSec) * 0.45));
         if (!deck.preloadSignaled && remaining <= preloadThreshold) {
           deck.preloadSignaled = true;
           this.callbacks.onPreloadWindow?.(deck.deckId, deck.meta.submissionId);
         }
 
-        const baseTransWindow = this.djLevel >= 3 ? 10 : this.djLevel === 2 ? 7 : 6;
-        const transDuration = Math.min(baseTransWindow, Math.max(2, (targetExit - deck.cueInSec) * 0.25));
-        if (!deck.transitionTriggered && remaining <= transDuration) {
+        if (!deck.transitionTriggered) {
           const prepared = this.decks.find(
             (d) =>
               d.deckId !== deck.deckId &&
@@ -1473,12 +1588,33 @@ export class FourDeckWebAudioEngine {
               d.meta !== null
           );
           if (prepared) {
-            this.triggerAutomatedTransition(
-              deck.deckId,
-              prepared.deckId,
-              transDuration,
-              this.activeTransitionStyle
-            );
+            // Musical Transition Timeline Scheduler: plan ahead, wait for exact beat/phrase boundary,
+            // and replan cleanly if preparation finished late past a phrase boundary!
+            let activePlan = this.timelineScheduler.getActivePlan();
+            if (
+              !activePlan ||
+              activePlan.outgoing_deck_id !== deck.deckId ||
+              activePlan.incoming_deck_id !== prepared.deckId
+            ) {
+              activePlan = this.schedulePlannedTransition(deck.deckId, prepared.deckId);
+            }
+
+            if (activePlan && activePlan.status === 'planned') {
+              const tick = this.timelineScheduler.evaluateClockTick(pos, deck.buffer.duration);
+              if (tick === 'replan_needed') {
+                this.schedulePlannedTransition(deck.deckId, prepared.deckId);
+              } else if (tick === 'execute') {
+                this.executePlannedTransition(activePlan);
+              }
+            } else if (remaining <= Math.min(6, Math.max(2, (targetExit - deck.cueInSec) * 0.25))) {
+              // Safe end-of-track fallback only if planner rejected earlier window
+              this.triggerAutomatedTransition(
+                deck.deckId,
+                prepared.deckId,
+                Math.min(4, remaining),
+                'safe_quick_cut'
+              );
+            }
           }
         }
       }

@@ -61,14 +61,46 @@ pub struct BeatGridPoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhraseMarker {
-    pub section_type: String, // 'intro', 'groove', 'breakdown', 'build', 'drop', 'peak', 'outro', 'phrase'
+    pub section_type: String, // 'intro', 'verse', 'chorus', 'instrumental', 'groove', 'breakdown', 'build', 'drop', 'peak', 'outro', 'phrase'
     pub start_ms: i64,
     pub end_ms: i64,
     pub energy_level: f64,
     #[serde(default)]
     pub bass_energy: f64,
     #[serde(default)]
+    pub vocal_activity: f64,
+    #[serde(default)]
     pub confidence: f64,
+    #[serde(default)]
+    pub bar_index: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TempoSegment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub bpm: f64,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeterAnalysis {
+    pub beats_per_bar: u8,     // 4, 3, or 6
+    pub meter_label: String,   // "4/4" | "3/4" | "6/8" | "uncertain"
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackTimingProfile {
+    pub average_bpm: f64,
+    pub beatgrid_confidence: f64,
+    pub downbeat_offset_ms: i64,
+    pub is_variable_tempo: bool,
+    pub tempo_drift_bpm: f64,
+    pub meter: MeterAnalysis,
+    pub tempo_map: Vec<TempoSegment>,
+    pub beat_timestamps_ms: Vec<i64>,
+    pub downbeat_timestamps_ms: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

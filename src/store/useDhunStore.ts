@@ -357,6 +357,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
         const savedQr = localHelperClient.getSavedGuestQr();
         const style = (dash.transition_style as TransitionStyle) || 'timed_bass_swap';
         webAudioEngine.setDjLevel(dash.room.dj_level);
+        webAudioEngine.setMoodId(dash.room.primary_mood_id);
         webAudioEngine.setTransitionStyle(style);
 
         set({
@@ -409,6 +410,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
         const dash = await localHelperClient.getRoomDashboard(activeRoom.room_id);
         const style = (dash.transition_style as TransitionStyle) || 'timed_bass_swap';
         webAudioEngine.setDjLevel(dash.room.dj_level);
+        webAudioEngine.setMoodId(dash.room.primary_mood_id);
         webAudioEngine.setTransitionStyle(style);
         set({
           activeRoom: dash.room,
@@ -657,7 +659,9 @@ export const useDhunStore = create<DhunState>((set, get) => {
           bpm: nextPlayableCandidate.bpm,
           camelotKey: nextPlayableCandidate.camelot_key,
           overallEnergy: nextPlayableCandidate.overall_energy,
+          genreTags: nextPlayableCandidate.genre_tags,
           sections: nextPlayableCandidate.sections,
+          timingProfile: nextPlayableCandidate.timing_profile ?? null,
         });
 
         if (!ok) {
@@ -679,7 +683,10 @@ export const useDhunStore = create<DhunState>((set, get) => {
             set({ nextPlayableCandidate: evRes.next_playable_candidate });
           }
         } else {
-          // Track preloaded onto idle deck for seamless transition without interrupting current playback
+          // Track preloaded onto idle deck: immediately plan musical transition ahead of time!
+          if (playingDeck) {
+            webAudioEngine.schedulePlannedTransition(playingDeck.deckId, idleDeckId);
+          }
           await localHelperClient.recordPlaybackEvent(activeRoom.room_id, {
             submission_id: nextPlayableCandidate.submission_id,
             event: 'prepared',
@@ -691,8 +698,9 @@ export const useDhunStore = create<DhunState>((set, get) => {
           });
         }
       } catch (err: any) {
-        // Failed preload/decode MUST NOT interrupt currently playing audio!
+        // Failed preload/decode MUST NOT interrupt currently playing audio! Cancel any stale plan cleanly.
         const errMsg = err?.message || 'Audio decode or cache stream failure';
+        webAudioEngine.cancelPendingTransition(`Incoming track preload failed: ${errMsg}`);
         await localHelperClient
           .recordPlaybackEvent(activeRoom.room_id, {
             submission_id: nextPlayableCandidate.submission_id,
@@ -717,6 +725,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
 
     setDjLevel: async (level: DjLevel) => {
       webAudioEngine.setDjLevel(level);
+      webAudioEngine.cancelPendingTransition('DJ level changed — replanning for new skill level');
       set({
         selectedDjLevel: level,
         djLevelName: DJ_LEVEL_NAMES[level],
@@ -733,10 +742,12 @@ export const useDhunStore = create<DhunState>((set, get) => {
     },
 
     setPartyMood: async (moodId: string) => {
+      webAudioEngine.setMoodId(moodId);
       const moodObj = get().moodProfiles.find((m) => m.id === moodId);
       if (moodObj) {
         webAudioEngine.setTargetEnergy(moodObj.target_energy);
       }
+      webAudioEngine.cancelPendingTransition('Party mood updated — replanning transition for new mood');
       set({ selectedMoodId: moodId });
       const { activeRoom } = get();
       if (activeRoom && activeRoom.status !== 'closed') {

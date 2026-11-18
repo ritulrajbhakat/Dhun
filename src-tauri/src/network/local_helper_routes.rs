@@ -28,9 +28,13 @@ use uuid::Uuid;
 
 use crate::db::models::{
     GuestOwnSubmissionView, LocalPartyRoom, LocalRoomGuest, LocalRoomSubmission,
-    LocalTempCacheStats, PhraseMarker, SubmissionIntakeJob, SyncStatusOverview,
+    LocalTempCacheStats, PhraseMarker, SubmissionIntakeJob, SyncStatusOverview, TrackTimingProfile,
 };
 use crate::db::Database;
+use crate::dj::decision_engine::{
+    plan_dj_transition, PartyDecisionContext, TempoQualityPolicy, TrackTransitionInput,
+    TransitionDecisionPlan,
+};
 use crate::dj::levels::{DjLevel, DjSkillProfile};
 use crate::dj::moods::{get_mood_by_id as get_mood_preset, get_preset_moods as get_all_mood_presets};
 use crate::dj::selector::{
@@ -394,7 +398,9 @@ pub struct PlayableCandidatePointer {
     pub camelot_key: Option<String>,
     pub duration_ms: Option<i64>,
     pub overall_energy: Option<f64>,
+    pub genre_tags: Vec<String>,
     pub sections: Vec<PhraseMarker>,
+    pub timing_profile: Option<TrackTimingProfile>,
 }
 
 #[derive(Debug, Serialize)]
@@ -411,6 +417,7 @@ pub struct HostRoomDashboardResponse {
     pub recommendations: Vec<DjRecommendation>,
     pub pending_intake_jobs: usize,
     pub next_playable_candidate: Option<PlayableCandidatePointer>,
+    pub transition_plan: Option<TransitionDecisionPlan>,
     pub transition_style: String,
     pub cache_stats: LocalTempCacheStats,
     pub sync_overview: SyncStatusOverview,
@@ -515,6 +522,12 @@ fn build_playable_pointer(
         .as_deref()
         .and_then(|sid| db.get_phrase_markers_for_song(sid).ok())
         .unwrap_or_default();
+    let timing_profile = sub
+        .song_id
+        .as_deref()
+        .and_then(|sid| db.get_timing_profile_for_song(sid).ok())
+        .flatten();
+    let genre_tags: Vec<String> = serde_json::from_str(&sub.genre_tags_json).unwrap_or_default();
     Some(PlayableCandidatePointer {
         submission_id: sub.id.clone(),
         cache_id: cache_id.clone(),
@@ -525,8 +538,42 @@ fn build_playable_pointer(
         camelot_key: sub.camelot_key.clone(),
         duration_ms: sub.duration_ms,
         overall_energy: sub.overall_energy,
+        genre_tags,
         sections,
+        timing_profile,
     })
+}
+
+fn build_track_transition_input(
+    sub: &LocalRoomSubmission,
+    deck_id: usize,
+    db: &Database,
+) -> TrackTransitionInput {
+    let sections = sub
+        .song_id
+        .as_deref()
+        .and_then(|sid| db.get_phrase_markers_for_song(sid).ok())
+        .unwrap_or_default();
+    let timing_profile = sub
+        .song_id
+        .as_deref()
+        .and_then(|sid| db.get_timing_profile_for_song(sid).ok())
+        .flatten();
+    let genre_tags: Vec<String> = serde_json::from_str(&sub.genre_tags_json).unwrap_or_default();
+    TrackTransitionInput {
+        track_id: sub.id.clone(),
+        deck_id,
+        title: sub.title.clone(),
+        artist: sub.artist.clone(),
+        duration_sec: (sub.duration_ms.unwrap_or(180_000) as f64 / 1000.0).max(10.0),
+        current_pos_sec: 0.0,
+        bpm: sub.bpm,
+        camelot_key: sub.camelot_key.clone(),
+        overall_energy: sub.overall_energy,
+        genre_tags,
+        sections,
+        timing_profile,
+    }
 }
 
 fn evaluate_and_find_next_playable(
@@ -1112,6 +1159,34 @@ pub async fn get_host_room_dashboard(
         .db
         .get_local_room_submissions(&room_id)
         .unwrap_or_default();
+    let transition_plan = {
+        let cur = submissions.iter().find(|s| s.dj_status == "playing");
+        let nxt = next_playable_candidate
+            .as_ref()
+            .and_then(|p| submissions.iter().find(|s| s.id == p.submission_id));
+        match (cur, nxt) {
+            (Some(c), Some(n)) => {
+                let primary_mood = get_mood_preset(&room.primary_mood_id)
+                    .unwrap_or_else(|| get_all_mood_presets().into_iter().next().unwrap());
+                let elapsed_mins = room
+                    .started_at
+                    .map(|s| ((chrono::Utc::now().timestamp_millis() - s).max(0) as f64) / 60_000.0)
+                    .unwrap_or(0.0);
+                let target_energy = compute_mood_energy_target(&primary_mood, elapsed_mins);
+                let out_in = build_track_transition_input(c, 0, &state.db);
+                let inc_in = build_track_transition_input(n, 1, &state.db);
+                let party_ctx = PartyDecisionContext {
+                    dj_level: lvl,
+                    mood_id: room.primary_mood_id.clone(),
+                    target_energy,
+                    recent_techniques: Vec::new(),
+                    tempo_policy: TempoQualityPolicy::for_dj_level(lvl),
+                };
+                Some(plan_dj_transition(&out_in, &inc_in, &party_ctx))
+            }
+            _ => None,
+        }
+    };
     let pending_intake_jobs = state
         .db
         .get_pending_intake_job_count(&room_id)
@@ -1148,6 +1223,7 @@ pub async fn get_host_room_dashboard(
         recommendations,
         pending_intake_jobs,
         next_playable_candidate,
+        transition_plan,
         transition_style,
         cache_stats,
         sync_overview,

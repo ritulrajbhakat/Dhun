@@ -1451,6 +1451,60 @@ impl Database {
         Ok(Vec::new())
     }
 
+    /// Reads the structured `TrackTimingProfile` (tempo map, beatgrid timestamps, meter, confidence)
+    /// from `global_song_catalogue.beat_grid_json` (backward-compatible with legacy beat arrays).
+    pub fn get_timing_profile_for_song(&self, song_id: &str) -> Result<Option<TrackTimingProfile>> {
+        let conn = self.conn.lock().unwrap();
+        let row_res: std::result::Result<(Option<String>, Option<f64>, Option<f64>), _> = conn.query_row(
+            "SELECT beat_grid_json, original_bpm, bpm_confidence
+             FROM global_song_catalogue WHERE song_id = ?1 LIMIT 1",
+            params![song_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        );
+        let Ok((raw_opt, bpm_opt, conf_opt)) = row_res else {
+            return Ok(None);
+        };
+        if let Some(raw) = raw_opt {
+            if let Ok(profile) = serde_json::from_str::<TrackTimingProfile>(&raw) {
+                return Ok(Some(profile));
+            }
+            // Legacy fallback: array of BeatGridPoint
+            if let Ok(legacy_grid) = serde_json::from_str::<Vec<BeatGridPoint>>(&raw) {
+                if !legacy_grid.is_empty() {
+                    let bpm = bpm_opt.unwrap_or(120.0);
+                    let conf = conf_opt.unwrap_or(0.6);
+                    let beats: Vec<i64> = legacy_grid.iter().map(|b| b.time_offset_ms).collect();
+                    let downbeats: Vec<i64> = legacy_grid
+                        .iter()
+                        .filter(|b| b.is_downbeat)
+                        .map(|b| b.time_offset_ms)
+                        .collect();
+                    return Ok(Some(TrackTimingProfile {
+                        average_bpm: bpm,
+                        beatgrid_confidence: conf,
+                        downbeat_offset_ms: beats.first().copied().unwrap_or(0),
+                        is_variable_tempo: false,
+                        tempo_drift_bpm: 0.0,
+                        meter: MeterAnalysis {
+                            beats_per_bar: 4,
+                            meter_label: "4/4".to_string(),
+                            confidence: conf,
+                        },
+                        tempo_map: vec![TempoSegment {
+                            start_ms: 0,
+                            end_ms: beats.last().copied().unwrap_or(0),
+                            bpm,
+                            confidence: conf,
+                        }],
+                        beat_timestamps_ms: beats,
+                        downbeat_timestamps_ms: downbeats,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     // ========================================================================
     // Persistent Asynchronous Submission Intake Queue (`submission_intake_jobs`)
     // ========================================================================

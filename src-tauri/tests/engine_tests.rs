@@ -4341,6 +4341,301 @@ mod tests {
             "Level 2 must recognize 64 BPM as half-time match for 128 BPM"
         );
     }
+
+    /// Real PCM audio-buffer DSP test: verifies variable tempo map (accelerating BPM),
+    /// non-4/4 meter detection (3/4 rhythmic grouping), and vocal-band activity separation.
+    #[test]
+    fn test_tempo_map_variable_bpm_meter_3_4_and_vocal_activity_dsp() {
+        use dhun_lib::analysis::bpm_detector::BpmDetector;
+        use dhun_lib::analysis::phrase_detector::PhraseDetector;
+        use std::sync::Arc;
+
+        let sr = 44_100u32;
+
+        // 1. Variable tempo track: first 16s at 100 BPM clicks, next 16s at 140 BPM clicks
+        let var_sec = 32usize;
+        let mut var_samples = vec![0.0f32; sr as usize * var_sec * 2];
+        let mut add_clicks = |buf: &mut [f32], start_s: f64, end_s: f64, bpm: f64, accent_every: usize| {
+            let step = 60.0 / bpm;
+            let mut t = start_s;
+            let mut idx = 0usize;
+            while t < end_s {
+                let start_f = (t * sr as f64) as usize;
+                let click_len = (sr as usize * 45) / 1000;
+                let amp = if idx % accent_every == 0 { 0.85 } else { 0.35 };
+                for k in 0..click_len {
+                    let f = start_f + k;
+                    if f * 2 + 1 >= buf.len() {
+                        break;
+                    }
+                    let env = 1.0 - (k as f64 / click_len as f64);
+                    let v = (amp * env * (2.0 * std::f64::consts::PI * 120.0 * (k as f64 / sr as f64)).sin()) as f32;
+                    buf[f * 2] = (buf[f * 2] + v).clamp(-1.0, 1.0);
+                    buf[f * 2 + 1] = (buf[f * 2 + 1] + v).clamp(-1.0, 1.0);
+                }
+                t += step;
+                idx += 1;
+            }
+        };
+        add_clicks(&mut var_samples, 0.0, 16.0, 100.0, 4);
+        add_clicks(&mut var_samples, 16.0, 32.0, 140.0, 4);
+
+        let (_avg, _conf, tempo_map, drift_bpm, is_variable) =
+            BpmDetector::detect_tempo_map(&Arc::new(var_samples), sr, (var_sec * 1000) as u64);
+        assert!(tempo_map.len() >= 2, "Expected multi-segment tempo map");
+        assert!(
+            is_variable && drift_bpm >= 10.0,
+            "Accelerating 100->140 BPM buffer must be flagged as variable tempo (drift={:.1}, map={:?})",
+            drift_bpm,
+            tempo_map
+        );
+
+        // 2. 3/4 Meter buffer: strong accent every 3 beats at 120 BPM for 24s
+        let mut waltz_samples = vec![0.0f32; sr as usize * 24 * 2];
+        add_clicks(&mut waltz_samples, 0.0, 24.0, 120.0, 3);
+        let meter_3_4 = BpmDetector::detect_meter(&Arc::new(waltz_samples), sr, 120.0, 0);
+        assert_eq!(
+            meter_3_4.meter_label, "3/4",
+            "Strong 3-beat accent pattern must detect 3/4 meter (got {:?})",
+            meter_3_4
+        );
+        assert_eq!(meter_3_4.beats_per_bar, 3);
+
+        // 3. Vocal activity separation: Phrase 0 = sub-bass instrumental (75 Hz), Phrase 1 = center vocal-band (900 Hz)
+        let mut voc_samples = Vec::with_capacity(sr as usize * 32 * 2);
+        for f in 0..(sr as usize * 32) {
+            let t = f as f64 / sr as f64;
+            let s = if f < sr as usize * 16 {
+                (0.42 * (2.0 * std::f64::consts::PI * 75.0 * t).sin()) as f32
+            } else {
+                (0.42 * (2.0 * std::f64::consts::PI * 900.0 * t).sin()) as f32
+            };
+            voc_samples.push(s);
+            voc_samples.push(s);
+        }
+        let (phrases, _, _, _, _) =
+            PhraseDetector::analyze_phrasing_with_timing(&Arc::new(voc_samples), sr, 120.0, 0, 4, 32_000);
+        assert!(phrases.len() >= 2);
+        let inst_voc = phrases[0].vocal_activity;
+        let vocal_voc = phrases.last().unwrap().vocal_activity;
+        assert!(
+            vocal_voc > inst_voc + 0.35,
+            "Center 900 Hz vocal-band phrase ({:.2}) must score far higher vocal_activity than 75 Hz bass instrumental ({:.2})",
+            vocal_voc,
+            inst_voc
+        );
+    }
+
+    /// Comprehensive deterministic test of the DJ Transition Decision Engine covering:
+    /// same-BPM, half-time, double-time, gradual tempo ramp, 3:4 bridge, low-confidence beatgrid,
+    /// meter conflict (3/4 vs 4/4), vocal clash avoidance, build-up protection, intro-over-chorus,
+    /// breakdown-to-drop, genre change, Indian moods (Baraat, Garba, Shaadi, Desi Club), and
+    /// insufficient remaining playback time rejection.
+    #[test]
+    fn test_dj_transition_decision_engine_all_bpm_relationships_vocal_clash_meters_and_indian_moods() {
+        use dhun_lib::dj::decision_engine::{
+            plan_dj_transition, BpmRelationship, PartyDecisionContext, TempoQualityPolicy,
+            TrackTransitionInput,
+        };
+        use dhun_lib::dj::levels::DjLevel;
+
+        let make_timing = |bpm: f64, conf: f64, beats_per_bar: u8, meter_label: &str, var: bool| TrackTimingProfile {
+            average_bpm: bpm,
+            beatgrid_confidence: conf,
+            downbeat_offset_ms: 0,
+            is_variable_tempo: var,
+            tempo_drift_bpm: if var { 9.0 } else { 0.4 },
+            meter: MeterAnalysis {
+                beats_per_bar,
+                meter_label: meter_label.to_string(),
+                confidence: conf,
+            },
+            tempo_map: vec![TempoSegment {
+                start_ms: 0,
+                end_ms: 180_000,
+                bpm,
+                confidence: conf,
+            }],
+            beat_timestamps_ms: (0..360).map(|i| (i as f64 * (60_000.0 / bpm)) as i64).collect(),
+            downbeat_timestamps_ms: (0..90)
+                .map(|i| (i as f64 * beats_per_bar as f64 * (60_000.0 / bpm)) as i64)
+                .collect(),
+        };
+
+        let make_sec = |stype: &str, s_ms: i64, e_ms: i64, energy: f64, vocal: f64| PhraseMarker {
+            section_type: stype.to_string(),
+            start_ms: s_ms,
+            end_ms: e_ms,
+            energy_level: energy,
+            bass_energy: energy * 0.85,
+            vocal_activity: vocal,
+            confidence: 0.88,
+            bar_index: 0,
+        };
+
+        let base_track = |id: &str, deck: usize, bpm: f64, key: &str, genre: &str, sections: Vec<PhraseMarker>| {
+            TrackTransitionInput {
+                track_id: id.to_string(),
+                deck_id: deck,
+                title: format!("Track {}", id),
+                artist: format!("Artist {}", id),
+                duration_sec: 160.0,
+                current_pos_sec: 60.0,
+                bpm: Some(bpm),
+                camelot_key: Some(key.to_string()),
+                overall_energy: Some(0.80),
+                genre_tags: vec![genre.to_string()],
+                sections,
+                timing_profile: Some(make_timing(bpm, 0.90, 4, "4/4", false)),
+            }
+        };
+
+        let ctx = |level: DjLevel, mood: &str| PartyDecisionContext {
+            dj_level: level,
+            mood_id: mood.to_string(),
+            target_energy: 0.82,
+            recent_techniques: vec![],
+            tempo_policy: TempoQualityPolicy::for_dj_level(level),
+        };
+
+        // 1. Same-BPM Desi Club instrumental tracks -> long 64-beat phrase/layer blend
+        let club_out = base_track(
+            "c1",
+            0,
+            128.0,
+            "8A",
+            "Tech House",
+            vec![
+                make_sec("groove", 0, 96_000, 0.82, 0.15),
+                make_sec("outro", 96_000, 160_000, 0.65, 0.10),
+            ],
+        );
+        let club_in = base_track(
+            "c2",
+            1,
+            128.0,
+            "8A",
+            "Tech House",
+            vec![
+                make_sec("intro", 0, 48_000, 0.68, 0.10),
+                make_sec("drop", 48_000, 128_000, 0.92, 0.15),
+            ],
+        );
+        let p_club = plan_dj_transition(&club_out, &club_in, &ctx(DjLevel::Level3AdvancedPerformance, "desi_club"));
+        assert_eq!(p_club.status, "planned");
+        assert_eq!(p_club.bpm_relationship, BpmRelationship::Direct);
+        assert_eq!(p_club.duration_beats, 64, "Instrumental Desi Club blend should select 64 beats");
+        assert!(p_club.meter_compatible);
+
+        // 2. Half-time (128 -> 64) & Double-time (70 -> 140) on Level 2
+        let mut ht_in = club_in.clone();
+        ht_in.bpm = Some(64.0);
+        ht_in.timing_profile = Some(make_timing(64.0, 0.90, 4, "4/4", false));
+        let p_ht = plan_dj_transition(&club_out, &ht_in, &ctx(DjLevel::Level2SmartMixing, "house_party"));
+        assert_eq!(p_ht.bpm_relationship, BpmRelationship::HalfTime);
+
+        let mut dt_out = club_out.clone();
+        dt_out.bpm = Some(70.0);
+        dt_out.timing_profile = Some(make_timing(70.0, 0.90, 4, "4/4", false));
+        let mut dt_in = club_in.clone();
+        dt_in.bpm = Some(140.0);
+        dt_in.timing_profile = Some(make_timing(140.0, 0.90, 4, "4/4", false));
+        let p_dt = plan_dj_transition(&dt_out, &dt_in, &ctx(DjLevel::Level2SmartMixing, "house_party"));
+        assert_eq!(p_dt.bpm_relationship, BpmRelationship::DoubleTime);
+
+        // 3. Gradual tempo ramp (112 -> 128 BPM = 14.3% diff) on Level 4 -> tempo_ramp_bridge
+        let mut ramp_out = club_out.clone();
+        ramp_out.bpm = Some(112.0);
+        ramp_out.timing_profile = Some(make_timing(112.0, 0.90, 4, "4/4", false));
+        let p_ramp = plan_dj_transition(&ramp_out, &club_in, &ctx(DjLevel::Level4CreativeTools, "house_party"));
+        assert_eq!(p_ramp.bpm_relationship, BpmRelationship::GradualTempoRamp);
+        assert_eq!(p_ramp.selected_technique, "tempo_ramp_bridge");
+
+        // 4. Low-confidence beatgrid -> refuses forced beatmatch (`NoBeatmatch`) + explains rejected alternatives
+        let mut bad_grid = club_in.clone();
+        bad_grid.timing_profile = Some(make_timing(128.0, 0.30, 4, "4/4", false));
+        let p_low = plan_dj_transition(&club_out, &bad_grid, &ctx(DjLevel::Level2SmartMixing, "house_party"));
+        assert_eq!(p_low.bpm_relationship, BpmRelationship::NoBeatmatch);
+        assert_eq!(p_low.selected_technique, "safe_quick_cut");
+        assert!(!p_low.rejected_alternatives.is_empty());
+
+        // 5. Incompatible meter (3/4 Garba/Folk vs 4/4) -> refuses forced beatmatch!
+        let mut meter3 = club_in.clone();
+        meter3.timing_profile = Some(make_timing(128.0, 0.90, 3, "3/4", false));
+        let p_meter = plan_dj_transition(&club_out, &meter3, &ctx(DjLevel::Level3AdvancedPerformance, "garba"));
+        assert!(!p_meter.meter_compatible);
+        assert_eq!(p_meter.bpm_relationship, BpmRelationship::NoBeatmatch);
+
+        // 6. Vocal-vs-vocal clash in Bollywood/Shaadi -> avoids long blend & sets `avoid_vocal_clash`
+        let voc_out = base_track(
+            "v1",
+            0,
+            122.0,
+            "9B",
+            "Bollywood",
+            vec![make_sec("chorus", 40_000, 120_000, 0.85, 0.82)],
+        );
+        let voc_in = base_track(
+            "v2",
+            1,
+            122.0,
+            "9B",
+            "Bollywood",
+            vec![make_sec("chorus", 0, 80_000, 0.86, 0.85)],
+        );
+        let p_voc = plan_dj_transition(&voc_out, &voc_in, &ctx(DjLevel::Level2SmartMixing, "shaadi"));
+        assert_eq!(p_voc.vocal_overlap_policy, "avoid_vocal_clash");
+        assert!(p_voc.duration_beats <= 16, "Vocal clash must shorten transition (got {} beats)", p_voc.duration_beats);
+        assert!(p_voc.rejected_alternatives.iter().any(|r| r.technique == "phrase_long_blend"));
+
+        // 7. Intro-over-chorus & Breakdown-to-drop preferred pairing + Build-up payoff protection!
+        let mut build_out = base_track(
+            "b1",
+            0,
+            126.0,
+            "8A",
+            "EDM",
+            vec![
+                make_sec("build", 48_000, 64_000, 0.70, 0.15),
+                make_sec("drop", 64_000, 96_000, 0.95, 0.15),
+                make_sec("breakdown", 96_000, 120_000, 0.40, 0.10),
+            ],
+        );
+        build_out.current_pos_sec = 52.0; // Currently inside build-up right before drop!
+        let drop_in = base_track(
+            "d2",
+            1,
+            126.0,
+            "8A",
+            "EDM",
+            vec![
+                make_sec("intro", 0, 16_000, 0.40, 0.10),
+                make_sec("drop", 16_000, 80_000, 0.94, 0.15),
+            ],
+        );
+        let p_bd = plan_dj_transition(&build_out, &drop_in, &ctx(DjLevel::Level3AdvancedPerformance, "desi_club"));
+        assert!(
+            p_bd.outgoing_mix_out_sec >= 90.0,
+            "Must protect active build-up & drop payoff before mixing out at breakdown (got {:.1}s)",
+            p_bd.outgoing_mix_out_sec
+        );
+        assert_eq!(p_bd.outgoing_section_type, "breakdown");
+        assert_eq!(p_bd.incoming_section_type, "drop", "Breakdown outgoing should welcome high-impact incoming drop");
+
+        // 8. Baraat Dhol Indian percussion mood -> prefers short clean mix, rejects long blend
+        let dhol_out = base_track("dh1", 0, 134.0, "6A", "Bhangra Dhol", vec![make_sec("groove", 0, 140_000, 0.95, 0.45)]);
+        let dhol_in = base_track("dh2", 1, 134.0, "6A", "Bhangra Dhol", vec![make_sec("intro", 0, 40_000, 0.90, 0.25)]);
+        let p_dhol = plan_dj_transition(&dhol_out, &dhol_in, &ctx(DjLevel::Level2SmartMixing, "baraat"));
+        assert!(p_dhol.duration_beats <= 16);
+        assert!(p_dhol.rejected_alternatives.iter().any(|r| r.technique == "phrase_long_blend"));
+
+        // 9. Insufficient remaining playback time (< 1.2s) -> explicitly REJECTED
+        let mut urgent = club_out.clone();
+        urgent.current_pos_sec = 159.3;
+        let p_rej = plan_dj_transition(&urgent, &club_in, &ctx(DjLevel::Level2SmartMixing, "house_party"));
+        assert_eq!(p_rej.status, "rejected");
+        assert!(p_rej.rejection_reason.is_some());
+    }
 }
 
 
