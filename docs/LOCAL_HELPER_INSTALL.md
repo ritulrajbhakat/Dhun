@@ -20,6 +20,7 @@ Optional environment variable overrides:
 - `DHUN_CACHE_DIR` (explicit temporary audio cache directory)
 - `DHUN_ALLOWED_ORIGINS` (comma-separated public Vercel origins if using a custom domain; `*.vercel.app` and `localhost` are already allowed)
 - `DHUN_GLOBAL_CATALOGUE_URL` & `DHUN_CATALOGUE_SERVICE_KEY` (optional engine-only metadata sync; omit for 100% offline operation)
+- `DHUN_AUDIO_RESOLVER_URL` & optional `DHUN_AUDIO_RESOLVER_KEY` (optional host-configured HTTPS media resolver endpoint that receives `POST` JSON `{ source_url, provider_video_id, title, artist, version_tag }` and returns either JSON `{ direct_https_audio_url, license_or_authorization_note, expected_sha256 }` or direct `audio/*` bytes to cache and analyze locally)
 
 ---
 

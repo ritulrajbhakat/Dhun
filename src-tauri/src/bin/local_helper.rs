@@ -6,6 +6,7 @@ use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use dhun_lib::db::Database;
+use dhun_lib::library::resolver::AuthorizedResolverConfig;
 use dhun_lib::network::local_helper_routes::{
     create_local_helper_router, LocalHelperState, DEFAULT_LOCAL_HELPER_PORT,
 };
@@ -133,14 +134,39 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let state = Arc::new(LocalHelperState::new(
-        db.clone(),
-        port,
-        cache_dir,
-        sync_manager,
-        None,
-        allowed_origins,
-    ));
+    // Optional host-configured HTTPS media resolver (for licensed / free-alternative HTTPS audio servers)
+    let resolver_url = std::env::var("DHUN_AUDIO_RESOLVER_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let resolver_key = std::env::var("DHUN_AUDIO_RESOLVER_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    let audio_resolver = match resolver_url {
+        Some(url) => match AuthorizedResolverConfig::new(url.clone(), resolver_key) {
+            Ok(cfg) => {
+                info!("Authorized HTTPS Audio Resolver configured: {}", cfg.endpoint_url);
+                Some(cfg)
+            }
+            Err(e) => {
+                warn!("Ignored invalid DHUN_AUDIO_RESOLVER_URL '{}': {}", url, e);
+                None
+            }
+        },
+        None => None,
+    };
+
+    let state = Arc::new(
+        LocalHelperState::new(
+            db.clone(),
+            port,
+            cache_dir,
+            sync_manager,
+            None,
+            allowed_origins,
+        )
+        .with_audio_resolver(audio_resolver),
+    );
 
     // Launch-time cache maintenance: reconcile stale locks and purge expired temp audio files
     let _ = state.cache_manager.reconcile_locks(&db);

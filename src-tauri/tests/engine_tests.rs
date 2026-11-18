@@ -3561,6 +3561,63 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_cache);
     }
+
+    /// Verifies AuthorizedResolverConfig anti-SSRF/HTTPS enforcement and direct audio byte
+    /// Symphonia validation + cache ingestion (accepting valid WAV, rejecting garbage cleanly).
+    #[test]
+    fn test_authorized_resolver_validation_and_direct_audio_cache_ingest() {
+        use dhun_lib::library::resolver::{
+            save_and_ingest_audio_bytes_to_cache, AuthorizedResolverConfig, ResolverJsonResponse,
+        };
+
+        // 1. Resolver config strictly enforces HTTPS and blocks localhost/private IPs
+        assert!(AuthorizedResolverConfig::new("http://example.com/resolve".to_string(), None).is_err());
+        assert!(AuthorizedResolverConfig::new("https://127.0.0.1/resolve".to_string(), None).is_err());
+        assert!(AuthorizedResolverConfig::new("https://localhost/resolve".to_string(), None).is_err());
+        assert!(AuthorizedResolverConfig::new("https://192.168.1.10/resolve".to_string(), None).is_err());
+        assert!(AuthorizedResolverConfig::new("   ".to_string(), None).is_err());
+
+        // 2. JSON response contract deserialization
+        let parsed_json: ResolverJsonResponse = serde_json::from_str(
+            r#"{"direct_https_audio_url":"https://media.example.com/a.mp3","license_or_authorization_note":"CC-BY","expected_sha256":null}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed_json.direct_https_audio_url, "https://media.example.com/a.mp3");
+        assert_eq!(parsed_json.license_or_authorization_note.as_deref(), Some("CC-BY"));
+
+        // 3. Direct audio byte ingestion validates via Symphonia, caches WAV, and cleans up garbage
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_resolver_ingest_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_cache).unwrap();
+
+        let bad_res = save_and_ingest_audio_bytes_to_cache(
+            b"<html>not audio</html>",
+            "dQw4w9WgXcQ",
+            "https://resolver.example.com/audio",
+            &temp_cache,
+            &db,
+        );
+        assert!(bad_res.is_err(), "Non-audio HTML payload must be rejected");
+        let leftover_parts: Vec<_> = std::fs::read_dir(&temp_cache)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(leftover_parts.is_empty(), "Rejected payloads must not leave orphaned temp files");
+
+        let wav_bytes = create_test_wav_bytes(44100, 2, 44100, 44100);
+        let (cached_path, sha256) = save_and_ingest_audio_bytes_to_cache(
+            &wav_bytes,
+            "dQw4w9WgXcQ",
+            "https://resolver.example.com/audio",
+            &temp_cache,
+            &db,
+        )
+        .expect("Valid WAV bytes from resolver must ingest and cache cleanly");
+        assert!(cached_path.exists());
+        assert_eq!(sha256.len(), 64);
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
 }
 
 

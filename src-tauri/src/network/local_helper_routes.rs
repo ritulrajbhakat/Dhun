@@ -41,7 +41,8 @@ use crate::library::cache::{
     CACHE_PRIORITY_PLAYING, DEFAULT_MAX_TEMP_TRACKS,
 };
 use crate::library::downloader::AudioDownloader;
-use crate::library::pipeline::{run_local_song_pipeline, AuthorizedStreamProof};
+use crate::library::pipeline::AuthorizedStreamProof;
+use crate::library::resolver::{run_local_song_pipeline_with_resolver, AuthorizedResolverConfig};
 use crate::network::ip::{
     detect_reachable_lan_ip, is_allowed_local_host_header, is_lan_or_loopback_ip,
 };
@@ -76,6 +77,7 @@ pub struct LocalHelperState {
     pub rate_limiter: RateLimiter,
     pub ws_tx: broadcast::Sender<LocalRoomEvent>,
     pub allowed_frontend_origins: Vec<String>,
+    pub audio_resolver: Option<AuthorizedResolverConfig>,
 }
 
 impl LocalHelperState {
@@ -110,7 +112,13 @@ impl LocalHelperState {
             rate_limiter: RateLimiter::new(15, 60),
             ws_tx,
             allowed_frontend_origins,
+            audio_resolver: None,
         }
+    }
+
+    pub fn with_audio_resolver(mut self, resolver: Option<AuthorizedResolverConfig>) -> Self {
+        self.audio_resolver = resolver;
+        self
     }
 
     /// Reads the current reachable RFC1918 LAN IP (re-detecting automatically when not pinned in tests
@@ -608,6 +616,7 @@ pub async fn local_health(
         "port": state.port,
         "lan_reachable": lan_ip.is_some(),
         "detected_lan_ip": lan_ip,
+        "audio_resolver_configured": state.audio_resolver.is_some(),
         "cache_stats": cache_stats,
         "sync_overview": sync_overview,
         "timestamp": chrono::Utc::now().timestamp_millis()
@@ -1352,11 +1361,12 @@ pub async fn submit_song_to_local_room(
 
     let submission_id = format!("sub_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
 
-    let outcome = run_local_song_pipeline(
+    let outcome = run_local_song_pipeline_with_resolver(
         &room_id,
         &submission_id,
         &req.url,
         req.authorized_stream.as_ref(),
+        state.audio_resolver.as_ref(),
         None,
         &state.db,
         &state.cache_manager,
