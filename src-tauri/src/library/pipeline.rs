@@ -185,12 +185,12 @@ pub async fn stage_3_authorized_acquisition(
         );
     }
 
-    let safe_name = format!("auth_{}.audio", parsed.video_id);
+    let safe_name = format!("auth_{}", parsed.video_id);
     match downloader
         .download_audio(
             &proof.direct_https_audio_url,
-            Some(&safe_name),
             proof.expected_sha256.as_deref(),
+            Some(&safe_name),
             db,
         )
         .await
