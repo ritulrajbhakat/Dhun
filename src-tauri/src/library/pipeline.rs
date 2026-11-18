@@ -40,7 +40,7 @@ impl AcquisitionStatus {
 
 /// Optional explicit authorization envelope for content the host is legally authorized to process
 /// (e.g. licensed/royalty-free direct HTTPS audio mirror associated with a YouTube release).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorizedStreamProof {
     pub direct_https_audio_url: String,
     pub license_or_authorization_note: String,

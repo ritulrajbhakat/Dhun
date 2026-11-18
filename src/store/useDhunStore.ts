@@ -1,6 +1,9 @@
 import { create } from 'zustand';
 import {
   DjLevel,
+  DjRecommendation,
+  DjSkillProfile,
+  DjTechniqueExecutionRecord,
   LocalPartyRoom,
   LocalRoomEvent,
   LocalRoomSubmission,
@@ -64,12 +67,16 @@ interface DhunState {
   // Private Local Party Room State (Zero Cloud Parties, Zero Approval Queue)
   activeRoom: LocalPartyRoom | null;
   djLevelName: string;
+  djSkillProfile: DjSkillProfile | null;
   exposedDecks: 2 | 4;
   internalDeckCapacity: 4;
   autoDjEnabled: boolean;
   guestUrl: string | null;
   qrSvg: string | null;
   submissions: LocalRoomSubmission[];
+  recommendations: DjRecommendation[];
+  pendingIntakeJobs: number;
+  techniqueLog: DjTechniqueExecutionRecord[];
   nextPlayableCandidate: PlayableCandidatePointer | null;
   transitionStyle: TransitionStyle;
   cacheStats: LocalTempCacheStats;
@@ -152,16 +159,20 @@ export const useDhunStore = create<DhunState>((set, get) => {
   const ensureFallbackPolling = () => {
     if (httpFallbackTimer) return;
     httpFallbackTimer = setInterval(() => {
-      const { activeRoom, wsConnected, helperConnected } = get();
+      const { activeRoom, wsConnected, helperConnected, pendingIntakeJobs } = get();
       if (!activeRoom || activeRoom.status === 'closed') {
         stopHttpFallbackPolling();
         return;
       }
-      // If a strict browser (e.g. Safari) blocks ws://127.0.0.1 from HTTPS, seamlessly poll REST
-      if (!wsConnected && helperConnected) {
-        void get().refreshRoomDashboard();
+      // Poll REST when WebSocket is unavailable (e.g. Safari) OR while background intake jobs are draining
+      if (helperConnected && (!wsConnected || pendingIntakeJobs > 0)) {
+        void get().refreshRoomDashboard().then(() => {
+          if (get().activeRoom?.status === 'live') {
+            void get().driveAutoDjLoop();
+          }
+        });
       }
-    }, 5000);
+    }, 3000);
   };
 
   const handleLocalRoomEvent = (evt: LocalRoomEvent) => {
@@ -172,6 +183,8 @@ export const useDhunStore = create<DhunState>((set, get) => {
       evt.event_type === 'room.config_updated' ||
       evt.event_type === 'room.closed' ||
       evt.event_type === 'dj.submission_received' ||
+      evt.event_type === 'dj.submission_updated' ||
+      evt.event_type === 'dj.submission_ready' ||
       evt.event_type === 'dj.evaluated' ||
       evt.event_type === 'dj.playback_updated'
     ) {
@@ -192,11 +205,16 @@ export const useDhunStore = create<DhunState>((set, get) => {
       // Preload next playable candidate onto an idle deck before current track finishes
       void get().driveAutoDjLoop();
     },
-    onTransitionStarted: (_fromDeck, _fromSubId, toDeckId, toSubId) => {
+    onTechniqueExecuted: (execution) => {
+      set((state) => ({
+        techniqueLog: [execution, ...state.techniqueLog].slice(0, 25),
+      }));
+    },
+    onTransitionStarted: (_fromDeck, _fromSubId, toDeckId, toSubId, execution) => {
       const { activeRoom } = get();
       set({
         autoDjPlaybackState: 'transitioning',
-        autoDjStatusNote: `Transitioning automatically to Deck ${String.fromCharCode(65 + toDeckId)}`,
+        autoDjStatusNote: `L${execution.djLevel} ${execution.techniqueLabel} → Deck ${String.fromCharCode(65 + toDeckId)} (${execution.incomingTitle})`,
       });
       if (activeRoom) {
         void localHelperClient
@@ -271,14 +289,18 @@ export const useDhunStore = create<DhunState>((set, get) => {
 
     activeRoom: null,
     djLevelName: DJ_LEVEL_NAMES[2],
+    djSkillProfile: null,
     exposedDecks: 2,
     internalDeckCapacity: 4,
     autoDjEnabled: true,
     guestUrl: null,
     qrSvg: null,
     submissions: [],
+    recommendations: [],
+    pendingIntakeJobs: 0,
+    techniqueLog: [],
     nextPlayableCandidate: null,
-    transitionStyle: 'bass_swap',
+    transitionStyle: 'timed_bass_swap',
     cacheStats: { track_count: 0, max_tracks: 15, total_bytes: 0, locked_tracks: 0 },
     syncOverview: { pending_count: 0, in_flight_count: 0, synced_count: 0, failed_count: 0 },
 
@@ -333,17 +355,21 @@ export const useDhunStore = create<DhunState>((set, get) => {
       try {
         const dash = await localHelperClient.getRoomDashboard(savedRoomId);
         const savedQr = localHelperClient.getSavedGuestQr();
-        const style = (dash.transition_style as TransitionStyle) || 'bass_swap';
+        const style = (dash.transition_style as TransitionStyle) || 'timed_bass_swap';
+        webAudioEngine.setDjLevel(dash.room.dj_level);
         webAudioEngine.setTransitionStyle(style);
 
         set({
           activeRoom: dash.room,
           djLevelName: dash.dj_level_name,
+          djSkillProfile: dash.dj_skill_profile || null,
           exposedDecks: dash.exposed_decks >= 4 ? 4 : 2,
           autoDjEnabled: dash.auto_dj_enabled,
           lanReachable: dash.lan_reachable,
           detectedLanIp: dash.detected_lan_ip,
           submissions: dash.submissions,
+          recommendations: dash.recommendations || [],
+          pendingIntakeJobs: dash.pending_intake_jobs ?? 0,
           nextPlayableCandidate: dash.next_playable_candidate,
           transitionStyle: style,
           cacheStats: dash.cache_stats,
@@ -381,16 +407,20 @@ export const useDhunStore = create<DhunState>((set, get) => {
       if (!activeRoom) return;
       try {
         const dash = await localHelperClient.getRoomDashboard(activeRoom.room_id);
-        const style = (dash.transition_style as TransitionStyle) || 'bass_swap';
+        const style = (dash.transition_style as TransitionStyle) || 'timed_bass_swap';
+        webAudioEngine.setDjLevel(dash.room.dj_level);
         webAudioEngine.setTransitionStyle(style);
         set({
           activeRoom: dash.room,
           djLevelName: dash.dj_level_name,
+          djSkillProfile: dash.dj_skill_profile || null,
           exposedDecks: dash.exposed_decks >= 4 ? 4 : 2,
           autoDjEnabled: dash.auto_dj_enabled,
           lanReachable: dash.lan_reachable,
           detectedLanIp: dash.detected_lan_ip,
           submissions: dash.submissions,
+          recommendations: dash.recommendations || [],
+          pendingIntakeJobs: dash.pending_intake_jobs ?? 0,
           nextPlayableCandidate: dash.next_playable_candidate,
           transitionStyle: style,
           cacheStats: dash.cache_stats,
@@ -645,6 +675,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
     },
 
     setDjLevel: async (level: DjLevel) => {
+      webAudioEngine.setDjLevel(level);
       set({
         selectedDjLevel: level,
         djLevelName: DJ_LEVEL_NAMES[level],
@@ -656,6 +687,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
           dj_level: level,
         });
         set({ activeRoom: updated });
+        await get().evaluateDjPool().catch(() => {});
       }
     },
 

@@ -1,5 +1,6 @@
 import {
   CreateLocalRoomResponse,
+  DjRecommendation,
   HostRoomDashboardResponse,
   LocalHelperHealth,
   LocalPartyRoom,
@@ -260,6 +261,7 @@ export class LocalHelperClient {
     dj_status: string;
     cache_locked: boolean;
     next_playable_candidate: PlayableCandidatePointer | null;
+    recommendations?: DjRecommendation[];
     transition_style: string;
   }> {
     return this.request(
@@ -309,6 +311,7 @@ export class LocalHelperClient {
     evaluated_count: number;
     prepared_next_submission_id: string | null;
     next_playable_candidate: PlayableCandidatePointer | null;
+    recommendations?: DjRecommendation[];
     interrupted_current_track: boolean;
     transition_style: string;
   }> {

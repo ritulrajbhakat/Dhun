@@ -339,6 +339,22 @@ pub struct LocalTempCacheStats {
     pub locked_tracks: usize,
 }
 
+/// Persistent background intake job stored in SQLite (`submission_intake_jobs`)
+/// so async song submissions survive local helper restarts without data loss.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionIntakeJob {
+    pub id: String,
+    pub room_id: String,
+    pub submission_id: String,
+    pub raw_url: String,
+    pub authorized_stream_json: Option<String>,
+    pub status: String, // 'received' | 'metadata_processing' | 'awaiting_authorized_audio' | 'analysing' | 'ready' | 'restricted_by_provider' | 'failed'
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// Global Shared Song Metadata Catalogue Record (Reusable Musical Intelligence ONLY).
 /// Never contains party IDs, playlists, guest requests, or raw audio files.
 #[derive(Debug, Clone, Serialize, Deserialize)]

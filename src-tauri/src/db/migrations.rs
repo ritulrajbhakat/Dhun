@@ -325,6 +325,36 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         info!("Migration v5 applied successfully.");
     }
 
+    if current_version < 6 {
+        info!("Applying DHUN schema migration v6 (Persistent async submission intake queue)...");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS submission_intake_jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                room_id TEXT NOT NULL REFERENCES local_party_rooms(room_id) ON DELETE CASCADE,
+                submission_id TEXT NOT NULL REFERENCES local_room_submissions(id) ON DELETE CASCADE,
+                raw_url TEXT NOT NULL,
+                authorized_stream_json TEXT,
+                status TEXT NOT NULL DEFAULT 'received',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_intake_jobs_status_created
+                ON submission_intake_jobs(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_intake_jobs_room
+                ON submission_intake_jobs(room_id, status);
+            ",
+        )?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at, description) VALUES (6, ?1, 'Persistent asynchronous submission intake queue surviving helper restarts')",
+            params![now],
+        )?;
+        info!("Migration v6 applied successfully.");
+    }
+
     Ok(())
 }
 

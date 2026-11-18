@@ -3653,6 +3653,211 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_cache);
     }
+
+    /// Verifies persistent asynchronous submission intake queue:
+    /// - Submitting multiple songs returns immediately with `received` (zero blocking on metadata/audio)
+    /// - Jobs persist in SQLite `submission_intake_jobs`
+    /// - Interrupted in-flight jobs recover cleanly on restart and process to completion
+    #[tokio::test]
+    async fn test_async_persistent_intake_queue_non_blocking_and_crash_recovery_in_process() {
+        use axum::extract::{ConnectInfo, Path, State};
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::Json;
+        use dhun_lib::network::local_helper_routes::{
+            create_local_room, get_host_room_dashboard, process_single_intake_job,
+            submit_song_to_local_room, CreateLocalRoomRequest, LocalHelperState,
+            UnifiedSongSubmissionRequest,
+        };
+        use dhun_lib::sync::MetadataSyncManager;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_async_q_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_cache).unwrap();
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let state = Arc::new(LocalHelperState::new(
+            db.clone(),
+            47821,
+            temp_cache.clone(),
+            sync_mgr,
+            Some(Some("192.168.1.55".to_string())),
+            vec![],
+        ));
+        let host_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+
+        let Json(created) = create_local_room(
+            State(state.clone()),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Async Queue Test".to_string(),
+                dj_level: Some(3),
+                primary_mood_id: Some("shaadi".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut host_headers = HeaderMap::new();
+        host_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", created.host_token)).unwrap(),
+        );
+
+        // Submit 3 links back-to-back -> each must return immediately as `received`
+        for vid in ["dQw4w9WgXcQ", "9bZkp7q19f0", "kJQP7kiw5Fk"] {
+            let Json(sub) = submit_song_to_local_room(
+                State(state.clone()),
+                Path(created.room.room_id.clone()),
+                ConnectInfo(host_addr),
+                host_headers.clone(),
+                Json(UnifiedSongSubmissionRequest {
+                    url: format!("https://www.youtube.com/watch?v={}", vid),
+                    authorized_stream: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sub.acquisition_status, "received");
+            assert_eq!(sub.status, "received_by_dj");
+        }
+
+        assert_eq!(db.get_pending_intake_job_count(&created.room.room_id).unwrap(), 3);
+
+        // Claim job 1 (simulating mid-flight processing), then simulate crash/restart recovery
+        let claimed = db.claim_next_submission_intake_job().unwrap().expect("Must claim job 1");
+        assert_eq!(claimed.status, "metadata_processing");
+
+        let recovered = db.recover_interrupted_intake_jobs().unwrap();
+        assert_eq!(recovered, 1, "Interrupted in-flight intake job must recover cleanly on restart");
+
+        // Drain all 3 jobs cleanly via the background worker helper
+        let mut drained = 0;
+        while let Ok(Some(job)) = db.claim_next_submission_intake_job() {
+            assert!(process_single_intake_job(&state, &job).await);
+            drained += 1;
+        }
+        assert_eq!(drained, 3);
+        assert_eq!(db.get_pending_intake_job_count(&created.room.room_id).unwrap(), 0);
+
+        // Dashboard must report truthful recommendations + skill profile + 0 pending intake jobs
+        let Json(dash) = get_host_room_dashboard(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dash.pending_intake_jobs, 0);
+        assert_eq!(dash.dj_skill_profile.level, 3);
+        assert!(!dash.recommendations.is_empty(), "Recommendations must be produced even for metadata-only tracks");
+        assert!(
+            dash.recommendations.iter().all(|r| !r.is_playable && r.playability_label == "metadata_only_restricted"),
+            "Metadata-only recommendations must be honestly labeled as not playable"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
+    /// Verifies DJ Levels 1–4 have genuinely distinct, strictly inheriting skill profiles and select
+    /// different mixing techniques for the exact same pair of tracks, while falling back safely when
+    /// BPM/key metadata is incomplete.
+    #[test]
+    fn test_dj_level_1_to_4_distinct_techniques_and_incomplete_metadata_recommendations() {
+        use dhun_lib::dj::levels::DjLevel;
+        use dhun_lib::dj::moods::get_mood_by_id;
+        use dhun_lib::dj::selector::{build_dj_recommendations, choose_technique_for_pair};
+
+        // 1. Strict capability & technique inheritance across Levels 1 -> 4
+        let p1 = DjLevel::Level1TwoDeckMixer.skill_profile();
+        let p2 = DjLevel::Level2SmartMixing.skill_profile();
+        let p3 = DjLevel::Level3AdvancedPerformance.skill_profile();
+        let p4 = DjLevel::Level4CreativeTools.skill_profile();
+
+        assert!(p1.unlocked_techniques.len() < p2.unlocked_techniques.len());
+        assert!(p2.unlocked_techniques.len() < p3.unlocked_techniques.len());
+        assert!(p3.unlocked_techniques.len() < p4.unlocked_techniques.len());
+        for t in &p1.unlocked_techniques {
+            assert!(p2.unlocked_techniques.contains(t));
+            assert!(p3.unlocked_techniques.contains(t));
+            assert!(p4.unlocked_techniques.contains(t));
+        }
+
+        let shaadi = get_mood_by_id("shaadi").unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let make_track = |id: &str, status: &str, bpm: Option<f64>, key: Option<&str>, energy: Option<f64>, acq: &str| {
+            LocalRoomSubmission {
+                id: id.to_string(),
+                room_id: "rm_lvl".to_string(),
+                submitted_by_type: "host".to_string(),
+                submitted_by_id: "host".to_string(),
+                submitted_by_name: "Host".to_string(),
+                provider: "youtube".to_string(),
+                source_url: format!("https://www.youtube.com/watch?v={:0<11}", id),
+                provider_video_id: format!("{:0<11}", id),
+                song_id: Some(format!("gsng_{}", id)),
+                title: format!("Song {}", id),
+                artist: format!("Artist {}", id),
+                version_tag: "original".to_string(),
+                thumbnail_url: None,
+                duration_ms: Some(200_000),
+                bpm,
+                half_time_bpm: bpm.map(|b| b / 2.0),
+                double_time_bpm: bpm.map(|b| b * 2.0),
+                musical_key: key.map(|k| k.to_string()),
+                camelot_key: key.map(|k| k.to_string()),
+                overall_energy: energy,
+                danceability: Some(0.88),
+                genre_tags_json: r#"["Bollywood"]"#.to_string(),
+                mood_tags_json: r#"["shaadi"]"#.to_string(),
+                metadata_source: "local_analysis".to_string(),
+                acquisition_status: acq.to_string(),
+                acquisition_note: None,
+                dj_status: status.to_string(),
+                dj_score: 0.0,
+                local_cache_path: if acq == "cached_authorized" { Some("/tmp/t.wav".to_string()) } else { None },
+                cache_id: if acq == "cached_authorized" { Some(format!("c_{}", id)) } else { None },
+                created_at: now,
+                updated_at: now,
+            }
+        };
+
+        // 2. Acceptance Test: Exact same harmonic pair produces 4 distinct techniques at L1, L2, L3, L4!
+        let playing = make_track("cur", "playing", Some(126.0), Some("8B"), Some(0.80), "cached_authorized");
+        let candidate = make_track("nxt", "queued_for_dj", Some(128.0), Some("9B"), Some(0.84), "cached_authorized");
+
+        let (t1, _) = choose_technique_for_pair(DjLevel::Level1TwoDeckMixer, Some(&playing), &candidate, &shaadi, 0.95);
+        let (t2, _) = choose_technique_for_pair(DjLevel::Level2SmartMixing, Some(&playing), &candidate, &shaadi, 0.95);
+        let (t3, _) = choose_technique_for_pair(DjLevel::Level3AdvancedPerformance, Some(&playing), &candidate, &shaadi, 0.95);
+        let (t4, _) = choose_technique_for_pair(DjLevel::Level4CreativeTools, Some(&playing), &candidate, &shaadi, 0.95);
+
+        assert_eq!(t1, "phrase_long_blend");
+        assert_eq!(t2, "timed_bass_swap");
+        assert_eq!(t3, "four_deck_layer");
+        assert_eq!(t4, "creative_mashup_layer");
+
+        // 3. Incomplete metadata test: missing BPM & key lowers confidence, explains what's missing,
+        //    and selects a safe transition fallback instead of pretending beat alignment!
+        let incomplete = make_track("inc", "queued_for_dj", None, None, None, "restricted_by_provider");
+        let recs = build_dj_recommendations(
+            &[playing.clone(), incomplete],
+            &shaadi,
+            None,
+            shaadi.target_energy,
+            DjLevel::Level2SmartMixing,
+        );
+        assert_eq!(recs.len(), 1);
+        assert!(!recs[0].is_playable);
+        assert_eq!(recs[0].playability_label, "metadata_only_restricted");
+        assert!(recs[0].confidence < 0.45);
+        assert!(recs[0].missing_signals.iter().any(|m| m.contains("BPM")));
+        assert!(recs[0].missing_signals.iter().any(|m| m.contains("key")));
+        assert_eq!(recs[0].suggested_technique, "safe_quick_cut");
+    }
 }
 
 

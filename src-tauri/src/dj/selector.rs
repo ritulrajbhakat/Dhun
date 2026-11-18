@@ -377,3 +377,415 @@ pub fn select_next_submission_without_interrupting(
     (scored, best_playable_next_id)
 }
 
+/// Explainable DJ recommendation surfaced directly to the host UI.
+/// Works even when the catalogue is small or BPM/key analysis is incomplete:
+/// missing signals lower confidence and trigger safe transition fallbacks rather than going silent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DjRecommendation {
+    pub submission_id: String,
+    pub title: String,
+    pub artist: String,
+    /// `"best_next"` | `"harmonic_match"` | `"energy_builder"` | `"safe_transition"` | `"creative_layer"`
+    pub category: String,
+    pub category_label: String,
+    pub compatibility_score: f64,
+    /// 0.0–1.0 confidence based on how much real analysis metadata is known
+    pub confidence: f64,
+    pub is_playable: bool,
+    /// `"playable_now"` | `"processing"` | `"metadata_only_restricted"` | `"failed"`
+    pub playability_label: String,
+    pub reasons: Vec<String>,
+    pub known_signals: Vec<String>,
+    pub missing_signals: Vec<String>,
+    pub suggested_technique: String,
+    pub technique_label: String,
+    pub technique_reason: String,
+}
+
+pub fn technique_display_label(technique_id: &str) -> &'static str {
+    match technique_id {
+        "safe_quick_cut" => "Safe Quick Cut",
+        "eq3_handover" => "3-Band EQ Handover",
+        "phrase_long_blend" => "Phrase-Aligned Long Blend",
+        "timed_bass_swap" => "Timed Bass Swap",
+        "filter_sweep_drop" => "Resonant Filter Sweep Drop",
+        "echo_out_blend" => "Beat-Synced Echo-Out Blend",
+        "beat_roll_buildup" => "Beat Roll Build-Up",
+        "filtered_buildup_drop" => "Filtered Build-Up & Drop",
+        "four_deck_layer" => "4-Deck Groove Layering",
+        "stutter_gate_drop" => "Rhythmic Stutter Gate Drop",
+        "backspin_cut" => "Vinyl Backspin Brake Cut",
+        "echo_freeze_drop" => "Echo Freeze Drop",
+        "tempo_ramp_bridge" => "Tempo Ramp Bridge",
+        "creative_mashup_layer" => "Creative Dual-Deck Mashup Layer",
+        _ => "3-Band EQ Handover",
+    }
+}
+
+/// Deterministically selects a genuine level-appropriate DJ technique based on:
+/// - Active DJ Level (1–4, with strict capability inheritance)
+/// - Metadata confidence (falls back to safe cut / EQ handover when BPM or beat grid is missing!)
+/// - BPM delta, Camelot harmonic fit, energy jump, and mood style.
+pub fn choose_technique_for_pair(
+    dj_level: crate::dj::levels::DjLevel,
+    current: Option<&crate::db::models::LocalRoomSubmission>,
+    candidate: &crate::db::models::LocalRoomSubmission,
+    primary_mood: &crate::dj::moods::MoodDefinition,
+    confidence: f64,
+) -> (String, String) {
+    use crate::dj::levels::DjLevel;
+
+    let cur_bpm = current.and_then(|c| c.bpm);
+    let cand_bpm = candidate.bpm;
+    let bpm_known = cur_bpm.is_some() && cand_bpm.is_some();
+    let bpm_pct_diff = match (cur_bpm, cand_bpm) {
+        (Some(a), Some(b)) if a > 0.0 => (a - b).abs() / a,
+        _ => 1.0,
+    };
+
+    let key_compat = match (
+        current.and_then(|c| c.camelot_key.as_deref()),
+        candidate.camelot_key.as_deref(),
+    ) {
+        (Some(ka), Some(kb)) => calculate_camelot_compatibility(ka, kb),
+        _ => 0.5,
+    };
+
+    let energy_delta = match (
+        current.and_then(|c| c.overall_energy),
+        candidate.overall_energy,
+    ) {
+        (Some(ea), Some(eb)) => eb - ea,
+        _ => 0.0,
+    };
+
+    // Strict safety fallback: never pretend accurate beat/phrase sync when BPM or analysis is missing
+    if !bpm_known || confidence < 0.45 {
+        if dj_level >= DjLevel::Level3AdvancedPerformance {
+            return (
+                "echo_out_blend".to_string(),
+                "Beat grid/BPM unverified — using Level 3 echo-out decay into clean incoming start instead of forced beatmatch.".to_string(),
+            );
+        }
+        return (
+            "safe_quick_cut".to_string(),
+            "BPM or beat grid not yet verified — safe quick cut avoids off-beat trainwrecks.".to_string(),
+        );
+    }
+
+    match dj_level {
+        DjLevel::Level1TwoDeckMixer => {
+            if bpm_pct_diff <= 0.04 {
+                (
+                    "phrase_long_blend".to_string(),
+                    "Level 1: BPMs within 4% — clean 2-deck phrase-aligned long blend.".to_string(),
+                )
+            } else if bpm_pct_diff <= 0.08 {
+                (
+                    "eq3_handover".to_string(),
+                    "Level 1: Clean 2-deck 3-band EQ handover (high → mid → low).".to_string(),
+                )
+            } else {
+                (
+                    "safe_quick_cut".to_string(),
+                    "Level 1: Large BPM gap — safe quick cut on phrase boundary.".to_string(),
+                )
+            }
+        }
+        DjLevel::Level2SmartMixing => {
+            if bpm_pct_diff <= 0.08 && key_compat >= 0.85 {
+                (
+                    "timed_bass_swap".to_string(),
+                    "Level 2: BPM & Camelot key compatible — auto-synced timed bass swap with gain matching.".to_string(),
+                )
+            } else if primary_mood.transition_style == "filter_sweep" || bpm_pct_diff <= 0.12 {
+                (
+                    "filter_sweep_drop".to_string(),
+                    "Level 2: Smart resonant filter sweep bridging tempo/key change cleanly.".to_string(),
+                )
+            } else {
+                (
+                    "safe_quick_cut".to_string(),
+                    "Level 2: Wide BPM delta (>12%) — smart fallback to clean quick cut.".to_string(),
+                )
+            }
+        }
+        DjLevel::Level3AdvancedPerformance => {
+            if energy_delta >= 0.08 {
+                (
+                    "beat_roll_buildup".to_string(),
+                    "Level 3: Rising energy — rhythmic 1/2→1/8 beat roll build-up into incoming drop.".to_string(),
+                )
+            } else if key_compat >= 0.90 && bpm_pct_diff <= 0.06 {
+                (
+                    "four_deck_layer".to_string(),
+                    "Level 3: Tight harmonic & BPM match — 4-deck filtered groove layering.".to_string(),
+                )
+            } else if bpm_pct_diff > 0.08 {
+                (
+                    "echo_out_blend".to_string(),
+                    "Level 3: Beat-synced 3/4-beat echo-out tail bridging tempo shift seamlessly.".to_string(),
+                )
+            } else {
+                (
+                    "filtered_buildup_drop".to_string(),
+                    "Level 3: Resonant HPF tension sweep into synchronized full-bass drop.".to_string(),
+                )
+            }
+        }
+        DjLevel::Level4CreativeTools => {
+            if key_compat >= 0.90 && bpm_pct_diff <= 0.06 {
+                (
+                    "creative_mashup_layer".to_string(),
+                    "Level 4: Harmonic lock — creative EQ-carved dual-deck mashup layering before bass swap.".to_string(),
+                )
+            } else if bpm_pct_diff > 0.07 && bpm_pct_diff <= 0.14 {
+                (
+                    "tempo_ramp_bridge".to_string(),
+                    "Level 4: Continuous tempo-ramp bridge smoothly pulling deck BPM into incoming tempo.".to_string(),
+                )
+            } else if energy_delta >= 0.07 {
+                (
+                    "stutter_gate_drop".to_string(),
+                    "Level 4: Peak energy lift — 16th-note rhythmic stutter gate chopping into incoming drop.".to_string(),
+                )
+            } else if bpm_pct_diff > 0.14 {
+                (
+                    "backspin_cut".to_string(),
+                    "Level 4: Dramatic genre/tempo switch — vinyl backspin brake cut directly onto downbeat.".to_string(),
+                )
+            } else {
+                (
+                    "echo_freeze_drop".to_string(),
+                    "Level 4: High-feedback 1/2-beat echo freeze wash releasing into full-energy incoming groove.".to_string(),
+                )
+            }
+        }
+    }
+}
+
+/// Builds explainable DJ recommendations for the host console, even when the catalogue is small
+/// or BPM/key analysis is incomplete. Honestly marks playability vs processing vs metadata-only.
+pub fn build_dj_recommendations(
+    submissions: &[crate::db::models::LocalRoomSubmission],
+    primary_mood: &crate::dj::moods::MoodDefinition,
+    secondary_mood: Option<&crate::dj::moods::MoodDefinition>,
+    target_energy: f64,
+    dj_level: crate::dj::levels::DjLevel,
+) -> Vec<DjRecommendation> {
+    let currently_playing = submissions.iter().find(|s| s.dj_status == "playing");
+    let current_bpm = currently_playing.and_then(|s| s.bpm);
+    let current_camelot = currently_playing.and_then(|s| s.camelot_key.as_deref());
+    let current_energy = currently_playing.and_then(|s| s.overall_energy);
+    let current_artist_lower = currently_playing.map(|s| s.artist.to_lowercase());
+
+    let recently_played_videos: std::collections::HashSet<&str> = submissions
+        .iter()
+        .filter(|s| s.dj_status == "played" || s.dj_status == "playing")
+        .map(|s| s.provider_video_id.as_str())
+        .collect();
+
+    let mut recs: Vec<DjRecommendation> = submissions
+        .iter()
+        .filter(|s| {
+            s.dj_status != "playing"
+                && s.dj_status != "played"
+                && s.dj_status != "skipped_unplayable"
+        })
+        .map(|s| {
+            let mut known = Vec::new();
+            let mut missing = Vec::new();
+            let mut reasons = Vec::new();
+
+            // Confidence starts from real available metadata (never goes silent when partial!)
+            let mut confidence = 0.25_f64;
+
+            if let Some(bpm) = s.bpm {
+                known.push(format!("BPM {:.1}", bpm));
+                confidence += 0.25;
+                if let Some(cbpm) = current_bpm {
+                    let compat = calculate_bpm_compatibility(cbpm, bpm);
+                    if compat >= 0.90 {
+                        reasons.push(format!("Tight tempo fit ({:.0} → {:.0} BPM)", cbpm, bpm));
+                    } else if compat >= 0.75 {
+                        reasons.push(format!("Mixable tempo shift ({:.0} → {:.0} BPM)", cbpm, bpm));
+                    } else {
+                        reasons.push(format!("Wide BPM change ({:.0} → {:.0} BPM)", cbpm, bpm));
+                    }
+                } else if bpm >= primary_mood.min_bpm && bpm <= primary_mood.max_bpm {
+                    reasons.push(format!("Inside {} BPM window ({:.0} BPM)", primary_mood.display_name, bpm));
+                }
+            } else {
+                missing.push("BPM not yet verified".to_string());
+            }
+
+            let mut key_compat = 0.5;
+            if let Some(ref k) = s.camelot_key {
+                known.push(format!("Camelot {}", k));
+                confidence += 0.20;
+                if let Some(ck) = current_camelot {
+                    key_compat = calculate_camelot_compatibility(ck, k);
+                    if key_compat >= 0.90 {
+                        reasons.push(format!("Harmonic Camelot lock ({} → {})", ck, k));
+                    } else if key_compat >= 0.75 {
+                        reasons.push(format!("Compatible energy key lift ({} → {})", ck, k));
+                    }
+                }
+            } else {
+                missing.push("Musical key unknown".to_string());
+            }
+
+            if let Some(en) = s.overall_energy {
+                known.push(format!("Energy {:.0}%", en * 100.0));
+                confidence += 0.15;
+                if let Some(ce) = current_energy {
+                    if en - ce >= 0.06 {
+                        reasons.push("Raises dancefloor energy".to_string());
+                    } else if (en - ce).abs() < 0.06 {
+                        reasons.push("Maintains steady party groove".to_string());
+                    }
+                } else if (en - target_energy).abs() <= 0.15 {
+                    reasons.push(format!("Fits {} target energy", primary_mood.display_name));
+                }
+            } else {
+                missing.push("Energy profile unanalyzed".to_string());
+            }
+
+            if s.duration_ms.unwrap_or(0) > 0 {
+                known.push(format!("Duration {}s", s.duration_ms.unwrap_or(0) / 1000));
+                confidence += 0.05;
+            } else {
+                missing.push("Phrase alignment unknown".to_string());
+            }
+
+            let is_playable = s.acquisition_status == "cached_authorized"
+                && (s.cache_id.is_some() || s.local_cache_path.is_some());
+            if is_playable {
+                known.push("Cached audio ready".to_string());
+                confidence += 0.10;
+            } else if s.acquisition_status == "restricted_by_provider" {
+                missing.push("No authorized local audio (metadata-only)".to_string());
+            } else if matches!(
+                s.acquisition_status.as_str(),
+                "received" | "metadata_processing" | "awaiting_authorized_audio" | "analysing"
+            ) {
+                missing.push("Background intake still processing".to_string());
+            }
+
+            let playability_label = if is_playable {
+                "playable_now"
+            } else if matches!(
+                s.acquisition_status.as_str(),
+                "received" | "metadata_processing" | "awaiting_authorized_audio" | "analysing"
+            ) {
+                "processing"
+            } else if s.acquisition_status == "failed" {
+                "failed"
+            } else {
+                "metadata_only_restricted"
+            }
+            .to_string();
+
+            let mut score = score_local_submission_for_dj(
+                s,
+                primary_mood,
+                secondary_mood,
+                current_bpm,
+                current_camelot,
+                target_energy,
+            );
+
+            // Artist & repeat diversity reasoning
+            let is_repeat = recently_played_videos.contains(s.provider_video_id.as_str());
+            if is_repeat {
+                score = (score - 40.0).max(0.0);
+                reasons.push("Already played earlier (deprioritized)".to_string());
+            } else if current_artist_lower
+                .as_deref()
+                .map(|a| !a.is_empty() && a == s.artist.to_lowercase())
+                .unwrap_or(false)
+            {
+                score = (score - 8.0).max(0.0);
+                reasons.push("Same artist as current track".to_string());
+            } else {
+                reasons.push("Fresh artist & track for the crowd".to_string());
+            }
+
+            // Ensure at least one clear mood/genre reason when BPM/key are absent
+            if s.bpm.is_none() && s.camelot_key.is_none() {
+                reasons.insert(
+                    0,
+                    format!(
+                        "Ranked via {} mood/metadata signals while BPM & key are pending",
+                        primary_mood.display_name
+                    ),
+                );
+            }
+
+            let clamped_conf = (confidence.clamp(0.15, 1.0) * 100.0).round() / 100.0;
+            let (technique_id, technique_reason) = choose_technique_for_pair(
+                dj_level,
+                currently_playing,
+                s,
+                primary_mood,
+                clamped_conf,
+            );
+
+            // Classify recommendation role
+            let (category, category_label) = if clamped_conf < 0.45 || technique_id == "safe_quick_cut" {
+                ("safe_transition", "Safe Transition")
+            } else if key_compat >= 0.90 && s.camelot_key.is_some() {
+                if dj_level >= crate::dj::levels::DjLevel::Level4CreativeTools {
+                    ("creative_layer", "Creative Mashup Option")
+                } else {
+                    ("harmonic_match", "Harmonic Option")
+                }
+            } else if s.overall_energy.unwrap_or(0.0) > current_energy.unwrap_or(target_energy) + 0.05 {
+                ("energy_builder", "Energy Builder")
+            } else {
+                ("best_next", "Best Next Track")
+            };
+
+            DjRecommendation {
+                submission_id: s.id.clone(),
+                title: s.title.clone(),
+                artist: s.artist.clone(),
+                category: category.to_string(),
+                category_label: category_label.to_string(),
+                compatibility_score: score,
+                confidence: clamped_conf,
+                is_playable,
+                playability_label,
+                reasons,
+                known_signals: known,
+                missing_signals: missing,
+                technique_label: technique_display_label(&technique_id).to_string(),
+                suggested_technique: technique_id,
+                technique_reason,
+            }
+        })
+        .collect();
+
+    // Sort playable tracks first by score, then non-playable recommendations by score
+    recs.sort_by(|a, b| {
+        b.is_playable
+            .cmp(&a.is_playable)
+            .then_with(|| {
+                b.compatibility_score
+                    .partial_cmp(&a.compatibility_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    // Label the #1 playable (or top overall if none playable yet) explicitly as "Best Next Track"
+    if let Some(top) = recs.first_mut() {
+        if top.is_playable {
+            top.category = "best_next".to_string();
+            top.category_label = "Best Next Track".to_string();
+        }
+    }
+
+    recs.truncate(6);
+    recs
+}
+

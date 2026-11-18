@@ -8,7 +8,8 @@ use tracing_subscriber::FmtSubscriber;
 use dhun_lib::db::Database;
 use dhun_lib::library::resolver::AuthorizedResolverConfig;
 use dhun_lib::network::local_helper_routes::{
-    create_local_helper_router, LocalHelperState, DEFAULT_LOCAL_HELPER_PORT,
+    create_local_helper_router, start_intake_queue_worker, LocalHelperState,
+    DEFAULT_LOCAL_HELPER_PORT,
 };
 use dhun_lib::sync::MetadataSyncManager;
 
@@ -185,6 +186,9 @@ async fn main() -> anyhow::Result<()> {
     if purged_expired > 0 {
         info!("Cleaned up {} expired temporary cache file(s) on launch.", purged_expired);
     }
+
+    // Start persistent asynchronous submission intake worker (recovers interrupted jobs automatically)
+    let _intake_worker = start_intake_queue_worker(state.clone());
 
     info!("Host Loopback API:        http://127.0.0.1:{}", port);
     match state.current_lan_ip() {

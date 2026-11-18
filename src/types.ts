@@ -1,5 +1,83 @@
 export type DjLevel = 1 | 2 | 3 | 4;
 
+export type DjTechniqueId =
+  | 'safe_quick_cut'
+  | 'eq3_handover'
+  | 'phrase_long_blend'
+  | 'timed_bass_swap'
+  | 'filter_sweep_drop'
+  | 'echo_out_blend'
+  | 'beat_roll_buildup'
+  | 'filtered_buildup_drop'
+  | 'four_deck_layer'
+  | 'stutter_gate_drop'
+  | 'backspin_cut'
+  | 'echo_freeze_drop'
+  | 'tempo_ramp_bridge'
+  | 'creative_mashup_layer'
+  | 'bass_swap'
+  | 'quick_cut'
+  | 'phrase_sync'
+  | 'filter_sweep';
+
+export interface DjSkillProfile {
+  level: DjLevel;
+  name: string;
+  summary: string;
+  exposed_decks: number;
+  internal_deck_capacity: number;
+  max_tempo_stretch_pct: number;
+  supports_auto_bpm_match: boolean;
+  supports_half_double_match: boolean;
+  supports_harmonic_key_match: boolean;
+  supports_gain_match: boolean;
+  supports_bass_swap: boolean;
+  supports_echo_out: boolean;
+  supports_beat_roll: boolean;
+  supports_four_deck_layering: boolean;
+  supports_stutter_gate: boolean;
+  supports_backspin_cut: boolean;
+  supports_echo_freeze: boolean;
+  supports_tempo_ramp: boolean;
+  supports_creative_mashup: boolean;
+  unlocked_techniques: string[];
+}
+
+export interface DjRecommendation {
+  submission_id: string;
+  title: string;
+  artist: string;
+  category: 'best_next' | 'harmonic_match' | 'energy_builder' | 'safe_transition' | 'creative_layer' | string;
+  category_label: string;
+  compatibility_score: number;
+  confidence: number;
+  is_playable: boolean;
+  playability_label: 'playable_now' | 'processing' | 'metadata_only_restricted' | 'failed' | string;
+  reasons: string[];
+  known_signals: string[];
+  missing_signals: string[];
+  suggested_technique: string;
+  technique_label: string;
+  technique_reason: string;
+}
+
+export interface DjTechniqueExecutionRecord {
+  id: string;
+  timestamp: number;
+  djLevel: DjLevel;
+  techniqueId: DjTechniqueId;
+  techniqueLabel: string;
+  outgoingTitle: string;
+  incomingTitle: string;
+  fromDeckId: number;
+  toDeckId: number;
+  durationSec: number;
+  tempoMatchRatio: number;
+  gainMatchDb: number;
+  fallbackUsed: boolean;
+  reason: string;
+}
+
 export interface MoodProfile {
   id: string;
   display_name: string;
@@ -111,12 +189,15 @@ export interface CreateLocalRoomResponse {
 export interface HostRoomDashboardResponse {
   room: LocalPartyRoom;
   dj_level_name: string;
+  dj_skill_profile?: DjSkillProfile;
   exposed_decks: number;
   internal_deck_capacity: number;
   auto_dj_enabled: boolean;
   lan_reachable: boolean;
   detected_lan_ip: string | null;
   submissions: LocalRoomSubmission[];
+  recommendations?: DjRecommendation[];
+  pending_intake_jobs?: number;
   next_playable_candidate: PlayableCandidatePointer | null;
   transition_style: string;
   cache_stats: LocalTempCacheStats;

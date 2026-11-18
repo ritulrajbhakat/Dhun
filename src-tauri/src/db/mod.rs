@@ -1345,6 +1345,200 @@ impl Database {
         Ok(())
     }
 
+    /// Updates a submission's pipeline stage (`received` -> `metadata_processing` -> `awaiting_authorized_audio` -> `analysing` -> `cached_authorized` / `restricted_by_provider` / `failed`).
+    pub fn update_submission_processing_stage(
+        &self,
+        sub_id: &str,
+        acquisition_status: &str,
+        acquisition_note: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE local_room_submissions
+             SET acquisition_status = ?1, acquisition_note = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![acquisition_status, acquisition_note, now, sub_id],
+        )?;
+        Ok(())
+    }
+
+    /// Persists resolved metadata, local Symphonia analysis, and cache linkage for an asynchronously processed submission.
+    pub fn update_submission_pipeline_result(&self, sub: &LocalRoomSubmission) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE local_room_submissions SET
+                song_id = ?1,
+                title = ?2,
+                artist = ?3,
+                version_tag = ?4,
+                thumbnail_url = ?5,
+                duration_ms = ?6,
+                bpm = ?7,
+                half_time_bpm = ?8,
+                double_time_bpm = ?9,
+                musical_key = ?10,
+                camelot_key = ?11,
+                overall_energy = ?12,
+                danceability = ?13,
+                genre_tags_json = ?14,
+                mood_tags_json = ?15,
+                metadata_source = ?16,
+                acquisition_status = ?17,
+                acquisition_note = ?18,
+                local_cache_path = ?19,
+                updated_at = ?20
+             WHERE id = ?21",
+            params![
+                sub.song_id,
+                sub.title,
+                sub.artist,
+                sub.version_tag,
+                sub.thumbnail_url,
+                sub.duration_ms,
+                sub.bpm,
+                sub.half_time_bpm,
+                sub.double_time_bpm,
+                sub.musical_key,
+                sub.camelot_key,
+                sub.overall_energy,
+                sub.danceability,
+                sub.genre_tags_json,
+                sub.mood_tags_json,
+                sub.metadata_source,
+                sub.acquisition_status,
+                sub.acquisition_note,
+                sub.local_cache_path,
+                now,
+                sub.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Persistent Asynchronous Submission Intake Queue (`submission_intake_jobs`)
+    // ========================================================================
+
+    pub fn enqueue_submission_intake_job(&self, job: &SubmissionIntakeJob) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO submission_intake_jobs (
+                id, room_id, submission_id, raw_url, authorized_stream_json,
+                status, attempts, last_error, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                job.id,
+                job.room_id,
+                job.submission_id,
+                job.raw_url,
+                job.authorized_stream_json,
+                job.status,
+                job.attempts,
+                job.last_error,
+                job.created_at,
+                job.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resets any jobs interrupted mid-flight by a helper restart back to `'received'` so they resume cleanly.
+    pub fn recover_interrupted_intake_jobs(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let count = conn.execute(
+            "UPDATE submission_intake_jobs
+             SET status = 'received', updated_at = ?1
+             WHERE status IN ('metadata_processing', 'awaiting_authorized_audio', 'analysing')",
+            params![now],
+        )?;
+        Ok(count)
+    }
+
+    /// Atomically claims the oldest queued intake job (`status = 'received'`) for background processing.
+    pub fn claim_next_submission_intake_job(&self) -> Result<Option<SubmissionIntakeJob>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let next_job: Option<SubmissionIntakeJob> = {
+            let mut stmt = tx.prepare(
+                "SELECT j.id, j.room_id, j.submission_id, j.raw_url, j.authorized_stream_json,
+                        j.status, j.attempts, j.last_error, j.created_at, j.updated_at
+                 FROM submission_intake_jobs j
+                 JOIN local_party_rooms r ON r.room_id = j.room_id
+                 WHERE j.status = 'received' AND r.status != 'closed'
+                 ORDER BY j.created_at ASC
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map([], |row| {
+                Ok(SubmissionIntakeJob {
+                    id: row.get(0)?,
+                    room_id: row.get(1)?,
+                    submission_id: row.get(2)?,
+                    raw_url: row.get(3)?,
+                    authorized_stream_json: row.get(4)?,
+                    status: row.get(5)?,
+                    attempts: row.get(6)?,
+                    last_error: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })?;
+            match rows.next() {
+                Some(r) => Some(r?),
+                None => None,
+            }
+        };
+
+        if let Some(mut job) = next_job {
+            let now = chrono::Utc::now().timestamp_millis();
+            job.status = "metadata_processing".to_string();
+            job.attempts += 1;
+            job.updated_at = now;
+            tx.execute(
+                "UPDATE submission_intake_jobs
+                 SET status = 'metadata_processing', attempts = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![job.attempts, now, job.id],
+            )?;
+            tx.commit()?;
+            Ok(Some(job))
+        } else {
+            tx.commit()?;
+            Ok(None)
+        }
+    }
+
+    pub fn update_submission_intake_job_status(
+        &self,
+        job_id: &str,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE submission_intake_jobs
+             SET status = ?1, last_error = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![status, last_error, now, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pending_intake_job_count(&self, room_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM submission_intake_jobs
+             WHERE room_id = ?1 AND status IN ('received', 'metadata_processing', 'awaiting_authorized_audio', 'analysing')",
+            params![room_id],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     // ========================================================================
     // Local Temporary Audio Cache Operations (10-15 Track Rolling Cap + Expiry)
     // ========================================================================

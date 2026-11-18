@@ -28,21 +28,28 @@ use uuid::Uuid;
 
 use crate::db::models::{
     GuestOwnSubmissionView, LocalPartyRoom, LocalRoomGuest, LocalRoomSubmission,
-    LocalTempCacheStats, SyncStatusOverview,
+    LocalTempCacheStats, SubmissionIntakeJob, SyncStatusOverview,
 };
 use crate::db::Database;
-use crate::dj::levels::DjLevel;
+use crate::dj::levels::{DjLevel, DjSkillProfile};
 use crate::dj::moods::{get_mood_by_id as get_mood_preset, get_preset_moods as get_all_mood_presets};
 use crate::dj::selector::{
-    compute_mood_energy_target, select_next_submission_without_interrupting,
+    build_dj_recommendations, choose_technique_for_pair, compute_mood_energy_target,
+    select_next_submission_without_interrupting, DjRecommendation,
 };
 use crate::library::cache::{
     RollingCacheManager, CACHE_PRIORITY_EVICTABLE, CACHE_PRIORITY_NEXT_DECK,
     CACHE_PRIORITY_PLAYING, DEFAULT_MAX_TEMP_TRACKS,
 };
 use crate::library::downloader::AudioDownloader;
-use crate::library::pipeline::AuthorizedStreamProof;
-use crate::library::resolver::{run_local_song_pipeline_with_resolver, AuthorizedResolverConfig};
+use crate::library::pipeline::{
+    stage_1_validate_and_identify, stage_2_lookup_existing_metadata,
+    stage_4_cache_temporary_audio, stage_5_local_audio_analysis, stage_6_sync_metadata_only,
+    AcquisitionStatus, AuthorizedStreamProof,
+};
+use crate::library::resolver::{
+    acquire_via_authorized_resolver, download_authorized_proof, AuthorizedResolverConfig,
+};
 use crate::network::ip::{
     detect_reachable_lan_ip, is_allowed_local_host_header, is_lan_or_loopback_ip,
 };
@@ -78,6 +85,7 @@ pub struct LocalHelperState {
     pub ws_tx: broadcast::Sender<LocalRoomEvent>,
     pub allowed_frontend_origins: Vec<String>,
     pub audio_resolver: Option<AuthorizedResolverConfig>,
+    pub intake_notify: Arc<tokio::sync::Notify>,
 }
 
 impl LocalHelperState {
@@ -113,6 +121,7 @@ impl LocalHelperState {
             ws_tx,
             allowed_frontend_origins,
             audio_resolver: None,
+            intake_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -390,12 +399,15 @@ pub struct PlayableCandidatePointer {
 pub struct HostRoomDashboardResponse {
     pub room: LocalPartyRoom,
     pub dj_level_name: String,
+    pub dj_skill_profile: DjSkillProfile,
     pub exposed_decks: usize,
     pub internal_deck_capacity: usize,
     pub auto_dj_enabled: bool,
     pub lan_reachable: bool,
     pub detected_lan_ip: Option<String>,
     pub submissions: Vec<LocalRoomSubmission>,
+    pub recommendations: Vec<DjRecommendation>,
+    pub pending_intake_jobs: usize,
     pub next_playable_candidate: Option<PlayableCandidatePointer>,
     pub transition_style: String,
     pub cache_stats: LocalTempCacheStats,
@@ -460,6 +472,7 @@ pub struct DjEvaluationResponse {
     pub evaluated_count: usize,
     pub prepared_next_submission_id: Option<String>,
     pub next_playable_candidate: Option<PlayableCandidatePointer>,
+    pub recommendations: Vec<DjRecommendation>,
     pub interrupted_current_track: bool,
     pub transition_style: String,
 }
@@ -478,6 +491,7 @@ pub struct PlaybackEventResponse {
     pub dj_status: String,
     pub cache_locked: bool,
     pub next_playable_candidate: Option<PlayableCandidatePointer>,
+    pub recommendations: Vec<DjRecommendation>,
     pub transition_style: String,
 }
 
@@ -505,13 +519,19 @@ fn build_playable_pointer(room_id: &str, sub: &LocalRoomSubmission) -> Option<Pl
 fn evaluate_and_find_next_playable(
     room: &LocalPartyRoom,
     db: &Database,
-) -> (Vec<(String, f64)>, Option<PlayableCandidatePointer>, String) {
+) -> (
+    Vec<(String, f64)>,
+    Option<PlayableCandidatePointer>,
+    String,
+    Vec<DjRecommendation>,
+) {
     let primary_mood = get_mood_preset(&room.primary_mood_id)
         .unwrap_or_else(|| get_all_mood_presets().into_iter().next().unwrap());
     let secondary_mood = room
         .secondary_mood_id
         .as_deref()
         .and_then(get_mood_preset);
+    let dj_level = DjLevel::from_i32(room.dj_level);
 
     let elapsed_mins = room
         .started_at
@@ -544,12 +564,311 @@ fn evaluate_and_find_next_playable(
         }
     }
 
-    let next_ptr = best_playable_id
-        .as_deref()
-        .and_then(|id| submissions.iter().find(|s| s.id == id))
-        .and_then(|s| build_playable_pointer(&room.room_id, s));
+    let recommendations = build_dj_recommendations(
+        &submissions,
+        &primary_mood,
+        secondary_mood.as_ref(),
+        target_energy,
+        dj_level,
+    );
 
-    (scored, next_ptr, primary_mood.transition_style)
+    let currently_playing = submissions.iter().find(|s| s.dj_status == "playing");
+    let next_sub = best_playable_id
+        .as_deref()
+        .and_then(|id| submissions.iter().find(|s| s.id == id));
+
+    let transition_style = if let Some(cand) = next_sub {
+        let conf = recommendations
+            .iter()
+            .find(|r| r.submission_id == cand.id)
+            .map(|r| r.confidence)
+            .unwrap_or(0.5);
+        choose_technique_for_pair(dj_level, currently_playing, cand, &primary_mood, conf).0
+    } else if let Some(top_rec) = recommendations.first() {
+        top_rec.suggested_technique.clone()
+    } else {
+        primary_mood.transition_style.clone()
+    };
+
+    let next_ptr = next_sub.and_then(|s| build_playable_pointer(&room.room_id, s));
+
+    (scored, next_ptr, transition_style, recommendations)
+}
+
+/// Processes a single persistent intake job through truthful stages:
+/// `metadata_processing` -> `awaiting_authorized_audio` -> `analysing` -> `cached_authorized` / `restricted_by_provider` / `failed`.
+pub async fn process_single_intake_job(state: &LocalHelperState, job: &SubmissionIntakeJob) -> bool {
+    let parsed = match stage_1_validate_and_identify(&job.raw_url) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("Invalid URL: {}", e);
+            let _ = state.db.update_submission_processing_stage(&job.submission_id, "failed", Some(&msg));
+            let _ = state.db.update_submission_intake_job_status(&job.id, "failed", Some(&msg));
+            return false;
+        }
+    };
+
+    // Stage 2: Metadata lookup (local cache -> global catalogue -> official oEmbed)
+    let _ = state.db.update_submission_processing_stage(
+        &job.submission_id,
+        "metadata_processing",
+        Some("Resolving song title, artist, and existing catalogue metadata..."),
+    );
+    state.broadcast_event(
+        &job.room_id,
+        "dj.submission_updated",
+        true,
+        None,
+        serde_json::json!({
+            "submission_id": job.submission_id,
+            "stage": "metadata_processing"
+        }),
+    );
+
+    let (mut metadata, mut metadata_source) = stage_2_lookup_existing_metadata(
+        &parsed,
+        &state.db,
+        &state.sync_manager,
+        &state.http_client,
+    )
+    .await;
+
+    // Immediately persist resolved title/artist so the UI shows real track identity before audio finishes
+    let mut current_sub = state
+        .db
+        .get_local_room_submissions(&job.room_id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.id == job.submission_id)
+        .unwrap_or_else(|| LocalRoomSubmission {
+            id: job.submission_id.clone(),
+            room_id: job.room_id.clone(),
+            submitted_by_type: "host".to_string(),
+            submitted_by_id: "host".to_string(),
+            submitted_by_name: "Host".to_string(),
+            provider: parsed.provider.as_str().to_string(),
+            source_url: parsed.canonical_url.clone(),
+            provider_video_id: parsed.video_id.clone(),
+            song_id: Some(metadata.song_id.clone()),
+            title: metadata.title.clone(),
+            artist: metadata.artist.clone(),
+            version_tag: metadata.version_tag.clone(),
+            thumbnail_url: Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", parsed.video_id)),
+            duration_ms: None,
+            bpm: metadata.original_bpm,
+            half_time_bpm: metadata.half_time_bpm,
+            double_time_bpm: metadata.double_time_bpm,
+            musical_key: metadata.musical_key.clone(),
+            camelot_key: metadata.camelot_key.clone(),
+            overall_energy: metadata.overall_energy,
+            danceability: metadata.danceability,
+            genre_tags_json: "[]".to_string(),
+            mood_tags_json: "[]".to_string(),
+            metadata_source: metadata_source.clone(),
+            acquisition_status: "awaiting_authorized_audio".to_string(),
+            acquisition_note: None,
+            dj_status: "queued_for_dj".to_string(),
+            dj_score: 0.0,
+            local_cache_path: None,
+            cache_id: None,
+            created_at: job.created_at,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+        });
+
+    current_sub.song_id = Some(metadata.song_id.clone());
+    current_sub.title = metadata.title.clone();
+    current_sub.artist = metadata.artist.clone();
+    current_sub.version_tag = metadata.version_tag.clone();
+    current_sub.bpm = metadata.original_bpm;
+    current_sub.half_time_bpm = metadata.half_time_bpm;
+    current_sub.double_time_bpm = metadata.double_time_bpm;
+    current_sub.musical_key = metadata.musical_key.clone();
+    current_sub.camelot_key = metadata.camelot_key.clone();
+    current_sub.overall_energy = metadata.overall_energy;
+    current_sub.danceability = metadata.danceability;
+    current_sub.genre_tags_json =
+        serde_json::to_string(&metadata.genre_tags).unwrap_or_else(|_| "[]".to_string());
+    current_sub.mood_tags_json =
+        serde_json::to_string(&metadata.mood_tags).unwrap_or_else(|_| "[]".to_string());
+    current_sub.metadata_source = metadata_source.clone();
+    current_sub.acquisition_status = "awaiting_authorized_audio".to_string();
+    current_sub.acquisition_note = Some("Metadata resolved; checking authorized audio source...".to_string());
+    let _ = state.db.update_submission_pipeline_result(&current_sub);
+    let _ = state
+        .db
+        .update_submission_intake_job_status(&job.id, "awaiting_authorized_audio", None);
+
+    // Stage 3: Authorised audio acquisition (explicit proof or host-configured resolver)
+    let auth_proof: Option<AuthorizedStreamProof> = job
+        .authorized_stream_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+
+    let (acq_status, acq_note, acquired_path) = if let Some(ref proof) = auth_proof {
+        download_authorized_proof(&parsed, proof, &state.downloader, &state.db).await
+    } else if let Some(ref resolver) = state.audio_resolver {
+        acquire_via_authorized_resolver(&parsed, &metadata, resolver, &state.downloader, &state.db)
+            .await
+    } else {
+        (
+            AcquisitionStatus::RestrictedByProvider,
+            "YouTube/YouTube Music URLs provide legal oEmbed metadata only; no authorized audio source is configured. Track remains in recommendations as metadata-only.".to_string(),
+            None,
+        )
+    };
+
+    // Stage 4 & 5: Temporary caching + Local Symphonia DSP analysis (only when audio is cached)
+    let mut cached_entry = None;
+    if acq_status == AcquisitionStatus::CachedAuthorized {
+        if let Some(ref audio_path) = acquired_path {
+            let _ = state.db.update_submission_processing_stage(
+                &job.submission_id,
+                "analysing",
+                Some("Audio cached; running local Symphonia BPM, key, beat-grid & energy analysis..."),
+            );
+            let _ = state
+                .db
+                .update_submission_intake_job_status(&job.id, "analysing", None);
+            state.broadcast_event(
+                &job.room_id,
+                "dj.submission_updated",
+                true,
+                None,
+                serde_json::json!({
+                    "submission_id": job.submission_id,
+                    "title": metadata.title,
+                    "stage": "analysing"
+                }),
+            );
+
+            if let Ok(entry) = stage_4_cache_temporary_audio(
+                &state.cache_manager,
+                &job.room_id,
+                Some(&job.submission_id),
+                &metadata.song_id,
+                audio_path,
+                &state.db,
+            ) {
+                cached_entry = Some(entry);
+            }
+
+            if let Ok(analysis) = stage_5_local_audio_analysis(audio_path, &metadata.song_id) {
+                metadata.duration_ms = analysis.duration_ms;
+                metadata.original_bpm = Some(analysis.original_bpm);
+                metadata.half_time_bpm = Some(analysis.half_time_bpm);
+                metadata.double_time_bpm = Some(analysis.double_time_bpm);
+                metadata.bpm_confidence = Some(analysis.bpm_confidence);
+                metadata.musical_key = Some(analysis.musical_key.clone());
+                metadata.camelot_key = Some(analysis.camelot_key.clone());
+                metadata.key_confidence = Some(analysis.key_confidence);
+                metadata.beat_grid_json = Some(analysis.beat_grid_json.clone());
+                metadata.phrase_markers_json = Some(analysis.phrase_markers_json.clone());
+                metadata.overall_energy = Some(analysis.overall_energy);
+                metadata.danceability = Some(analysis.danceability);
+                metadata.analysis_confidence =
+                    ((analysis.bpm_confidence + analysis.key_confidence) / 2.0).clamp(0.0, 1.0);
+                metadata.processing_status = "analyzed".to_string();
+                metadata_source = "local_analysis".to_string();
+
+                let _ = state.db.upsert_global_song_metadata(
+                    &metadata,
+                    Some((
+                        &parsed.canonical_url,
+                        parsed.provider.as_str(),
+                        &parsed.video_id,
+                    )),
+                );
+            }
+        }
+    }
+
+    // Finalize submission record
+    current_sub.duration_ms = if metadata.duration_ms > 0 {
+        Some(metadata.duration_ms)
+    } else {
+        None
+    };
+    current_sub.bpm = metadata.original_bpm;
+    current_sub.half_time_bpm = metadata.half_time_bpm;
+    current_sub.double_time_bpm = metadata.double_time_bpm;
+    current_sub.musical_key = metadata.musical_key.clone();
+    current_sub.camelot_key = metadata.camelot_key.clone();
+    current_sub.overall_energy = metadata.overall_energy;
+    current_sub.danceability = metadata.danceability;
+    current_sub.metadata_source = metadata_source;
+    current_sub.acquisition_status = acq_status.as_str().to_string();
+    current_sub.acquisition_note = Some(acq_note.clone());
+    current_sub.local_cache_path = cached_entry.as_ref().map(|c| c.file_path.clone());
+    current_sub.cache_id = cached_entry.as_ref().map(|c| c.id.clone());
+
+    let _ = state.db.update_submission_pipeline_result(&current_sub);
+
+    // Stage 6: Metadata-only sync (offline-safe outbox, zero audio bytes)
+    let _ = stage_6_sync_metadata_only(&parsed, &metadata, &state.sync_manager, &state.db).await;
+
+    let final_job_status = match acq_status {
+        AcquisitionStatus::CachedAuthorized => "ready",
+        AcquisitionStatus::RestrictedByProvider => "restricted_by_provider",
+        AcquisitionStatus::Failed => "failed",
+    };
+    let final_err = if acq_status == AcquisitionStatus::Failed {
+        Some(acq_note.as_str())
+    } else {
+        None
+    };
+    let _ = state
+        .db
+        .update_submission_intake_job_status(&job.id, final_job_status, final_err);
+
+    // Re-evaluate DJ recommendations and push real-time WebSocket notification
+    if let Ok(Some(room)) = state.db.get_local_party_room(&job.room_id) {
+        if room.status != "closed" {
+            let _ = evaluate_and_find_next_playable(&room, &state.db);
+        }
+    }
+
+    state.broadcast_event(
+        &job.room_id,
+        "dj.submission_ready",
+        true,
+        None,
+        serde_json::json!({
+            "submission_id": job.submission_id,
+            "title": current_sub.title,
+            "artist": current_sub.artist,
+            "acquisition_status": current_sub.acquisition_status,
+            "bpm": current_sub.bpm,
+            "camelot_key": current_sub.camelot_key
+        }),
+    );
+
+    true
+}
+
+/// Spawns the persistent background intake queue worker that survives helper restarts
+/// and drains queued song submissions without blocking HTTP request handlers.
+pub fn start_intake_queue_worker(state: Arc<LocalHelperState>) -> tokio::task::JoinHandle<()> {
+    let recovered = state.db.recover_interrupted_intake_jobs().unwrap_or(0);
+    if recovered > 0 {
+        info!("Recovered {} interrupted submission intake job(s) on startup.", recovered);
+    }
+
+    tokio::spawn(async move {
+        info!("Persistent async submission intake worker started.");
+        loop {
+            let mut processed_any = false;
+            while let Ok(Some(job)) = state.db.claim_next_submission_intake_job() {
+                processed_any = true;
+                process_single_intake_job(&state, &job).await;
+            }
+            if !processed_any {
+                tokio::select! {
+                    _ = state.intake_notify.notified() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+                }
+            }
+        }
+    })
 }
 
 // ============================================================================
@@ -723,11 +1042,16 @@ pub async fn get_host_room_dashboard(
     verify_host_token(&headers, &room)?;
 
     let lvl = DjLevel::from_i32(room.dj_level);
-    let (_, next_playable_candidate, transition_style) = evaluate_and_find_next_playable(&room, &state.db);
+    let (_, next_playable_candidate, transition_style, recommendations) =
+        evaluate_and_find_next_playable(&room, &state.db);
     let submissions = state
         .db
         .get_local_room_submissions(&room_id)
         .unwrap_or_default();
+    let pending_intake_jobs = state
+        .db
+        .get_pending_intake_job_count(&room_id)
+        .unwrap_or(0);
     let cache_stats = state
         .cache_manager
         .get_temp_cache_stats(DEFAULT_MAX_TEMP_TRACKS, &state.db)
@@ -750,12 +1074,15 @@ pub async fn get_host_room_dashboard(
     Ok(Json(HostRoomDashboardResponse {
         room,
         dj_level_name: lvl.display_name().to_string(),
+        dj_skill_profile: lvl.skill_profile(),
         exposed_decks: lvl.max_decks(),
         internal_deck_capacity: lvl.internal_deck_capacity(),
         auto_dj_enabled: lvl.supports_auto_dj(),
         lan_reachable: lan_ip.is_some(),
         detected_lan_ip: lan_ip,
         submissions,
+        recommendations,
+        pending_intake_jobs,
         next_playable_candidate,
         transition_style,
         cache_stats,
@@ -1192,7 +1519,7 @@ pub async fn record_dj_playback_event(
     }
 
     // Re-evaluate remaining playable candidates (excluding restricted & already-played tracks)
-    let (_, next_playable_candidate, transition_style) =
+    let (_, next_playable_candidate, transition_style, recommendations) =
         evaluate_and_find_next_playable(&room, &state.db);
 
     // Notify host WebSocket (and if this submission belonged to a guest, notify ONLY that guest!)
@@ -1219,6 +1546,7 @@ pub async fn record_dj_playback_event(
         dj_status: next_dj_status.to_string(),
         cache_locked,
         next_playable_candidate,
+        recommendations,
         transition_style,
     }))
 }
@@ -1359,64 +1687,83 @@ pub async fn submit_song_to_local_room(
             ("guest".to_string(), guest.id, guest.nickname)
         };
 
+    // Fast synchronous Stage 1 URL validation only (<1ms); heavy metadata/acquisition/analysis
+    // runs asynchronously in the persistent SQLite-backed intake worker so users never wait!
+    let parsed = stage_1_validate_and_identify(&req.url)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid song submission: {}", e)))?;
+
     let submission_id = format!("sub_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
-
-    let outcome = run_local_song_pipeline_with_resolver(
-        &room_id,
-        &submission_id,
-        &req.url,
-        req.authorized_stream.as_ref(),
-        state.audio_resolver.as_ref(),
-        None,
-        &state.db,
-        &state.cache_manager,
-        &state.downloader,
-        &state.sync_manager,
-        &state.http_client,
-    )
-    .await
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid song submission: {}", e)))?;
-
+    let job_id = format!("job_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
     let now = chrono::Utc::now().timestamp_millis();
-    let cache_id = outcome.cached_entry.as_ref().map(|c| c.id.clone());
+
+    // Instant local metadata hit if already known in SQLite (still enqueues intake job for audio/refresh)
+    let existing_meta = state
+        .db
+        .lookup_global_song_by_video_id(&parsed.video_id)
+        .ok()
+        .flatten();
+
+    let initial_title = existing_meta
+        .as_ref()
+        .map(|m| m.title.clone())
+        .unwrap_or_else(|| format!("Resolving YouTube track ({})", parsed.video_id));
+    let initial_artist = existing_meta
+        .as_ref()
+        .map(|m| m.artist.clone())
+        .unwrap_or_else(|| "Queued in background intake...".to_string());
+    let initial_version = existing_meta
+        .as_ref()
+        .map(|m| m.version_tag.clone())
+        .unwrap_or_else(|| "original".to_string());
+    let initial_meta_source = if existing_meta.is_some() {
+        "local_cache"
+    } else {
+        "pending"
+    };
+    let intake_note = "Accepted into persistent intake queue — resolving metadata & authorized audio in background. You can submit more links immediately.".to_string();
+
     let submission = LocalRoomSubmission {
         id: submission_id.clone(),
         room_id: room_id.clone(),
         submitted_by_type: submitted_by_type.clone(),
         submitted_by_id: submitted_by_id.clone(),
         submitted_by_name: submitted_by_name.clone(),
-        provider: outcome.parsed.provider.as_str().to_string(),
-        source_url: outcome.parsed.canonical_url.clone(),
-        provider_video_id: outcome.parsed.video_id.clone(),
-        song_id: Some(outcome.metadata.song_id.clone()),
-        title: outcome.metadata.title.clone(),
-        artist: outcome.metadata.artist.clone(),
-        version_tag: outcome.metadata.version_tag.clone(),
+        provider: parsed.provider.as_str().to_string(),
+        source_url: parsed.canonical_url.clone(),
+        provider_video_id: parsed.video_id.clone(),
+        song_id: existing_meta.as_ref().map(|m| m.song_id.clone()),
+        title: initial_title.clone(),
+        artist: initial_artist.clone(),
+        version_tag: initial_version.clone(),
         thumbnail_url: Some(format!(
             "https://i.ytimg.com/vi/{}/hqdefault.jpg",
-            outcome.parsed.video_id
+            parsed.video_id
         )),
-        duration_ms: if outcome.metadata.duration_ms > 0 {
-            Some(outcome.metadata.duration_ms)
-        } else {
-            None
-        },
-        bpm: outcome.metadata.original_bpm,
-        half_time_bpm: outcome.metadata.half_time_bpm,
-        double_time_bpm: outcome.metadata.double_time_bpm,
-        musical_key: outcome.metadata.musical_key.clone(),
-        camelot_key: outcome.metadata.camelot_key.clone(),
-        overall_energy: outcome.metadata.overall_energy,
-        danceability: outcome.metadata.danceability,
-        genre_tags_json: serde_json::to_string(&outcome.metadata.genre_tags).unwrap_or_else(|_| "[]".to_string()),
-        mood_tags_json: serde_json::to_string(&outcome.metadata.mood_tags).unwrap_or_else(|_| "[]".to_string()),
-        metadata_source: outcome.metadata_source.clone(),
-        acquisition_status: outcome.acquisition_status.as_str().to_string(),
-        acquisition_note: Some(outcome.acquisition_note.clone()),
+        duration_ms: existing_meta
+            .as_ref()
+            .and_then(|m| if m.duration_ms > 0 { Some(m.duration_ms) } else { None }),
+        bpm: existing_meta.as_ref().and_then(|m| m.original_bpm),
+        half_time_bpm: existing_meta.as_ref().and_then(|m| m.half_time_bpm),
+        double_time_bpm: existing_meta.as_ref().and_then(|m| m.double_time_bpm),
+        musical_key: existing_meta.as_ref().and_then(|m| m.musical_key.clone()),
+        camelot_key: existing_meta.as_ref().and_then(|m| m.camelot_key.clone()),
+        overall_energy: existing_meta.as_ref().and_then(|m| m.overall_energy),
+        danceability: existing_meta.as_ref().and_then(|m| m.danceability),
+        genre_tags_json: existing_meta
+            .as_ref()
+            .map(|m| serde_json::to_string(&m.genre_tags).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string()),
+        mood_tags_json: existing_meta
+            .as_ref()
+            .map(|m| serde_json::to_string(&m.mood_tags).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string()),
+        metadata_source: initial_meta_source.to_string(),
+        acquisition_status: "received".to_string(),
+        acquisition_note: Some(intake_note.clone()),
         dj_status: "queued_for_dj".to_string(),
         dj_score: 0.0,
-        local_cache_path: outcome.cached_entry.as_ref().map(|c| c.file_path.clone()),
-        cache_id: cache_id.clone(),
+        local_cache_path: None,
+        cache_id: None,
         created_at: now,
         updated_at: now,
     };
@@ -1426,16 +1773,41 @@ pub async fn submit_song_to_local_room(
         .insert_local_room_submission(&submission)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let auth_json = req
+        .authorized_stream
+        .as_ref()
+        .and_then(|p| serde_json::to_string(p).ok());
+
+    let intake_job = SubmissionIntakeJob {
+        id: job_id,
+        room_id: room_id.clone(),
+        submission_id: submission_id.clone(),
+        raw_url: parsed.canonical_url.clone(),
+        authorized_stream_json: auth_json,
+        status: "received".to_string(),
+        attempts: 0,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    state
+        .db
+        .enqueue_submission_intake_job(&intake_job)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     if submitted_by_type == "guest" {
         let _ = state.db.increment_local_guest_submission_count(&submitted_by_id);
     }
 
-    let (scored, _, _) = evaluate_and_find_next_playable(&room, &state.db);
+    let (scored, _, _, _) = evaluate_and_find_next_playable(&room, &state.db);
     let this_score = scored
         .iter()
         .find(|(sid, _)| sid == &submission_id)
         .map(|(_, sc)| *sc)
         .unwrap_or(0.0);
+
+    // Wake background intake worker immediately (zero polling delay)
+    state.intake_notify.notify_one();
 
     // Host-only WebSocket broadcast (other guests NEVER see this submission!)
     state.broadcast_event(
@@ -1446,8 +1818,8 @@ pub async fn submit_song_to_local_room(
         serde_json::json!({
             "submission_id": submission_id,
             "submitted_by_type": submitted_by_type,
-            "title": outcome.metadata.title,
-            "acquisition_status": outcome.acquisition_status.as_str(),
+            "title": initial_title,
+            "acquisition_status": "received",
             "dj_score": this_score
         }),
     );
@@ -1455,15 +1827,15 @@ pub async fn submit_song_to_local_room(
     Ok(Json(UnifiedSongSubmissionResponse {
         id: submission_id,
         submitted_by_type,
-        title: outcome.metadata.title,
-        artist: outcome.metadata.artist,
-        version_tag: outcome.metadata.version_tag,
-        provider: outcome.parsed.provider.as_str().to_string(),
+        title: initial_title,
+        artist: initial_artist,
+        version_tag: initial_version,
+        provider: parsed.provider.as_str().to_string(),
         status: "received_by_dj".to_string(),
-        metadata_source: outcome.metadata_source,
-        acquisition_status: outcome.acquisition_status.as_str().to_string(),
-        acquisition_note: outcome.acquisition_note,
-        cache_id,
+        metadata_source: initial_meta_source.to_string(),
+        acquisition_status: "received".to_string(),
+        acquisition_note: intake_note,
+        cache_id: None,
         dj_score: this_score,
         interrupted_current_track: false,
     }))
@@ -1506,7 +1878,7 @@ pub async fn evaluate_dj_candidate_pool(
 
     verify_host_token(&headers, &room)?;
 
-    let (scored, next_playable_candidate, transition_style) =
+    let (scored, next_playable_candidate, transition_style, recommendations) =
         evaluate_and_find_next_playable(&room, &state.db);
     let prepared_next_submission_id = next_playable_candidate
         .as_ref()
@@ -1528,6 +1900,7 @@ pub async fn evaluate_dj_candidate_pool(
         evaluated_count: scored.len(),
         prepared_next_submission_id,
         next_playable_candidate,
+        recommendations,
         interrupted_current_track: false,
         transition_style,
     }))

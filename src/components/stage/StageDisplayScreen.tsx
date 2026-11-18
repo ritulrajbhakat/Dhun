@@ -32,7 +32,7 @@ import {
   Power,
 } from 'lucide-react';
 
-const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({ isLive, bpm }) => {
+const StageOscilloscopeWaveform: React.FC<{ isLive: boolean }> = ({ isLive }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
@@ -42,7 +42,6 @@ const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({
     if (!ctx) return;
 
     let animId: number;
-    let waveTime = 0;
     const waveData = new Uint8Array(new ArrayBuffer(128));
 
     const draw = () => {
@@ -50,41 +49,36 @@ const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
 
-      webAudioEngine.getWaveformData(waveData);
-      waveTime += (isLive ? 0.045 : 0.012) * (bpm / 128);
+      const hasRealAudio = webAudioEngine.hasActiveAudio();
+      if (hasRealAudio) {
+        webAudioEngine.getWaveformData(waveData);
+      }
 
       ctx.save();
       ctx.beginPath();
-      ctx.lineWidth = 2.5;
-      ctx.strokeStyle = isLive ? '#2dd4bf' : 'rgba(148, 163, 184, 0.35)';
-      ctx.shadowColor = isLive ? '#14b8a6' : 'transparent';
-      ctx.shadowBlur = isLive ? 12 : 0;
+      ctx.lineWidth = hasRealAudio ? 2.5 : 1.5;
+      ctx.strokeStyle = hasRealAudio
+        ? '#2dd4bf'
+        : isLive
+        ? 'rgba(148, 163, 184, 0.45)'
+        : 'rgba(148, 163, 184, 0.25)';
+      ctx.shadowColor = hasRealAudio ? '#14b8a6' : 'transparent';
+      ctx.shadowBlur = hasRealAudio ? 12 : 0;
 
-      const sliceWidth = w / 64;
-      let x = 0;
+      if (!hasRealAudio) {
+        // Honest flat standby line when no decoded Web Audio buffer is actively playing.
+        ctx.moveTo(0, h / 2);
+        ctx.lineTo(w, h / 2);
+        ctx.stroke();
+      } else {
+        const sliceWidth = w / 64;
+        let x = 0;
 
-      for (let i = 0; i < 64; i++) {
-        const envelope = Math.sin((i / 63) * Math.PI);
-        const audioOffset = (waveData[i * 2] - 128) / 128.0;
-        const amp = isLive ? 12 * envelope : 2 * envelope;
-        const y = h / 2 + audioOffset * 26 + Math.sin(waveTime * 2.5 + i * 0.22) * amp;
-
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-        x += sliceWidth;
-      }
-
-      ctx.stroke();
-
-      if (isLive) {
-        ctx.beginPath();
-        ctx.lineWidth = 1.0;
-        ctx.strokeStyle = 'rgba(45, 212, 191, 0.4)';
-        ctx.shadowBlur = 6;
-        x = 0;
         for (let i = 0; i < 64; i++) {
           const envelope = Math.sin((i / 63) * Math.PI);
-          const y = h / 2 - Math.sin(waveTime * 2.5 + i * 0.22) * (7 * envelope);
+          const audioOffset = (waveData[i * 2] - 128) / 128.0;
+          const y = h / 2 + audioOffset * (h * 0.42) * (0.35 + 0.65 * envelope);
+
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
           x += sliceWidth;
@@ -98,7 +92,7 @@ const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({
 
     draw();
     return () => cancelAnimationFrame(animId);
-  }, [isLive, bpm]);
+  }, [isLive]);
 
   return (
     <canvas
@@ -121,11 +115,15 @@ export const StageDisplayScreen: React.FC = () => {
     detectedLanIp,
     lanNotice,
     activeRoom,
+    djSkillProfile,
     exposedDecks,
     internalDeckCapacity,
     guestUrl,
     qrSvg,
     submissions,
+    recommendations,
+    pendingIntakeJobs,
+    techniqueLog,
     deckSnapshots,
     autoDjPlaybackState,
     autoDjStatusNote,
@@ -152,7 +150,7 @@ export const StageDisplayScreen: React.FC = () => {
 
   const [currentFxIndex, setCurrentFxIndex] = useState(0);
   const [autoCycleFx, setAutoCycleFx] = useState(true);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(() => Boolean(document.fullscreenElement));
   const [showHostDrawer, setShowHostDrawer] = useState(false);
   const [activeDrawerTab, setActiveDrawerTab] = useState<'party' | 'submit' | 'dj' | 'fx'>('party');
 
@@ -163,6 +161,7 @@ export const StageDisplayScreen: React.FC = () => {
 
   // Action feedback states
   const [isBusy, setIsBusy] = useState(false);
+  const [isSubmittingLink, setIsSubmittingLink] = useState(false);
   const [launchingHelper, setLaunchingHelper] = useState(false);
   const [launchNotice, setLaunchNotice] = useState<string | null>(null);
   const [roomFeedback, setRoomFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -218,11 +217,12 @@ export const StageDisplayScreen: React.FC = () => {
     : 124;
   const stageEnergy = activeMoodProfile ? activeMoodProfile.target_energy : 0.75;
 
-  const activeOrPreparedSubmission =
-    submissions.find((s) => s.dj_status === 'playing') ||
-    submissions.find((s) => s.dj_status === 'prepared') ||
-    submissions[0] ||
-    null;
+  const currentlyPlayingSubmission =
+    submissions.find((s) => s.dj_status === 'playing') || null;
+  const preparedSubmission =
+    submissions.find((s) => s.dj_status === 'prepared') || null;
+  const topRecommendation = recommendations[0] || null;
+  const latestTechnique = techniqueLog[0] || null;
 
   const activeWebAudioDeck = deckSnapshots.find((d) => d.isPlaying) || null;
   const preloadedWebAudioDeck =
@@ -237,22 +237,36 @@ export const StageDisplayScreen: React.FC = () => {
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen();
-      setIsFullscreen(true);
+      document.documentElement.requestFullscreen?.().catch(() => {});
     } else {
-      document.exitFullscreen();
-      setIsFullscreen(false);
+      document.exitFullscreen?.().catch(() => {});
     }
   };
+
+  // Keep fullscreen indicator synchronized with actual browser fullscreen state (e.g., Esc exit)
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
 
   // Keyboard shortcuts: 'M' for Host Console, 'F' for Fullscreen, 'Escape' to close
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (['INPUT', 'SELECT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      const isEditableTarget =
+        Boolean(target) &&
+        (['INPUT', 'SELECT', 'TEXTAREA'].includes(target!.tagName) || target!.isContentEditable);
+
+      if (e.key === 'Escape') {
+        setShowHostDrawer(false);
         return;
       }
+      if (isEditableTarget) return;
       if (e.key === 'm' || e.key === 'M') setShowHostDrawer((prev) => !prev);
-      if (e.key === 'Escape') setShowHostDrawer(false);
       if (e.key === 'f' || e.key === 'F') toggleFullscreen();
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -338,23 +352,24 @@ export const StageDisplayScreen: React.FC = () => {
 
   const handleSubmitSong = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!youtubeUrlInput.trim()) return;
-    setIsBusy(true);
+    const rawUrl = youtubeUrlInput.trim();
+    if (!rawUrl) return;
+    setIsSubmittingLink(true);
     setSubmitFeedback(null);
     try {
-      const res = await submitSong(youtubeUrlInput.trim());
+      const res = await submitSong(rawUrl);
+      setYoutubeUrlInput('');
       setSubmitFeedback({
         type: 'ok',
-        text: `Submitted "${res.title}" to automated DJ pool (score: ${res.dj_score.toFixed(1)}, acquisition: ${res.acquisition_status}). Current track was not interrupted.`,
+        text: `Accepted "${res.title}" into persistent intake queue (${res.acquisition_status}). Metadata, authorized audio check, and analysis are running in the background — you can submit another link right away.`,
       });
-      setYoutubeUrlInput('');
     } catch (err: any) {
       setSubmitFeedback({
         type: 'err',
         text: err?.message || 'Song submission rejected. Paste a valid YouTube or YouTube Music URL.',
       });
     } finally {
-      setIsBusy(false);
+      setIsSubmittingLink(false);
     }
   };
 
@@ -426,7 +441,7 @@ export const StageDisplayScreen: React.FC = () => {
               : 'DHUN — LOCAL AUTOMATIC PARTY DJ'}
           </p>
 
-          <StageOscilloscopeWaveform isLive={isPartyLive} bpm={stageBpm} />
+          <StageOscilloscopeWaveform isLive={isPartyLive} />
         </div>
       </div>
 
@@ -557,7 +572,8 @@ export const StageDisplayScreen: React.FC = () => {
             </span>
           </span>
           <span className="text-[10px] font-mono text-teal-300 bg-teal-500/10 border border-teal-500/30 px-2 py-0.5 rounded-full">
-            {exposedDecks}/{internalDeckCapacity} Decks • {activeMoodProfile.transition_style}
+            L{selectedDjLevel} • {exposedDecks}/{internalDeckCapacity} Decks
+            {latestTechnique ? ` • ${latestTechnique.techniqueLabel}` : ''}
           </span>
         </div>
 
@@ -602,40 +618,98 @@ export const StageDisplayScreen: React.FC = () => {
               </div>
             </div>
           </>
-        ) : activeOrPreparedSubmission ? (
+        ) : currentlyPlayingSubmission ? (
           <>
             <div className="flex items-center space-x-3 mb-2.5">
-              {activeOrPreparedSubmission.thumbnail_url ? (
+              {currentlyPlayingSubmission.thumbnail_url ? (
                 <img
-                  src={activeOrPreparedSubmission.thumbnail_url}
-                  alt={activeOrPreparedSubmission.title}
+                  src={currentlyPlayingSubmission.thumbnail_url}
+                  alt={currentlyPlayingSubmission.title}
                   className="w-11 h-11 rounded-xl object-cover shadow-lg border border-white/10"
                 />
               ) : (
-                <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-red-600 via-orange-600 to-amber-500 flex items-center justify-center shadow-lg">
+                <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-emerald-600 via-teal-600 to-sky-500 flex items-center justify-center shadow-lg">
                   <Disc3 className="w-6 h-6 text-white" />
                 </div>
               )}
               <div className="flex-1 min-w-0">
                 <h4 className="text-sm font-extrabold text-white truncate drop-shadow">
-                  {activeOrPreparedSubmission.title}
+                  {currentlyPlayingSubmission.title}
                 </h4>
                 <p className="text-xs text-slate-300 truncate">
-                  {activeOrPreparedSubmission.artist}
-                  {activeOrPreparedSubmission.bpm ? ` • ${Math.round(activeOrPreparedSubmission.bpm)} BPM` : ''}
-                  {activeOrPreparedSubmission.camelot_key ? ` • ${activeOrPreparedSubmission.camelot_key}` : ''}
+                  {currentlyPlayingSubmission.artist}
+                  {currentlyPlayingSubmission.bpm ? ` • ${Math.round(currentlyPlayingSubmission.bpm)} BPM` : ''}
+                  {currentlyPlayingSubmission.camelot_key ? ` • ${currentlyPlayingSubmission.camelot_key}` : ''}
                 </p>
               </div>
             </div>
-
+          </>
+        ) : preparedSubmission ? (
+          <>
+            <div className="flex items-center space-x-3 mb-2">
+              {preparedSubmission.thumbnail_url ? (
+                <img
+                  src={preparedSubmission.thumbnail_url}
+                  alt={preparedSubmission.title}
+                  className="w-11 h-11 rounded-xl object-cover shadow-lg border border-white/10"
+                />
+              ) : (
+                <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-amber-600 via-orange-600 to-rose-500 flex items-center justify-center shadow-lg">
+                  <Disc3 className="w-6 h-6 text-white" />
+                </div>
+              )}
+              <div className="flex-1 min-w-0">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-amber-300">
+                  Prepared Next • Not Playing Yet
+                </p>
+                <h4 className="text-sm font-extrabold text-white truncate drop-shadow">
+                  {preparedSubmission.title}
+                </h4>
+                <p className="text-xs text-slate-300 truncate">
+                  {preparedSubmission.artist}
+                  {preparedSubmission.bpm ? ` • ${Math.round(preparedSubmission.bpm)} BPM` : ''}
+                  {preparedSubmission.camelot_key ? ` • ${preparedSubmission.camelot_key}` : ''}
+                </p>
+              </div>
+            </div>
             <div className="bg-amber-500/10 border border-amber-400/25 rounded-xl px-2.5 py-1.5 mb-2.5">
               <p className="text-[10px] text-amber-200 leading-tight">
-                {autoDjPlaybackState === 'awaiting_playable_audio' && autoDjStatusNote
-                  ? autoDjStatusNote
-                  : `Pool: ${submissions.length} • Score ${activeOrPreparedSubmission.dj_score.toFixed(1)} • ${activeOrPreparedSubmission.acquisition_status}`}
+                {autoDjStatusNote ||
+                  `Score ${preparedSubmission.dj_score.toFixed(1)} • ${preparedSubmission.acquisition_status}`}
               </p>
             </div>
           </>
+        ) : submissions.length > 0 ? (
+          <div className="space-y-2 mb-2.5">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center shrink-0">
+                <Music className="w-5 h-5 text-amber-300" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h4 className="text-xs font-extrabold text-white truncate">
+                  No Track Playing • {submissions.length} in Pool
+                </h4>
+                <p className="text-[11px] text-slate-300 truncate">
+                  {pendingIntakeJobs > 0
+                    ? `Processing ${pendingIntakeJobs} link(s) in background…`
+                    : topRecommendation
+                    ? `Suggested: ${topRecommendation.title} (${topRecommendation.technique_label})`
+                    : 'Awaiting authorized playable audio'}
+                </p>
+              </div>
+            </div>
+            <div className="bg-amber-500/10 border border-amber-400/25 rounded-xl px-2.5 py-1.5">
+              <p className="text-[10px] text-amber-200 leading-tight">
+                {autoDjPlaybackState === 'awaiting_playable_audio' && autoDjStatusNote
+                  ? autoDjStatusNote
+                  : topRecommendation
+                  ? `${topRecommendation.category_label} • Score ${topRecommendation.compatibility_score.toFixed(1)} • ${
+                      topRecommendation.is_playable ? 'Playable now' : topRecommendation.playability_label.replace(/_/g, ' ')
+                    }`
+                  : 'Open Auto DJ & Cache (Press M) for live DJ recommendations.'}
+              </p>
+            </div>
+          </div>
         ) : (
           <div className="py-3 text-center space-y-1.5 mb-2">
             <div className="w-10 h-10 mx-auto rounded-xl bg-white/5 border border-white/10 flex items-center justify-center">
@@ -1013,19 +1087,27 @@ export const StageDisplayScreen: React.FC = () => {
                 </div>
               )}
 
-              {/* TAB 2: UNIFIED HOST & GUEST SONG SUBMISSION (NO APPROVAL QUEUE) */}
+              {/* TAB 2: UNIFIED HOST & GUEST SONG SUBMISSION (ASYNC INTAKE QUEUE, NO APPROVAL QUEUE) */}
               {activeDrawerTab === 'submit' && (
                 <div className="space-y-4">
                   <form
                     onSubmit={handleSubmitSong}
                     className="bg-zinc-900/90 p-4 rounded-xl border border-white/10 space-y-2.5"
                   >
-                    <h4 className="text-xs font-bold text-amber-300 uppercase flex items-center gap-1.5">
-                      <Link2 className="w-3.5 h-3.5" />
-                      <span>Submit Song to Automated DJ (YouTube / YT Music Only)</span>
-                    </h4>
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="text-xs font-bold text-amber-300 uppercase flex items-center gap-1.5">
+                        <Link2 className="w-3.5 h-3.5" />
+                        <span>Submit Song (Instant Async Intake)</span>
+                      </h4>
+                      {pendingIntakeJobs > 0 && (
+                        <span className="px-2 py-0.5 rounded-full bg-sky-500/20 border border-sky-400/40 text-sky-300 text-[10px] font-mono font-bold flex items-center gap-1">
+                          <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                          <span>{pendingIntakeJobs} processing</span>
+                        </span>
+                      )}
+                    </div>
                     <p className="text-[11px] text-slate-400">
-                      Host and guests use the exact same submission flow. There is no manual approval queue — the automated DJ scores mood, BPM, key, and energy to mix songs seamlessly without interrupting playback.
+                      Links enter the persistent background intake queue immediately so you can submit multiple tracks back-to-back without waiting. Metadata, authorized audio checks, and Symphonia analysis run asynchronously.
                     </p>
                     <div className="flex gap-2">
                       <input
@@ -1033,15 +1115,15 @@ export const StageDisplayScreen: React.FC = () => {
                         value={youtubeUrlInput}
                         onChange={(e) => setYoutubeUrlInput(e.target.value)}
                         placeholder="https://www.youtube.com/watch?v=..."
-                        disabled={!activeRoom || activeRoom.status === 'closed' || isBusy}
+                        disabled={!activeRoom || activeRoom.status === 'closed'}
                         className="flex-1 bg-black/60 border border-white/15 px-3 py-1.5 text-xs rounded-lg text-white font-mono outline-none focus:border-amber-400 disabled:opacity-40"
                       />
                       <button
                         type="submit"
-                        disabled={!activeRoom || activeRoom.status === 'closed' || isBusy || !youtubeUrlInput.trim()}
-                        className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-extrabold text-xs rounded-lg"
+                        disabled={!activeRoom || activeRoom.status === 'closed' || isSubmittingLink || !youtubeUrlInput.trim()}
+                        className="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-black font-extrabold text-xs rounded-lg shrink-0"
                       >
-                        {isBusy ? 'Processing...' : 'Submit'}
+                        {isSubmittingLink ? 'Queueing...' : 'Queue Link'}
                       </button>
                     </div>
 
@@ -1074,7 +1156,7 @@ export const StageDisplayScreen: React.FC = () => {
                         disabled={!activeRoom || activeRoom.status === 'closed'}
                         className="text-[11px] font-bold text-teal-300 hover:text-teal-200 disabled:opacity-40"
                       >
-                        Re-score for Mood
+                        Re-score &amp; Refresh Suggestions
                       </button>
                     </div>
 
@@ -1084,68 +1166,273 @@ export const StageDisplayScreen: React.FC = () => {
                       </div>
                     ) : (
                       <div className="space-y-2">
-                        {submissions.map((sub) => (
-                          <div
-                            key={sub.id}
-                            className="flex items-center justify-between gap-3 p-2.5 bg-zinc-900/70 rounded-xl border border-white/10"
-                          >
-                            <div className="flex items-center gap-3 min-w-0">
-                              {sub.thumbnail_url ? (
-                                <img
-                                  src={sub.thumbnail_url}
-                                  alt={sub.title}
-                                  className="w-11 h-8 rounded-md object-cover bg-black shrink-0"
-                                />
-                              ) : (
-                                <div className="w-11 h-8 rounded-md bg-zinc-800 flex items-center justify-center shrink-0">
-                                  <Music className="w-4 h-4 text-slate-500" />
+                        {submissions.map((sub) => {
+                          const acqBadgeClass = (() => {
+                            switch (sub.acquisition_status) {
+                              case 'cached_authorized':
+                                return 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300';
+                              case 'received':
+                              case 'metadata_processing':
+                              case 'awaiting_authorized_audio':
+                              case 'analysing':
+                              case 'pending':
+                                return 'bg-sky-500/20 border-sky-500/40 text-sky-300';
+                              case 'failed':
+                                return 'bg-rose-500/20 border-rose-500/40 text-rose-300';
+                              default:
+                                return 'bg-amber-500/15 border-amber-500/30 text-amber-300';
+                            }
+                          })();
+                          const acqLabel =
+                            sub.acquisition_status === 'cached_authorized'
+                              ? 'ready'
+                              : sub.acquisition_status === 'restricted_by_provider'
+                              ? 'metadata_only'
+                              : sub.acquisition_status;
+
+                          return (
+                            <div
+                              key={sub.id}
+                              className="flex items-center justify-between gap-3 p-2.5 bg-zinc-900/70 rounded-xl border border-white/10"
+                            >
+                              <div className="flex items-center gap-3 min-w-0">
+                                {sub.thumbnail_url ? (
+                                  <img
+                                    src={sub.thumbnail_url}
+                                    alt={sub.title}
+                                    className="w-11 h-8 rounded-md object-cover bg-black shrink-0"
+                                  />
+                                ) : (
+                                  <div className="w-11 h-8 rounded-md bg-zinc-800 flex items-center justify-center shrink-0">
+                                    <Music className="w-4 h-4 text-slate-500" />
+                                  </div>
+                                )}
+                                <div className="min-w-0">
+                                  <p className="text-xs font-bold text-white truncate">
+                                    {sub.title}{' '}
+                                    {sub.version_tag !== 'original' && (
+                                      <span className="text-[9px] uppercase text-amber-300">[{sub.version_tag}]</span>
+                                    )}
+                                  </p>
+                                  <p className="text-[11px] text-slate-400 truncate">
+                                    {sub.artist} &bull; via {sub.submitted_by_type === 'host' ? 'Host' : sub.submitted_by_name} &bull; Score{' '}
+                                    <span className="font-mono text-teal-300">{sub.dj_score.toFixed(1)}</span>
+                                    {sub.bpm ? ` • ${Math.round(sub.bpm)} BPM` : ''}
+                                    {sub.camelot_key ? ` • ${sub.camelot_key}` : ''}
+                                  </p>
                                 </div>
-                              )}
-                              <div className="min-w-0">
-                                <p className="text-xs font-bold text-white truncate">
-                                  {sub.title}{' '}
-                                  {sub.version_tag !== 'original' && (
-                                    <span className="text-[9px] uppercase text-amber-300">[{sub.version_tag}]</span>
-                                  )}
-                                </p>
-                                <p className="text-[11px] text-slate-400 truncate">
-                                  {sub.artist} &bull; via {sub.submitted_by_type === 'host' ? 'Host' : sub.submitted_by_name} &bull; Score{' '}
-                                  <span className="font-mono text-teal-300">{sub.dj_score.toFixed(1)}</span>
-                                </p>
+                              </div>
+
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="px-1.5 py-0.5 rounded bg-teal-500/15 border border-teal-500/30 text-[9px] font-mono font-bold text-teal-300">
+                                  {sub.dj_status}
+                                </span>
+                                <span
+                                  className={`px-1.5 py-0.5 rounded border text-[9px] font-mono font-bold ${acqBadgeClass}`}
+                                  title={sub.acquisition_note || 'Pipeline intake status'}
+                                >
+                                  {acqLabel}
+                                </span>
+                                <a
+                                  href={sub.source_url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="p-1 text-slate-400 hover:text-white"
+                                  title="Open Official Source"
+                                >
+                                  <ExternalLink className="w-3.5 h-3.5" />
+                                </a>
                               </div>
                             </div>
-
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              <span className="px-1.5 py-0.5 rounded bg-teal-500/15 border border-teal-500/30 text-[9px] font-mono font-bold text-teal-300">
-                                {sub.dj_status}
-                              </span>
-                              <span
-                                className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[9px] font-mono font-bold text-amber-300"
-                                title={sub.acquisition_note || 'Compliance status'}
-                              >
-                                {sub.acquisition_status}
-                              </span>
-                              <a
-                                href={sub.source_url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="p-1 text-slate-400 hover:text-white"
-                                title="Open Official Source"
-                              >
-                                <ExternalLink className="w-3.5 h-3.5" />
-                              </a>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>
                 </div>
               )}
 
-              {/* TAB 3: AUTOMATED 4-DECK DJ, TEMP CACHE (10-15 TRACKS), & OFFLINE SYNC OUTBOX */}
+              {/* TAB 3: AUTOMATED 4-DECK DJ, SKILL PROFILE, EXPLAINABLE SUGGESTIONS & REAL TECHNIQUE LOG */}
               {activeDrawerTab === 'dj' && (
                 <div className="space-y-4">
+                  {/* Active DJ Level Skill Profile (Real Inherited Capabilities L1 -> L4) */}
+                  {djSkillProfile && (
+                    <div className="bg-zinc-900/90 p-3.5 rounded-xl border border-amber-400/25 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <h4 className="text-xs font-bold text-amber-300 uppercase">
+                          Level {djSkillProfile.level}: {djSkillProfile.name}
+                        </h4>
+                        <span className="text-[10px] font-mono text-teal-300 bg-teal-500/10 border border-teal-500/30 px-2 py-0.5 rounded-full">
+                          {djSkillProfile.exposed_decks} Decks &bull; &plusmn;{djSkillProfile.max_tempo_stretch_pct}% Pitch
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-300 leading-snug">{djSkillProfile.summary}</p>
+                      <div className="flex flex-wrap gap-1 pt-0.5">
+                        {djSkillProfile.unlocked_techniques.map((tech) => (
+                          <span
+                            key={tech}
+                            className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-[9px] font-mono text-slate-300"
+                          >
+                            {tech.replace(/_/g, ' ')}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Explainable DJ Recommendations (Works even with incomplete metadata; honest playability) */}
+                  <div className="bg-zinc-900/90 p-3.5 rounded-xl border border-white/10 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-bold text-teal-300 uppercase">
+                        DJ Suggestions ({recommendations.length})
+                      </h4>
+                      <button
+                        onClick={() => evaluateDjPool()}
+                        disabled={!activeRoom || activeRoom.status === 'closed'}
+                        className="text-[10px] font-bold text-amber-300 hover:text-amber-200 disabled:opacity-40"
+                      >
+                        Re-evaluate
+                      </button>
+                    </div>
+
+                    {recommendations.length === 0 ? (
+                      <p className="text-[11px] text-slate-400">
+                        Submit songs to receive ranked DJ suggestions explaining compatibility, missing metadata, and recommended transition techniques.
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        {recommendations.map((rec) => {
+                          const playabilityBadge = (() => {
+                            if (rec.is_playable || rec.playability_label === 'playable_now') {
+                              return {
+                                cls: 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300',
+                                label: 'Playable Now',
+                              };
+                            }
+                            if (rec.playability_label === 'processing') {
+                              return {
+                                cls: 'bg-sky-500/20 border-sky-500/40 text-sky-300',
+                                label: 'Processing',
+                              };
+                            }
+                            if (rec.playability_label === 'failed') {
+                              return {
+                                cls: 'bg-rose-500/20 border-rose-500/40 text-rose-300',
+                                label: 'Audio Failed',
+                              };
+                            }
+                            return {
+                              cls: 'bg-amber-500/15 border-amber-500/35 text-amber-300',
+                              label: 'Metadata Only • Not Playable',
+                            };
+                          })();
+
+                          return (
+                            <div
+                              key={`${rec.category}-${rec.submission_id}`}
+                              className="p-2.5 rounded-lg bg-black/50 border border-white/10 space-y-1.5"
+                            >
+                              <div className="flex items-center justify-between gap-2 flex-wrap">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="px-1.5 py-0.5 rounded bg-teal-500/20 border border-teal-400/35 text-[9px] font-bold uppercase text-teal-200">
+                                    {rec.category_label}
+                                  </span>
+                                  <span className={`px-1.5 py-0.5 rounded border text-[9px] font-bold ${playabilityBadge.cls}`}>
+                                    {playabilityBadge.label}
+                                  </span>
+                                </div>
+                                <span className="text-[10px] font-mono text-slate-300">
+                                  Score <strong className="text-white">{rec.compatibility_score.toFixed(1)}</strong> &bull; Conf{' '}
+                                  {Math.round(rec.confidence * 100)}%
+                                </span>
+                              </div>
+
+                              <div>
+                                <p className="text-xs font-bold text-white truncate">{rec.title}</p>
+                                <p className="text-[10px] text-slate-400 truncate">{rec.artist}</p>
+                              </div>
+
+                              <div className="text-[10px] text-slate-300 space-y-0.5">
+                                {rec.reasons.slice(0, 3).map((reason, idx) => (
+                                  <p key={idx} className="leading-snug">
+                                    &bull; {reason}
+                                  </p>
+                                ))}
+                              </div>
+
+                              <div className="text-[10px] bg-white/5 border border-white/10 rounded-md px-2 py-1 text-slate-200">
+                                <span className="font-bold text-amber-300">Mix: {rec.technique_label}</span> — {rec.technique_reason}
+                              </div>
+
+                              <div className="flex flex-wrap gap-1 text-[9px] font-mono">
+                                {rec.known_signals.map((sig) => (
+                                  <span
+                                    key={`k-${sig}`}
+                                    className="px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/25"
+                                  >
+                                    ✓ {sig}
+                                  </span>
+                                ))}
+                                {rec.missing_signals.map((sig) => (
+                                  <span
+                                    key={`m-${sig}`}
+                                    className="px-1.5 py-0.5 rounded bg-zinc-800 text-slate-400 border border-white/10"
+                                  >
+                                    ? {sig}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Real DJ Technique Execution Log (Honest report of actual WebAudio transitions) */}
+                  <div className="bg-zinc-900/90 p-3.5 rounded-xl border border-white/10 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <h4 className="text-xs font-bold text-sky-300 uppercase">
+                        Executed Mix Technique Log ({techniqueLog.length})
+                      </h4>
+                      <span className="text-[9px] font-mono text-slate-400">Real DSP Telemetry</span>
+                    </div>
+                    {techniqueLog.length === 0 ? (
+                      <p className="text-[11px] text-slate-400">
+                        No automated transitions executed yet — techniques are logged here only when Web Audio genuinely performs a mix.
+                      </p>
+                    ) : (
+                      <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                        {techniqueLog.slice(0, 8).map((entry) => (
+                          <div
+                            key={entry.id}
+                            className="p-2 rounded-lg bg-black/50 border border-white/10 text-[10px] space-y-0.5"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-bold text-amber-300">
+                                L{entry.djLevel} • {entry.techniqueLabel}
+                              </span>
+                              <span className="font-mono text-slate-400">
+                                {entry.durationSec.toFixed(1)}s &bull; &times;{entry.tempoMatchRatio.toFixed(2)} &bull;{' '}
+                                {entry.gainMatchDb >= 0 ? `+${entry.gainMatchDb.toFixed(1)}` : entry.gainMatchDb.toFixed(1)} dB
+                              </span>
+                            </div>
+                            <p className="text-slate-200 truncate">
+                              Deck {String.fromCharCode(65 + entry.fromDeckId)} ({entry.outgoingTitle}) &rarr; Deck{' '}
+                              {String.fromCharCode(65 + entry.toDeckId)} ({entry.incomingTitle})
+                            </p>
+                            <p className="text-slate-400">
+                              {entry.fallbackUsed && (
+                                <span className="text-amber-300 font-bold mr-1">[Safe Fallback]</span>
+                              )}
+                              {entry.reason}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
                   {/* Local Temp Cache & Metadata-Only Sync Telemetry */}
                   <div className="grid grid-cols-2 gap-3">
                     <div className="bg-zinc-900/90 p-3.5 rounded-xl border border-white/10 space-y-1">
