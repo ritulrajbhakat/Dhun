@@ -28,6 +28,8 @@ import {
   HardDrive,
   Wifi,
   CloudUpload,
+  Download,
+  Power,
 } from 'lucide-react';
 
 const StageOscilloscopeWaveform: React.FC<{ isLive: boolean; bpm: number }> = ({ isLive, bpm }) => {
@@ -161,9 +163,40 @@ export const StageDisplayScreen: React.FC = () => {
 
   // Action feedback states
   const [isBusy, setIsBusy] = useState(false);
+  const [launchingHelper, setLaunchingHelper] = useState(false);
+  const [launchNotice, setLaunchNotice] = useState<string | null>(null);
   const [roomFeedback, setRoomFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [submitFeedback, setSubmitFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [copiedUrl, setCopiedUrl] = useState(false);
+
+  const helperInstallerUrl =
+    ((import.meta as any).env?.VITE_HELPER_DOWNLOAD_URL as string | undefined) ||
+    'https://github.com/ritulrajbhakat/Dhun/actions';
+
+  const handleLaunchHelperProtocol = () => {
+    setLaunchingHelper(true);
+    setLaunchNotice('Opening DHUN Local Helper via dhun://start… Confirm the browser prompt if shown.');
+    // Trigger registered OS protocol handler (like Zoom/Spotify/Figma desktop launchers)
+    window.location.href = 'dhun://start';
+
+    let attempts = 0;
+    const poll = window.setInterval(async () => {
+      attempts += 1;
+      await checkHelperHealth();
+      const connectedNow = useDhunStore.getState().helperConnected;
+      if (connectedNow) {
+        window.clearInterval(poll);
+        setLaunchingHelper(false);
+        setLaunchNotice(null);
+      } else if (attempts >= 12) {
+        window.clearInterval(poll);
+        setLaunchingHelper(false);
+        setLaunchNotice(
+          'Helper did not respond yet. If this is your first time on this laptop, download and run the one-click DHUN Local Helper Installer below.'
+        );
+      }
+    }, 1250);
+  };
 
   useEffect(() => {
     setHelperUrlDraft(helperUrl);
@@ -695,15 +728,27 @@ export const StageDisplayScreen: React.FC = () => {
               {lanNotice ||
                 'Connect to your Local DHUN Helper and create a private LAN party room to generate a real Wi-Fi QR code.'}
             </p>
-            <button
-              onClick={() => {
-                setActiveDrawerTab('party');
-                setShowHostDrawer(true);
-              }}
-              className="mt-1 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-300 text-[11px] font-bold transition-colors"
-            >
-              Open Local Setup
-            </button>
+            <div className="flex flex-wrap items-center justify-center gap-1.5 mt-1">
+              {!helperConnected && (
+                <button
+                  onClick={handleLaunchHelperProtocol}
+                  disabled={launchingHelper}
+                  className="px-2.5 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/40 text-emerald-300 text-[11px] font-bold transition-colors flex items-center gap-1"
+                >
+                  <Power className={`w-3 h-3 ${launchingHelper ? 'animate-spin' : ''}`} />
+                  <span>{launchingHelper ? 'Launching…' : 'Launch Helper'}</span>
+                </button>
+              )}
+              <button
+                onClick={() => {
+                  setActiveDrawerTab('party');
+                  setShowHostDrawer(true);
+                }}
+                className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-300 text-[11px] font-bold transition-colors"
+              >
+                Open Local Setup
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -821,12 +866,45 @@ export const StageDisplayScreen: React.FC = () => {
                     </p>
 
                     {!helperConnected && (
-                      <p className="text-[11px] text-rose-400 flex items-center gap-1.5">
-                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                        <span>
-                          {helperError || 'Local helper unreachable.'} Launch <code className="text-rose-200">dhun-local-helper</code> on this computer.
-                        </span>
-                      </p>
+                      <div className="space-y-2.5 pt-1">
+                        <p className="text-[11px] text-rose-400 flex items-center gap-1.5">
+                          <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                          <span>
+                            {helperError || 'Local helper is not running yet.'}
+                          </span>
+                        </p>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            onClick={handleLaunchHelperProtocol}
+                            disabled={launchingHelper}
+                            className="py-2 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-black text-xs flex items-center justify-center gap-1.5 transition-colors disabled:opacity-60"
+                          >
+                            <Power className={`w-3.5 h-3.5 ${launchingHelper ? 'animate-spin' : ''}`} />
+                            <span>{launchingHelper ? 'Starting Helper…' : 'Launch Installed Helper'}</span>
+                          </button>
+                          <a
+                            href={helperInstallerUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="py-2 px-3 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 font-bold text-xs flex items-center justify-center gap-1.5 transition-colors"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>Download Windows Installer</span>
+                          </a>
+                        </div>
+
+                        {launchNotice && (
+                          <p className="text-[11px] text-sky-300 bg-sky-500/10 border border-sky-400/30 rounded-lg px-2.5 py-1.5">
+                            {launchNotice}
+                          </p>
+                        )}
+
+                        <p className="text-[10px] text-slate-400 leading-snug">
+                          First time on this host laptop? Run the one-click <code className="text-slate-200">DHUN-Local-Helper-Setup.exe</code> installer once to install the helper, register <code className="text-slate-200">dhun://start</code>, and allow Private Wi-Fi QR access on port 47821.
+                        </p>
+                      </div>
                     )}
                   </div>
 

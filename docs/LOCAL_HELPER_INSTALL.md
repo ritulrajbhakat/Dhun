@@ -26,23 +26,28 @@ Optional environment variable overrides:
 
 ## 2. Windows x86_64 Installation & Startup (Verified Build Target)
 
+### Option A — One-Click Windows Installer (Recommended)
+1. Download **`DHUN-Local-Helper-Setup.exe`** from the **`DHUN-Local-Helper-Setup-Windows-x86_64`** GitHub Actions artifact (or build locally with Inno Setup 6: `iscc packaging/windows/dhun-helper-setup.iss`).
+2. Run **`DHUN-Local-Helper-Setup.exe`**. In one guided step it:
+   - Installs `dhun-local-helper.exe` into `%LOCALAPPDATA%\DHUN\bin`.
+   - Registers the **`dhun://`** custom protocol handler (`HKCU\Software\Classes\dhun`) so clicking **"Launch Installed Helper"** in the DHUN website starts the helper automatically with one browser confirmation (just like Zoom or Spotify).
+   - Optionally configures the Private-Wi-Fi-only Windows Firewall rule for TCP port `47821` (and removes it automatically on uninstall).
+   - Optionally enables start-on-Windows-sign-in and starts the helper right away.
+
+### Option B — Manual PowerShell Install (Developer / From Source)
 1. Download the `dhun-local-helper-windows-x86_64` artifact from GitHub Actions (or build locally with `cargo build --release --manifest-path src-tauri/Cargo.toml --bin dhun-local-helper`).
-2. Run the installation script:
+2. Run the installation script (also registers the `dhun://start` protocol handler for your user):
    ```powershell
-   .\packaging\windows\install-dhun-helper.ps1 -BinaryPath .\target\release\dhun-local-helper.exe
+   powershell -ExecutionPolicy Bypass -File .\packaging\windows\install-dhun-helper.ps1 -BinaryPath .\target\release\dhun-local-helper.exe
    ```
-3. Allow local Wi-Fi guest smartphones through Windows Firewall on **Private** networks only (Administrator PowerShell):
-   ```powershell
-   New-NetFirewallRule -DisplayName "DHUN Local Helper (Private LAN)" `
-     -Direction Inbound -Protocol TCP -LocalPort 47821 -Profile Private -Action Allow
+3. Allow local Wi-Fi guest smartphones through Windows Firewall on **Private** networks only (Administrator Command Prompt or PowerShell):
+   ```cmd
+   netsh advfirewall firewall add rule name="DHUN Local Helper (Private LAN)" dir=in action=allow protocol=TCP localport=47821 profile=private
    ```
-4. **Start the Helper**:
+4. **Start / Stop the Helper:**
    ```powershell
-   & "$env:LOCALAPPDATA\DHUN\bin\start-dhun-helper.ps1"
-   ```
-5. **Stop the Helper**:
-   ```powershell
-   & "$env:LOCALAPPDATA\DHUN\bin\stop-dhun-helper.ps1"
+   powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\DHUN\bin\start-dhun-helper.ps1"
+   powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\DHUN\bin\stop-dhun-helper.ps1"
    ```
 
 ---

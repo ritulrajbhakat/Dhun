@@ -183,7 +183,17 @@ async fn main() -> anyhow::Result<()> {
 
     let app = create_local_helper_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            info!(
+                "DHUN Local Helper is already running on port {} (e.g. triggered via dhun://start). Exiting duplicate instance cleanly.",
+                port
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
     info!("DHUN Local Helper bound on 0.0.0.0:{}", port);
 
     axum::serve(

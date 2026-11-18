@@ -34,7 +34,24 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist-helper-win | Out-Null
           Copy-Item target/release/dhun-local-helper.exe dist-helper-win/
           Copy-Item packaging/windows/*.ps1 dist-helper-win/
+          Copy-Item packaging/windows/*.vbs dist-helper-win/
           Copy-Item docs/LOCAL_HELPER_INSTALL.md dist-helper-win/
+
+      - name: Build Windows One-Click Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc packaging/windows/dhun-helper-setup.iss
+
+      - name: Upload Windows One-Click Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DHUN-Local-Helper-Setup-Windows-x86_64
+          path: dist-installer-win/DHUN-Local-Helper-Setup.exe
+          if-no-files-found: error
 
       - name: Upload Local Helper Windows Bundle
         uses: actions/upload-artifact@v4
