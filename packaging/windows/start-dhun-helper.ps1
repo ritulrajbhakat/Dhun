@@ -1,4 +1,4 @@
-﻿# DHUN Local Helper — Portable Start Script (Windows)
+# DHUN Local Helper — Portable Start Script (Windows)
 # Zero Cloudflare Tunnel, zero hardcoded developer paths.
 param(
     [int]$Port = 47821,

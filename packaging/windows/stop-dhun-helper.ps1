@@ -1,4 +1,4 @@
-﻿# DHUN Local Helper — Stop Script (Windows)
+# DHUN Local Helper — Stop Script (Windows)
 $DataDir = Join-Path $env:LOCALAPPDATA "DHUN\helper"
 $PidFile = Join-Path $DataDir "helper.pid"
 $stopped = $false
