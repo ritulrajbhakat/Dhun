@@ -1,33 +1,39 @@
 import os
+import sys
+
+# Automatically prepend the .venv\Scripts folder (where python, ffmpeg, and ffprobe live) 
+# to PATH so yt-dlp's subprocesses find ffmpeg immediately without manual venv activation.
+venv_bin_path = os.path.dirname(os.path.abspath(sys.executable))
+if venv_bin_path not in os.environ["PATH"]:
+    os.environ["PATH"] = venv_bin_path + os.pathsep + os.environ["PATH"]
+
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import yt_dlp
 
 app = FastAPI(title="DHUN Local Audio Resolver")
 
-VENV_SCRIPTS_PATH = r"C:\Users\ritul\.gemini\antigravity-ide\scratch\dhun\resolver-service\.venv\Scripts"
+# Create local cache directory for resolved MP3 files
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Mount cache folder so local MP3s are instantly servable over loopback HTTP
+app.mount("/cache", StaticFiles(directory=CACHE_DIR), name="cache")
 
 class ResolveRequest(BaseModel):
-    url: str
-    title: str
+    source_url: str
+    provider_video_id: str = ""
+    title: str = ""
+    artist: str = ""
+    version_tag: str = "original"
 
 @app.post("/resolve")
 async def resolve_audio(req: ResolveRequest):
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'ffmpeg_location': VENV_SCRIPTS_PATH,
-        'quiet': True,
-        'no_warnings': True,
-    }
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
+        # Extract video info first to get the clean video ID
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            info = ydl.extract_info(req.source_url, download=False)
             if not info:
                 raise HTTPException(status_code=400, detail="Failed to extract info from URL")
 
@@ -38,23 +44,49 @@ async def resolve_audio(req: ResolveRequest):
             else:
                 video_info = info
 
-            audio_url = video_info.get('url')
-            if not audio_url:
-                formats = video_info.get('formats') or []
-                audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-                if audio_formats:
-                    audio_url = audio_formats[0].get('url')
-                else:
-                    audio_url = video_info.get('webpage_url')
+            video_id = video_info.get('id', 'audio_track')
+            expected_mp3_path = os.path.join(CACHE_DIR, f"{video_id}.mp3")
+            local_audio_url = f"http://127.0.0.1:8000/cache/{video_id}.mp3"
 
-            return {
-                "status": "success",
-                "title": video_info.get('title', req.title),
-                "duration": video_info.get('duration'),
-                "direct_https_audio_url": audio_url
-            }
+            # If already downloaded and cached, return immediately
+            if os.path.exists(expected_mp3_path):
+                return {
+                    "direct_https_audio_url": local_audio_url,
+                    "license_or_authorization_note": "Cached locally via yt-dlp + ffmpeg",
+                    "expected_sha256": None,
+                    "status": "success",
+                    "title": video_info.get('title', req.title),
+                    "duration": video_info.get('duration')
+                }
+
+        # Otherwise, download and convert to MP3 using local ffmpeg
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': os.path.join(CACHE_DIR, '%(id)s.%(ext)s'),
+            'ffmpeg_location': venv_bin_path,
+            'quiet': True,
+            'no_warnings': True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([req.source_url])
+
+        return {
+            "direct_https_audio_url": local_audio_url,
+            "license_or_authorization_note": "Resolved and converted locally via yt-dlp + ffmpeg",
+            "expected_sha256": None,
+            "status": "success",
+            "title": video_info.get('title', req.title),
+            "duration": video_info.get('duration')
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yt-dlp extraction failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"yt-dlp extraction/conversion failed: {str(e)}")
 
 @app.get("/api/local/health")
 async def health_check():
