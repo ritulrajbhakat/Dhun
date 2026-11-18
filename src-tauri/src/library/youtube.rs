@@ -60,10 +60,59 @@ pub fn is_valid_youtube_video_id(id: &str) -> bool {
     id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Keyword and word-match pre-validation for YouTube / YouTube Music links.
+/// Rejects embedded credentials (`@` host spoofing), control characters, traversal tokens,
+/// script/file scheme keywords, and URLs lacking required YouTube host keywords.
+pub fn validate_youtube_link_keywords(raw_url: &str) -> Result<()> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 {
+        return Err(anyhow!("YouTube URL is empty or exceeds maximum length"));
+    }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(anyhow!("YouTube URL contains illegal whitespace or control characters"));
+    }
+
+    let lower = trimmed.to_lowercase();
+    for forbidden_keyword in [
+        "javascript:",
+        "vbscript:",
+        "data:",
+        "file://",
+        "ftp://",
+        "../",
+        "..\\",
+        "%00",
+        "169.254.169.254",
+    ] {
+        if lower.contains(forbidden_keyword) {
+            return Err(anyhow!(
+                "Rejected URL containing forbidden keyword '{}'",
+                forbidden_keyword
+            ));
+        }
+    }
+
+    if !(lower.contains("youtube.com") || lower.contains("youtu.be")) {
+        return Err(anyhow!(
+            "URL does not match required YouTube domain keywords ('youtube.com' or 'youtu.be')"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parses and strictly validates a YouTube or YouTube Music link, extracting provider and video ID.
-/// Rejects unauthorized domains, insecure schemes, and malformed identifiers.
+/// Rejects unauthorized domains, insecure schemes, userinfo spoofing, and malformed identifiers.
 pub fn parse_youtube_url(url_str: &str) -> Result<ParsedYouTubeUrl> {
+    validate_youtube_link_keywords(url_str)?;
+
     let parsed = Url::parse(url_str.trim()).map_err(|e| anyhow!("Malformed URL: {}", e))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow!(
+            "Security violation: URLs with embedded credentials/userinfo ('@') are rejected"
+        ));
+    }
 
     if parsed.scheme() != "https" && parsed.scheme() != "http" {
         return Err(anyhow!(

@@ -134,18 +134,29 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Optional host-configured HTTPS media resolver (for licensed / free-alternative HTTPS audio servers)
+    // Optional host-configured media resolver (public HTTPS, or local 127.0.0.1 when DHUN_ALLOW_LOOPBACK_RESOLVER=1)
     let resolver_url = std::env::var("DHUN_AUDIO_RESOLVER_URL")
         .ok()
         .filter(|s| !s.trim().is_empty());
     let resolver_key = std::env::var("DHUN_AUDIO_RESOLVER_KEY")
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let allow_loopback_resolver = std::env::var("DHUN_ALLOW_LOOPBACK_RESOLVER")
+        .ok()
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     let audio_resolver = match resolver_url {
-        Some(url) => match AuthorizedResolverConfig::new(url.clone(), resolver_key) {
+        Some(url) => match AuthorizedResolverConfig::new_with_loopback(
+            url.clone(),
+            resolver_key,
+            allow_loopback_resolver,
+        ) {
             Ok(cfg) => {
-                info!("Authorized HTTPS Audio Resolver configured: {}", cfg.endpoint_url);
+                info!(
+                    "Authorized Audio Resolver configured: {} (loopback={})",
+                    cfg.endpoint_url, cfg.allow_loopback
+                );
                 Some(cfg)
             }
             Err(e) => {

@@ -32,21 +32,61 @@ use crate::sync::MetadataSyncManager;
 pub struct AuthorizedResolverConfig {
     pub endpoint_url: String,
     pub api_key: Option<String>,
+    pub allow_loopback: bool,
+}
+
+/// Validates a host-configured loopback resolver URL (`http://127.0.0.1:<port>/...` or `http://localhost:<port>/...`).
+/// Still strictly blocks LAN/RFC1918 IPs, cloud metadata, and plain-HTTP remote hosts.
+pub fn validate_loopback_resolver_url(url_str: &str) -> Result<(reqwest::Url, std::net::SocketAddr)> {
+    let parsed = reqwest::Url::parse(url_str).map_err(|e| anyhow!("Malformed URL: {}", e))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(anyhow!(
+            "Loopback resolver must use http or https (got '{}')",
+            parsed.scheme()
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("Resolver URL missing host"))?
+        .to_lowercase();
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err(anyhow!(
+            "Loopback opt-in only permits 127.0.0.1 or localhost (got '{}')",
+            host
+        ));
+    }
+    let port = parsed.port_or_known_default().unwrap_or(8000);
+    let pinned = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    Ok((parsed, pinned))
 }
 
 impl AuthorizedResolverConfig {
-    /// Validates that the resolver endpoint is strictly HTTPS and non-private (anti-SSRF).
+    /// Validates that the resolver endpoint is strictly public HTTPS and non-private (anti-SSRF).
     pub fn new(endpoint_url: String, api_key: Option<String>) -> Result<Self> {
+        Self::new_with_loopback(endpoint_url, api_key, false)
+    }
+
+    /// Validates a resolver endpoint, optionally permitting host-local `http://127.0.0.1:<port>`
+    /// when explicitly opted in by the host (`DHUN_ALLOW_LOOPBACK_RESOLVER=1`), eliminating any need for tunnels.
+    pub fn new_with_loopback(
+        endpoint_url: String,
+        api_key: Option<String>,
+        allow_loopback: bool,
+    ) -> Result<Self> {
         let trimmed = endpoint_url.trim().to_string();
         if trimmed.is_empty() {
             return Err(anyhow!("Resolver URL cannot be empty"));
         }
-        let _ = validate_safe_public_url(&trimmed)?;
+        let is_loopback_valid = allow_loopback && validate_loopback_resolver_url(&trimmed).is_ok();
+        if !is_loopback_valid {
+            let _ = validate_safe_public_url(&trimmed)?;
+        }
         Ok(Self {
             endpoint_url: trimmed,
             api_key: api_key
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty()),
+            allow_loopback: is_loopback_valid,
         })
     }
 }
@@ -194,7 +234,13 @@ pub async fn acquire_via_authorized_resolver(
     downloader: &AudioDownloader,
     db: &Database,
 ) -> (AcquisitionStatus, String, Option<PathBuf>) {
-    let (validated_url, pinned_addr) = match validate_safe_public_url(&resolver.endpoint_url) {
+    let validation_res = if resolver.allow_loopback {
+        validate_loopback_resolver_url(&resolver.endpoint_url)
+            .or_else(|_| validate_safe_public_url(&resolver.endpoint_url))
+    } else {
+        validate_safe_public_url(&resolver.endpoint_url)
+    };
+    let (validated_url, pinned_addr) = match validation_res {
         Ok(v) => v,
         Err(e) => {
             warn!("Resolver URL failed security validation: {}", e);

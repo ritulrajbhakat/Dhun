@@ -3616,6 +3616,41 @@ mod tests {
         assert!(cached_path.exists());
         assert_eq!(sha256.len(), 64);
 
+        // 4. Explicit loopback resolver opt-in accepts 127.0.0.1/localhost without Cloudflare Tunnel,
+        //    while STILL rejecting private LAN IPs, metadata IPs, and non-HTTPS remote hosts
+        let loopback_cfg = AuthorizedResolverConfig::new_with_loopback(
+            "http://127.0.0.1:8000/resolve".to_string(),
+            None,
+            true,
+        )
+        .expect("Loopback opt-in must accept http://127.0.0.1:8000/resolve");
+        assert!(loopback_cfg.allow_loopback);
+        assert!(AuthorizedResolverConfig::new_with_loopback(
+            "http://192.168.1.5:8000/resolve".to_string(),
+            None,
+            true
+        )
+        .is_err());
+        assert!(AuthorizedResolverConfig::new_with_loopback(
+            "http://169.254.169.254/latest".to_string(),
+            None,
+            true
+        )
+        .is_err());
+        assert!(AuthorizedResolverConfig::new_with_loopback(
+            "http://example.com/resolve".to_string(),
+            None,
+            true
+        )
+        .is_err());
+
+        // 5. YouTube keyword/word-match & userinfo spoofing validation
+        use dhun_lib::library::youtube::parse_youtube_url;
+        assert!(parse_youtube_url("https://youtube.com@evil.com/watch?v=dQw4w9WgXcQ").is_err());
+        assert!(parse_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&x=../etc").is_err());
+        assert!(parse_youtube_url("https://www.youtube.com/watch?v=dQw4w\n9WgXcQ").is_err());
+        assert!(parse_youtube_url("https://example.com/watch?v=dQw4w9WgXcQ").is_err());
+
         let _ = std::fs::remove_dir_all(&temp_cache);
     }
 }
