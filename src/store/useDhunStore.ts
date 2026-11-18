@@ -563,10 +563,49 @@ export const useDhunStore = create<DhunState>((set, get) => {
       if (!activeRoom || activeRoom.status !== 'live') return;
 
       const playingDeck = webAudioEngine.getActivePlayingDeck();
-      const preparedDeck = webAudioEngine.getPreparedIdleDeck();
+      const preparedDecks = webAudioEngine.getPreparedIdleDecks();
+      const preparedDeck = preparedDecks[0] || null;
+      const loadedIds = new Set(
+        webAudioEngine
+          .getDeckSnapshots()
+          .map((d) => d.submissionId)
+          .filter((id): id is string => Boolean(id))
+      );
 
-      // Already have both a playing track AND a preloaded next track ready
+      // Level 3–4: if we already have a playing deck + 1 prepared deck, optionally stage a 3rd groove-layer deck
       if (playingDeck && preparedDeck) {
+        if (exposedDecks >= 4 && preparedDecks.length < 2) {
+          const layerSub = submissions.find(
+            (s) =>
+              s.acquisition_status === 'cached_authorized' &&
+              Boolean(s.cache_id) &&
+              s.dj_status === 'queued_for_dj' &&
+              !loadedIds.has(s.id)
+          );
+          const layerDeckId = layerSub ? webAudioEngine.findIdleDeck(exposedDecks) : null;
+          if (layerSub && layerSub.cache_id && layerDeckId !== null) {
+            isPreparingDeck = true;
+            try {
+              const layerBytes = await localHelperClient.fetchAuthorizedCachedAudio(
+                activeRoom.room_id,
+                layerSub.cache_id
+              );
+              await webAudioEngine.prepareAuthorizedDeckBuffer(layerDeckId, layerBytes, {
+                submissionId: layerSub.id,
+                cacheId: layerSub.cache_id,
+                title: layerSub.title,
+                artist: layerSub.artist,
+                bpm: layerSub.bpm,
+                camelotKey: layerSub.camelot_key,
+                overallEnergy: layerSub.overall_energy,
+              });
+            } catch {
+              // Optional 3rd-deck layer preload failure must never disrupt playing audio
+            } finally {
+              isPreparingDeck = false;
+            }
+          }
+        }
         set({ autoDjPlaybackState: 'playing' });
         return;
       }
@@ -617,6 +656,8 @@ export const useDhunStore = create<DhunState>((set, get) => {
           artist: nextPlayableCandidate.artist,
           bpm: nextPlayableCandidate.bpm,
           camelotKey: nextPlayableCandidate.camelot_key,
+          overallEnergy: nextPlayableCandidate.overall_energy,
+          sections: nextPlayableCandidate.sections,
         });
 
         if (!ok) {
@@ -692,6 +733,10 @@ export const useDhunStore = create<DhunState>((set, get) => {
     },
 
     setPartyMood: async (moodId: string) => {
+      const moodObj = get().moodProfiles.find((m) => m.id === moodId);
+      if (moodObj) {
+        webAudioEngine.setTargetEnergy(moodObj.target_energy);
+      }
       set({ selectedMoodId: moodId });
       const { activeRoom } = get();
       if (activeRoom && activeRoom.status !== 'closed') {
@@ -741,6 +786,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
         decks[deckId] = { ...decks[deckId], tempo };
         return { decks };
       });
+      webAudioEngine.setDeckTempo(deckId, tempo);
     },
 
     setMasterVolume: (vol) => {

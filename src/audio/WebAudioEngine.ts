@@ -11,7 +11,12 @@
 // Progress and transitions are driven exclusively by actual AudioContext.currentTime & decoded AudioBuffers.
 // Every executed transition is logged truthfully via `onTechniqueExecuted` (never decorative labels).
 
-import { DjLevel, DjTechniqueExecutionRecord, DjTechniqueId } from '../types';
+import {
+  DjLevel,
+  DjTechniqueExecutionRecord,
+  DjTechniqueId,
+  TrackSectionMarker,
+} from '../types';
 
 export type TransitionStyle = DjTechniqueId;
 
@@ -22,6 +27,24 @@ export interface DeckTrackMetadata {
   artist: string;
   bpm?: number | null;
   camelotKey?: string | null;
+  overallEnergy?: number | null;
+  sections?: TrackSectionMarker[];
+}
+
+export interface IntraTrackJumpPlan {
+  fromSec: number;
+  toSec: number;
+  targetLabel: string;
+}
+
+export interface MusicalPerformanceWindow {
+  cueInSec: number;
+  cueOutSec: number;
+  sectionLabel: string;
+  sectionSignature: string;
+  fallbackUsed: boolean;
+  reason: string;
+  intraTrackJump: IntraTrackJumpPlan | null;
 }
 
 interface WebAudioDeckChain {
@@ -44,8 +67,16 @@ interface WebAudioDeckChain {
   isPlaying: boolean;
   startedAtCtxTime: number;
   offsetSec: number;
+  cueInSec: number;
+  cueOutSec: number;
+  sectionLabel: string;
+  sectionFallbackUsed: boolean;
+  intraTrackJump: IntraTrackJumpPlan | null;
+  intraJumpExecuted: boolean;
   preloadSignaled: boolean;
   transitionTriggered: boolean;
+  isLayering: boolean;
+  cleanupTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export interface WebAudioDeckStatus {
@@ -59,6 +90,9 @@ export interface WebAudioDeckStatus {
   durationSec: number;
   bpm: number | null;
   camelotKey: string | null;
+  sectionLabel?: string | null;
+  cueInSec?: number;
+  cueOutSec?: number;
 }
 
 export interface AutoDjEngineCallbacks {
@@ -271,27 +305,199 @@ export function resolveTechniqueForLevel(
   };
 }
 
-class FourDeckWebAudioEngine {
-  private ctx: AudioContext | null = null;
+/**
+ * Deterministic musical-moment & section-boundary planner.
+ *
+ * Uses actual DSP-analyzed phrase/section markers (`meta.sections`) and BPM.
+ * Never fabricates semantic labels or makes arbitrary mid-bar cuts:
+ * - Every cue-in and cue-out point snaps to analyzed phrase boundaries.
+ * - Tracks previously played section signatures to avoid repeating the same moment.
+ * - Falls back honestly to full-track / safe phrase boundaries whenever section
+ *   markers are missing, low-confidence (< 0.55), or the track is short (< 24s).
+ */
+export function planMusicalPerformanceWindow(
+  meta: DeckTrackMetadata | null,
+  durationSec: number,
+  djLevel: DjLevel,
+  targetEnergy: number,
+  playedSections: Set<string>
+): MusicalPerformanceWindow {
+  const safeDur = Math.max(0.1, durationSec);
+  const sections = meta?.sections || [];
+  const subId = meta?.submissionId || 'unknown';
+  const hasBpm = Boolean(meta?.bpm && meta.bpm > 40);
+
+  // Strict honesty: fall back to safe full-track playback if no reliable section analysis exists
+  const confidentSections = sections.filter(
+    (s) => (s.confidence ?? 0) >= 0.55 && s.end_ms > s.start_ms + 2500
+  );
+  if (!hasBpm || safeDur < 24 || confidentSections.length < 2) {
+    return {
+      cueInSec: 0,
+      cueOutSec: safeDur,
+      sectionLabel: 'full_track_fallback',
+      sectionSignature: `${subId}:0-${Math.round(safeDur * 1000)}`,
+      fallbackUsed: true,
+      reason:
+        !hasBpm
+          ? 'BPM unverified — playing full track without forced section cuts.'
+          : safeDur < 24
+          ? 'Short track (<24s) — playing full duration without section trimming.'
+          : 'Section confidence below threshold — safe full-track phrase fallback.',
+      intraTrackJump: null,
+    };
+  }
+
+  // Filter out intros/outros when searching for primary musical body
+  const bodySections = confidentSections.filter(
+    (s) => s.section_type !== 'intro' && s.section_type !== 'outro'
+  );
+  const candidates = bodySections.length > 0 ? bodySections : confidentSections;
+
+  // Score candidate entry sections by party energy fit, musical role, and anti-repetition
+  const scoreSection = (s: TrackSectionMarker): number => {
+    const sig = `${subId}:${s.start_ms}-${s.end_ms}`;
+    let sc = 1.0 - Math.abs(s.energy_level - targetEnergy);
+    if (playedSections.has(sig)) sc -= 1.25; // Strong anti-repeat penalty
+    if (djLevel >= 3) {
+      if (s.section_type === 'build' || s.section_type === 'drop' || s.section_type === 'peak') {
+        sc += 0.35;
+      } else if (s.section_type === 'groove') {
+        sc += 0.2;
+      }
+    } else if (djLevel === 2) {
+      if (s.section_type === 'groove' || s.section_type === 'peak') sc += 0.25;
+    } else {
+      // Level 1 prefers clean early body entry (first groove/verse after intro)
+      sc += s.start_ms < safeDur * 350 ? 0.35 : 0.0;
+    }
+    return sc;
+  };
+
+  let entryIdx = 0;
+  let bestScore = -999;
+  for (let i = 0; i < candidates.length; i++) {
+    const sc = scoreSection(candidates[i]);
+    if (sc > bestScore) {
+      bestScore = sc;
+      entryIdx = i;
+    }
+  }
+
+  const chosenStart = candidates[entryIdx];
+  const fullStartIdx = Math.max(
+    0,
+    sections.findIndex((s) => s.start_ms === chosenStart.start_ms && s.end_ms === chosenStart.end_ms)
+  );
+
+  // Determine phrase-aligned exit boundary based on DJ Level
+  const targetWindowSec =
+    djLevel === 4 ? 52 : djLevel === 3 ? 68 : djLevel === 2 ? 110 : safeDur;
+
+  const cueInSec = Math.max(0, Math.min(safeDur - 12, chosenStart.start_ms / 1000));
+  let cueOutSec = safeDur;
+  let endSectionType = chosenStart.section_type;
+
+  // Walk forward along real analyzed phrase boundaries until reaching target musical moment length
+  for (let i = fullStartIdx; i < sections.length; i++) {
+    const sec = sections[i];
+    const endSec = Math.min(safeDur, sec.end_ms / 1000);
+    const span = endSec - cueInSec;
+    if (sec.section_type === 'outro' && (sec.confidence ?? 0) >= 0.55 && sec.start_ms / 1000 - cueInSec >= 18) {
+      cueOutSec = Math.min(safeDur, sec.start_ms / 1000);
+      endSectionType = i > fullStartIdx ? sections[i - 1].section_type : chosenStart.section_type;
+      break;
+    }
+    if (djLevel >= 2 && span >= targetWindowSec && span >= 24) {
+      cueOutSec = endSec;
+      endSectionType = sec.section_type;
+      break;
+    }
+  }
+
+  cueOutSec = Math.max(Math.min(safeDur, cueInSec + 16), Math.min(safeDur, cueOutSec));
+
+  // Level 3–4 optional intra-track beat-aligned jump: skip a mid-window low-energy breakdown
+  // straight into a confident build/drop when party energy target is high (>= 0.70)
+  let intraTrackJump: IntraTrackJumpPlan | null = null;
+  if (djLevel >= 3 && targetEnergy >= 0.70) {
+    for (let i = fullStartIdx + 1; i < sections.length - 1; i++) {
+      const s = sections[i];
+      const sStart = s.start_ms / 1000;
+      const sEnd = s.end_ms / 1000;
+      if (
+        sStart > cueInSec + 8 &&
+        sEnd < cueOutSec - 8 &&
+        s.section_type === 'breakdown' &&
+        (s.confidence ?? 0) >= 0.60
+      ) {
+        const nextHigh = sections
+          .slice(i + 1)
+          .find(
+            (n) =>
+              (n.section_type === 'build' || n.section_type === 'drop' || n.section_type === 'peak') &&
+              (n.confidence ?? 0) >= 0.60 &&
+              n.start_ms / 1000 < safeDur - 10
+          );
+        if (nextHigh && nextHigh.start_ms > s.start_ms + 4000) {
+          intraTrackJump = {
+            fromSec: sStart,
+            toSec: nextHigh.start_ms / 1000,
+            targetLabel: nextHigh.section_type,
+          };
+          // Extend cueOutSec so the post-jump drop/peak actually plays out cleanly!
+          const postJumpEnd = Math.min(safeDur, nextHigh.end_ms / 1000);
+          if (postJumpEnd > cueOutSec) {
+            cueOutSec = postJumpEnd;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  const label =
+    chosenStart.section_type === endSectionType
+      ? chosenStart.section_type
+      : `${chosenStart.section_type}→${endSectionType}`;
+
+  return {
+    cueInSec: Number(cueInSec.toFixed(2)),
+    cueOutSec: Number(cueOutSec.toFixed(2)),
+    sectionLabel: label,
+    sectionSignature: `${subId}:${chosenStart.start_ms}-${chosenStart.end_ms}`,
+    fallbackUsed: false,
+    reason: `Phrase-aligned ${label} moment (${cueInSec.toFixed(1)}s–${cueOutSec.toFixed(1)}s) for L${djLevel} at ${Math.round(targetEnergy * 100)}% energy.`,
+    intraTrackJump,
+  };
+}
+
+export class FourDeckWebAudioEngine {
+  private ctx: BaseAudioContext | null = null;
   private masterGain: GainNode | null = null;
   private limiter: DynamicsCompressorNode | null = null;
   private analyser: AnalyserNode | null = null;
   private decks: WebAudioDeckChain[] = [];
   private crossfaderPos = -1.0;
   private djLevel: DjLevel = 2;
+  private targetEnergy = 0.75;
   private activeTransitionStyle: TransitionStyle = 'timed_bass_swap';
   private callbacks: AutoDjEngineCallbacks = {};
   private clockMonitorId: ReturnType<typeof setInterval> | null = null;
+  private playedSectionSignatures: Set<string> = new Set();
 
-  public init(): void {
+  public init(customCtx?: BaseAudioContext): void {
     if (this.ctx) return;
-    if (typeof window === 'undefined') return;
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!AudioCtx) return;
-
-    this.ctx = new AudioCtx();
+    if (customCtx) {
+      this.ctx = customCtx;
+    } else {
+      if (typeof window === 'undefined') return;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      this.ctx = new AudioCtx();
+    }
 
     // Master bus -> Brickwall Limiter -> Analyser -> System Speakers
     this.masterGain = this.ctx.createGain();
@@ -392,8 +598,16 @@ class FourDeckWebAudioEngine {
         isPlaying: false,
         startedAtCtxTime: 0,
         offsetSec: 0,
+        cueInSec: 0,
+        cueOutSec: 0,
+        sectionLabel: 'full_track_fallback',
+        sectionFallbackUsed: true,
+        intraTrackJump: null,
+        intraJumpExecuted: false,
         preloadSignaled: false,
         transitionTriggered: false,
+        isLayering: false,
+        cleanupTimer: null,
       };
     });
   }
@@ -406,14 +620,18 @@ class FourDeckWebAudioEngine {
     this.djLevel = level;
   }
 
+  public setTargetEnergy(energy: number): void {
+    this.targetEnergy = Math.max(0.2, Math.min(1.0, energy));
+  }
+
   public setTransitionStyle(style: TransitionStyle): void {
     this.activeTransitionStyle = normalizeTechniqueName(style);
   }
 
   public async ensureRunning(): Promise<void> {
     this.init();
-    if (this.ctx && this.ctx.state === 'suspended') {
-      await this.ctx.resume();
+    if (this.ctx && 'resume' in this.ctx && this.ctx.state === 'suspended') {
+      await (this.ctx as AudioContext).resume();
     }
   }
 
@@ -448,6 +666,55 @@ class FourDeckWebAudioEngine {
     return snaps.find((d) => !d.isPlaying && d.isLoaded && d.submissionId !== null) || null;
   }
 
+  public getPreparedIdleDecks(): WebAudioDeckStatus[] {
+    return this.getDeckSnapshots().filter((d) => !d.isPlaying && d.isLoaded && d.submissionId !== null);
+  }
+
+  /**
+   * Loads a pre-decoded AudioBuffer directly onto an idle deck (also used by deterministic DSP tests).
+   */
+  public loadDecodedDeckBuffer(
+    deckId: number,
+    decoded: AudioBuffer,
+    meta: DeckTrackMetadata
+  ): boolean {
+    if (!this.ctx || deckId < 0 || deckId >= this.decks.length) return false;
+    const deck = this.decks[deckId];
+    if (deck.isPlaying) return false;
+    if (!decoded || decoded.duration <= 0) {
+      throw new Error('Decoded audio buffer has zero duration');
+    }
+
+    const plan = planMusicalPerformanceWindow(
+      meta,
+      decoded.duration,
+      this.djLevel,
+      this.targetEnergy,
+      this.playedSectionSignatures
+    );
+    this.playedSectionSignatures.add(plan.sectionSignature);
+    if (this.playedSectionSignatures.size > 120) {
+      const oldest = this.playedSectionSignatures.values().next().value;
+      if (oldest) this.playedSectionSignatures.delete(oldest);
+    }
+
+    deck.buffer = decoded;
+    deck.rmsGainFactor = computeBufferRmsGain(decoded);
+    deck.meta = meta;
+    deck.cueInSec = plan.cueInSec;
+    deck.cueOutSec = plan.cueOutSec;
+    deck.offsetSec = plan.cueInSec;
+    deck.sectionLabel = plan.sectionLabel;
+    deck.sectionFallbackUsed = plan.fallbackUsed;
+    deck.intraTrackJump = plan.intraTrackJump;
+    deck.intraJumpExecuted = false;
+    deck.preloadSignaled = false;
+    deck.transitionTriggered = false;
+    deck.isLayering = false;
+    this.emitSnapshots();
+    return true;
+  }
+
   public async prepareAuthorizedDeckBuffer(
     deckId: number,
     audioBytes: ArrayBuffer,
@@ -459,18 +726,7 @@ class FourDeckWebAudioEngine {
     if (deck.isPlaying) return false;
 
     const decoded = await this.ctx.decodeAudioData(audioBytes.slice(0));
-    if (!decoded || decoded.duration <= 0) {
-      throw new Error('Decoded audio buffer has zero duration');
-    }
-
-    deck.buffer = decoded;
-    deck.rmsGainFactor = computeBufferRmsGain(decoded);
-    deck.meta = meta;
-    deck.offsetSec = 0;
-    deck.preloadSignaled = false;
-    deck.transitionTriggered = false;
-    this.emitSnapshots();
-    return true;
+    return this.loadDecodedDeckBuffer(deckId, decoded, meta);
   }
 
   private resetDeckDsp(deck: WebAudioDeckChain, now: number): void {
@@ -482,6 +738,8 @@ class FourDeckWebAudioEngine {
     deck.eqHigh.gain.setValueAtTime(0, now);
 
     deck.filter.type = 'allpass';
+    deck.filter.Q.cancelScheduledValues(now);
+    deck.filter.Q.setValueAtTime(1.8, now);
     deck.filter.frequency.cancelScheduledValues(now);
     deck.filter.frequency.setValueAtTime(1000, now);
 
@@ -491,7 +749,7 @@ class FourDeckWebAudioEngine {
     deck.echoSend.gain.cancelScheduledValues(now);
     deck.echoSend.gain.setValueAtTime(0.0, now);
     deck.echoFeedback.gain.cancelScheduledValues(now);
-    deck.echoFeedback.gain.setValueAtTime(0.45, now);
+    deck.echoFeedback.gain.setValueAtTime(0.0, now);
 
     // Apply automatic RMS gain matching on Level 2+ (Level 1 uses unity 1.0 manual gain)
     const gainTarget = this.djLevel >= 2 ? deck.rmsGainFactor : 1.0;
@@ -499,10 +757,20 @@ class FourDeckWebAudioEngine {
     deck.channelGain.gain.setValueAtTime(gainTarget, now);
   }
 
-  public startDeck(deckId: number, playbackRate: number = 1.0): boolean {
+  public startDeck(
+    deckId: number,
+    playbackRate: number = 1.0,
+    initialCrossfadeGain?: number,
+    startOffsetSec?: number
+  ): boolean {
     if (!this.ctx || deckId < 0 || deckId >= this.decks.length) return false;
     const deck = this.decks[deckId];
     if (!deck.buffer || !deck.meta) return false;
+
+    if (deck.cleanupTimer) {
+      clearTimeout(deck.cleanupTimer);
+      deck.cleanupTimer = null;
+    }
 
     if (deck.sourceNode) {
       try {
@@ -516,10 +784,19 @@ class FourDeckWebAudioEngine {
     this.resetDeckDsp(deck, now);
 
     const otherPlaying = this.decks.some((d) => d.deckId !== deckId && d.isPlaying);
-    if (!otherPlaying) {
-      deck.crossfadeGain.gain.cancelScheduledValues(now);
-      deck.crossfadeGain.gain.setValueAtTime(1.0, now);
-    }
+    const startGain =
+      initialCrossfadeGain !== undefined ? initialCrossfadeGain : otherPlaying ? 0.0 : 1.0;
+    deck.crossfadeGain.gain.cancelScheduledValues(now);
+    deck.crossfadeGain.gain.setValueAtTime(startGain, now);
+
+    const effectiveOffset = Math.max(
+      0,
+      Math.min(
+        deck.buffer.duration - 0.5,
+        startOffsetSec !== undefined ? startOffsetSec : deck.offsetSec
+      )
+    );
+    deck.offsetSec = effectiveOffset;
 
     const src = this.ctx.createBufferSource();
     src.buffer = deck.buffer;
@@ -527,22 +804,32 @@ class FourDeckWebAudioEngine {
     src.connect(deck.channelGain);
 
     const finishedSubmissionId = deck.meta.submissionId;
+    const wasLayer = deck.isLayering;
     src.onended = () => {
       if (deck.sourceNode === src) {
+        if (deck.cleanupTimer) {
+          clearTimeout(deck.cleanupTimer);
+          deck.cleanupTimer = null;
+        }
         deck.isPlaying = false;
+        deck.isLayering = false;
         deck.sourceNode = null;
         deck.buffer = null;
         deck.meta = null;
         deck.offsetSec = 0;
+        deck.cueInSec = 0;
+        deck.cueOutSec = 0;
         this.emitSnapshots();
-        this.callbacks.onTrackEnded?.(deckId, finishedSubmissionId);
+        if (!wasLayer) {
+          this.callbacks.onTrackEnded?.(deckId, finishedSubmissionId);
+        }
         this.maybeStopClockMonitor();
       }
     };
 
-    src.start(0, deck.offsetSec);
+    src.start(now, effectiveOffset);
     deck.sourceNode = src;
-    deck.startedAtCtxTime = now - deck.offsetSec;
+    deck.startedAtCtxTime = now - effectiveOffset;
     deck.isPlaying = true;
     deck.preloadSignaled = false;
     deck.transitionTriggered = false;
@@ -551,9 +838,15 @@ class FourDeckWebAudioEngine {
     return true;
   }
 
-  public stopDeck(deckId: number): void {
+  public stopDeck(deckId: number, suppressCallback: boolean = true): void {
     if (deckId < 0 || deckId >= this.decks.length) return;
     const deck = this.decks[deckId];
+    if (deck.cleanupTimer) {
+      clearTimeout(deck.cleanupTimer);
+      deck.cleanupTimer = null;
+    }
+    const prevSubId = deck.meta?.submissionId ?? null;
+    const wasLayer = deck.isLayering;
     if (deck.sourceNode) {
       try {
         deck.sourceNode.onended = null;
@@ -564,17 +857,25 @@ class FourDeckWebAudioEngine {
     }
     if (this.ctx) {
       const now = this.ctx.currentTime;
+      deck.crossfadeGain.gain.cancelScheduledValues(now);
+      deck.crossfadeGain.gain.setValueAtTime(0.0, now);
       deck.echoSend.gain.cancelScheduledValues(now);
       deck.echoSend.gain.setValueAtTime(0.0, now);
       deck.echoFeedback.gain.cancelScheduledValues(now);
       deck.echoFeedback.gain.setValueAtTime(0.0, now);
     }
     deck.isPlaying = false;
+    deck.isLayering = false;
     deck.buffer = null;
     deck.meta = null;
     deck.offsetSec = 0;
+    deck.cueInSec = 0;
+    deck.cueOutSec = 0;
     this.maybeStopClockMonitor();
     this.emitSnapshots();
+    if (!suppressCallback && !wasLayer && prevSubId) {
+      this.callbacks.onTrackEnded?.(deckId, prevSubId);
+    }
   }
 
   /**
@@ -591,6 +892,8 @@ class FourDeckWebAudioEngine {
     const fromDeck = this.decks[fromDeckId];
     const toDeck = this.decks[toDeckId];
     if (!fromDeck || !toDeck || !toDeck.buffer || !toDeck.meta) return false;
+    // Overlapping transition guard: never corrupt an already-active outgoing fade
+    if (fromDeck.transitionTriggered) return false;
 
     const { technique, fallbackUsed, reason, tempoRatio } = resolveTechniqueForLevel(
       this.djLevel,
@@ -604,25 +907,91 @@ class FourDeckWebAudioEngine {
     const beatSec = Math.max(0.3, Math.min(0.85, 60 / refBpm));
 
     // Duration tailored to each genuine DJ technique
-    let dur = Math.max(0.8, Math.min(durationSec, toDeck.buffer.duration * 0.35));
+    const playableSpan = Math.max(2.0, (toDeck.cueOutSec || toDeck.buffer.duration) - toDeck.cueInSec);
+    let dur = Math.max(0.8, Math.min(durationSec, playableSpan * 0.35));
     if (technique === 'safe_quick_cut') dur = 0.32;
     else if (technique === 'backspin_cut') dur = Math.min(1.1, beatSec * 2);
-    else if (technique === 'phrase_long_blend') dur = Math.min(12.0, Math.max(dur, 8.0), toDeck.buffer.duration * 0.35);
+    else if (technique === 'phrase_long_blend') dur = Math.min(12.0, Math.max(dur, 8.0), playableSpan * 0.35);
     else if (technique === 'four_deck_layer' || technique === 'creative_mashup_layer') {
-      dur = Math.min(14.0, Math.max(dur, 10.0), toDeck.buffer.duration * 0.4);
+      dur = Math.min(14.0, Math.max(dur, 10.0), playableSpan * 0.4);
     }
 
     const mid = now + dur * 0.5;
 
+    // Atomically start incoming deck at gain 0.0 and its planned phrase-aligned cueInSec (zero click/pop!)
     if (!toDeck.isPlaying) {
-      this.startDeck(toDeckId, tempoRatio);
+      this.startDeck(toDeckId, tempoRatio, 0.0, toDeck.cueInSec);
     }
     fromDeck.transitionTriggered = true;
 
-    fromDeck.crossfadeGain.gain.cancelScheduledValues(now);
-    toDeck.crossfadeGain.gain.cancelScheduledValues(now);
-    fromDeck.crossfadeGain.gain.setValueAtTime(fromDeck.crossfadeGain.gain.value, now);
-    toDeck.crossfadeGain.gain.setValueAtTime(0.0, now);
+    // Anchor ALL outgoing AudioParams at `now` BEFORE ramping (prevents Web Audio ramping from t=0!)
+    const anchorParam = (param: AudioParam, fallbackVal?: number) => {
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(fallbackVal !== undefined ? fallbackVal : param.value, now);
+    };
+
+    anchorParam(fromDeck.crossfadeGain.gain, Math.max(0.01, fromDeck.crossfadeGain.gain.value || 1.0));
+    anchorParam(fromDeck.eqLow.gain);
+    anchorParam(fromDeck.eqMid.gain);
+    anchorParam(fromDeck.eqHigh.gain);
+    anchorParam(fromDeck.gateGain.gain, 1.0);
+    anchorParam(fromDeck.echoSend.gain, 0.0);
+    anchorParam(fromDeck.echoFeedback.gain, 0.0);
+
+    anchorParam(toDeck.crossfadeGain.gain, 0.0);
+    anchorParam(toDeck.eqLow.gain, 0.0);
+    anchorParam(toDeck.eqMid.gain, 0.0);
+    anchorParam(toDeck.eqHigh.gain, 0.0);
+    anchorParam(toDeck.gateGain.gain, 1.0);
+
+    // Optional genuine 3rd-deck rhythmic groove layer on Level 3 & Level 4 when another prepared deck exists
+    let layeredDeck: WebAudioDeckChain | null = null;
+    if (
+      this.djLevel >= 3 &&
+      (technique === 'four_deck_layer' || technique === 'creative_mashup_layer')
+    ) {
+      const candidateLayer = this.decks.find(
+        (d) =>
+          d.deckId !== fromDeckId &&
+          d.deckId !== toDeckId &&
+          !d.isPlaying &&
+          d.buffer !== null &&
+          d.meta !== null
+      );
+      if (candidateLayer && candidateLayer.meta) {
+        const layerResolve = resolveTechniqueForLevel(
+          this.djLevel,
+          fromDeck.meta,
+          candidateLayer.meta,
+          technique
+        );
+        // Only layer a 3rd deck if tempo is genuinely syncable (never layer off-beat!)
+        if (!layerResolve.fallbackUsed && Math.abs(1 - layerResolve.tempoRatio) <= 0.14) {
+          candidateLayer.isLayering = true;
+          if (this.startDeck(candidateLayer.deckId, layerResolve.tempoRatio, 0.0, candidateLayer.cueInSec)) {
+            layeredDeck = candidateLayer;
+            // Carve out sub/low frequencies on Deck 3 so 3-deck sum stays punchy and never muddies/clips
+            layeredDeck.eqLow.gain.setValueAtTime(-30, now);
+            layeredDeck.eqMid.gain.setValueAtTime(-4, now);
+            layeredDeck.eqHigh.gain.setValueAtTime(1.0, now);
+            layeredDeck.filter.type = 'highpass';
+            layeredDeck.filter.Q.setValueAtTime(1.4, now);
+            layeredDeck.filter.frequency.setValueAtTime(420, now);
+            layeredDeck.filter.frequency.exponentialRampToValueAtTime(1800, now + dur * 0.9);
+            // Headroom-balanced layer envelope (max 0.36 so 3 summed decks stay safely below limiter)
+            layeredDeck.crossfadeGain.gain.setValueAtTime(0.0, now);
+            layeredDeck.crossfadeGain.gain.linearRampToValueAtTime(0.36, now + dur * 0.25);
+            layeredDeck.crossfadeGain.gain.setValueAtTime(0.32, now + dur * 0.72);
+            layeredDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);
+          } else {
+            candidateLayer.isLayering = false;
+          }
+        }
+      }
+    }
+
+    // Track whether an echo tail lingers past `now + dur` so deck cleanup waits for clean decay
+    let cleanupGraceSec = 0.2;
 
     // =========================================================================
     // AUDIBLE TECHNIQUE LIBRARY (14 DISTINCT DSP SCHEDULES ACROSS LEVELS 1–4)
@@ -656,7 +1025,7 @@ class FourDeckWebAudioEngine {
       case 'phrase_long_blend': {
         // Level 1: smooth equal-power long blend preserving clarity with gentle low trim
         const steps = 16;
-        for (let i = 0; i <= steps; i++) {
+        for (let i = 1; i <= steps; i++) {
           const frac = i / steps;
           const t = now + dur * frac;
           fromDeck.crossfadeGain.gain.linearRampToValueAtTime(Math.cos(frac * Math.PI * 0.5), t);
@@ -686,16 +1055,17 @@ class FourDeckWebAudioEngine {
       case 'filter_sweep_drop':
       case 'filtered_buildup_drop': {
         // Level 2/3: resonant HPF tension sweep on outgoing -> full-bass drop on incoming
-        const peakQ = technique === 'filtered_buildup_drop' ? 6.5 : 3.2;
+        const peakQ = technique === 'filtered_buildup_drop' ? 6.2 : 3.2;
         fromDeck.filter.type = 'highpass';
+        fromDeck.filter.Q.cancelScheduledValues(now);
         fromDeck.filter.Q.setValueAtTime(peakQ, now);
+        fromDeck.filter.frequency.cancelScheduledValues(now);
         fromDeck.filter.frequency.setValueAtTime(75, now);
         fromDeck.filter.frequency.exponentialRampToValueAtTime(5200, now + dur * 0.88);
 
         fromDeck.crossfadeGain.gain.setValueAtTime(1.0, now + dur * 0.85);
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);
 
-        toDeck.crossfadeGain.gain.setValueAtTime(0.0, now);
         toDeck.crossfadeGain.gain.linearRampToValueAtTime(0.35, now + dur * 0.78);
         toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, now + dur * 0.9);
 
@@ -706,28 +1076,30 @@ class FourDeckWebAudioEngine {
       }
 
       case 'echo_out_blend': {
-        // Level 3: beat-synced 3/4-beat echo send ramp on outgoing + sharp fader drop while echo tail decays!
+        // Level 3: beat-synced 3/4-beat echo send ramp on outgoing + sharp fader drop while echo tail decays cleanly to 0
+        cleanupGraceSec = 2.4;
         const delayTime = Math.max(0.18, Math.min(0.75, beatSec * 0.75));
         fromDeck.echoDelay.delayTime.setValueAtTime(delayTime, now);
-        fromDeck.echoFeedback.gain.setValueAtTime(0.58, now);
-        fromDeck.echoSend.gain.setValueAtTime(0.0, now);
-        fromDeck.echoSend.gain.linearRampToValueAtTime(0.85, mid);
-        fromDeck.echoSend.gain.setValueAtTime(0.85, mid + beatSec * 0.5);
+        fromDeck.echoFeedback.gain.setValueAtTime(0.56, now);
+        fromDeck.echoSend.gain.linearRampToValueAtTime(0.8, mid);
+        fromDeck.echoSend.gain.setValueAtTime(0.8, mid + beatSec * 0.4);
         fromDeck.echoSend.gain.linearRampToValueAtTime(0.0, now + dur);
-        fromDeck.echoFeedback.gain.linearRampToValueAtTime(0.15, now + dur + 2.2);
+        fromDeck.echoFeedback.gain.setValueAtTime(0.56, now + dur * 0.8);
+        fromDeck.echoFeedback.gain.linearRampToValueAtTime(0.0, now + dur + 2.2);
 
         fromDeck.crossfadeGain.gain.setValueAtTime(1.0, mid);
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, mid + 0.12);
 
-        toDeck.crossfadeGain.gain.setValueAtTime(0.0, now);
         toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, mid + 0.15);
         break;
       }
 
       case 'beat_roll_buildup': {
-        // Level 3: rhythmic 1/2 -> 1/4 -> 1/8 beat stutter roll + rising HPF tension into drop!
+        // Level 3: click-free micro-ramped 1/2 -> 1/4 -> 1/8 beat stutter roll + rising HPF tension into drop
         fromDeck.filter.type = 'highpass';
-        fromDeck.filter.Q.setValueAtTime(4.5, now);
+        fromDeck.filter.Q.cancelScheduledValues(now);
+        fromDeck.filter.Q.setValueAtTime(4.2, now);
+        fromDeck.filter.frequency.cancelScheduledValues(now);
         fromDeck.filter.frequency.setValueAtTime(120, now);
         fromDeck.filter.frequency.exponentialRampToValueAtTime(3400, now + dur * 0.85);
 
@@ -735,9 +1107,14 @@ class FourDeckWebAudioEngine {
         const dropTime = now + dur * 0.88;
         let pulseLen = beatSec * 0.5;
         let pulsesAtRate = 0;
+        const ramp = 0.005; // 5ms click-free micro-fade
         while (cursor < dropTime) {
-          fromDeck.gateGain.gain.setValueAtTime(1.0, cursor);
-          fromDeck.gateGain.gain.setValueAtTime(0.12, cursor + pulseLen * 0.55);
+          const offAt = cursor + pulseLen * 0.55;
+          fromDeck.gateGain.gain.linearRampToValueAtTime(1.0, cursor + ramp);
+          if (offAt < dropTime) {
+            fromDeck.gateGain.gain.setValueAtTime(1.0, Math.max(cursor + ramp, offAt - ramp));
+            fromDeck.gateGain.gain.linearRampToValueAtTime(0.12, offAt + ramp);
+          }
           cursor += pulseLen;
           pulsesAtRate += 1;
           if (pulsesAtRate >= 4 && pulseLen > beatSec * 0.125) {
@@ -745,7 +1122,7 @@ class FourDeckWebAudioEngine {
             pulsesAtRate = 0;
           }
         }
-        fromDeck.gateGain.gain.setValueAtTime(1.0, dropTime + 0.05);
+        fromDeck.gateGain.gain.linearRampToValueAtTime(1.0, dropTime + 0.04);
         fromDeck.crossfadeGain.gain.setValueAtTime(1.0, dropTime - 0.04);
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, dropTime + 0.06);
 
@@ -755,33 +1132,42 @@ class FourDeckWebAudioEngine {
       }
 
       case 'four_deck_layer': {
-        // Level 3: keeps outgoing mid/high groove riding softly over incoming bass for extended 4-deck blend
+        // Level 3: headroom-balanced extended layering (plus optional 3rd deck groove layer above)
+        const outgoingHold = layeredDeck ? 0.45 : 0.55;
+        const incomingTarget = layeredDeck ? 0.88 : 1.0;
+
         toDeck.eqLow.gain.setValueAtTime(-24, now);
         toDeck.eqLow.gain.linearRampToValueAtTime(0, now + dur * 0.35);
-        fromDeck.eqLow.gain.setValueAtTime(0, now);
         fromDeck.eqLow.gain.linearRampToValueAtTime(-28, now + dur * 0.35);
         fromDeck.filter.type = 'highpass';
+        fromDeck.filter.frequency.cancelScheduledValues(now);
         fromDeck.filter.frequency.setValueAtTime(320, now + dur * 0.35);
         fromDeck.filter.frequency.exponentialRampToValueAtTime(2200, now + dur);
 
-        toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, now + dur * 0.3);
-        fromDeck.crossfadeGain.gain.setValueAtTime(0.55, now + dur * 0.35);
-        fromDeck.crossfadeGain.gain.setValueAtTime(0.45, now + dur * 0.8);
+        toDeck.crossfadeGain.gain.linearRampToValueAtTime(incomingTarget, now + dur * 0.3);
+        toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, now + dur);
+        fromDeck.crossfadeGain.gain.linearRampToValueAtTime(outgoingHold, now + dur * 0.35);
+        fromDeck.crossfadeGain.gain.setValueAtTime(outgoingHold * 0.82, now + dur * 0.8);
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);
         break;
       }
 
       case 'stutter_gate_drop': {
-        // Level 4: crisp 16th-note rhythmic trance/club gate chop on outgoing track into full drop!
+        // Level 4: crisp click-free 16th-note rhythmic trance/club gate chop on outgoing track into full drop
         const sixteenth = Math.max(0.06, beatSec * 0.25);
         const dropAt = now + dur * 0.82;
+        const ramp = 0.004;
         let t = now;
         while (t < dropAt) {
-          fromDeck.gateGain.gain.setValueAtTime(1.0, t);
-          fromDeck.gateGain.gain.setValueAtTime(0.02, t + sixteenth * 0.48);
+          const closeAt = t + sixteenth * 0.48;
+          fromDeck.gateGain.gain.linearRampToValueAtTime(1.0, t + ramp);
+          if (closeAt < dropAt) {
+            fromDeck.gateGain.gain.setValueAtTime(1.0, Math.max(t + ramp, closeAt - ramp));
+            fromDeck.gateGain.gain.linearRampToValueAtTime(0.02, closeAt + ramp);
+          }
           t += sixteenth;
         }
-        fromDeck.gateGain.gain.setValueAtTime(1.0, dropAt + 0.05);
+        fromDeck.gateGain.gain.linearRampToValueAtTime(1.0, dropAt + 0.04);
         fromDeck.crossfadeGain.gain.setValueAtTime(1.0, dropAt - 0.03);
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, dropAt + 0.05);
 
@@ -798,6 +1184,7 @@ class FourDeckWebAudioEngine {
           fromDeck.sourceNode.playbackRate.exponentialRampToValueAtTime(0.22, now + dur * 0.88);
         }
         fromDeck.filter.type = 'highpass';
+        fromDeck.filter.frequency.cancelScheduledValues(now);
         fromDeck.filter.frequency.setValueAtTime(150, now);
         fromDeck.filter.frequency.exponentialRampToValueAtTime(3600, now + dur * 0.88);
 
@@ -810,16 +1197,18 @@ class FourDeckWebAudioEngine {
       }
 
       case 'echo_freeze_drop': {
-        // Level 4: high-feedback 1/2-beat echo freeze wash while incoming bass slams in!
+        // Level 4: high-feedback (clamped <= 0.75) 1/2-beat echo freeze wash decaying cleanly to 0 while incoming bass slams in
+        cleanupGraceSec = 2.6;
         const halfBeat = Math.max(0.15, Math.min(0.5, beatSec * 0.5));
         fromDeck.echoDelay.delayTime.setValueAtTime(halfBeat, now);
-        fromDeck.echoFeedback.gain.setValueAtTime(0.76, now);
-        fromDeck.echoSend.gain.setValueAtTime(0.0, now);
-        fromDeck.echoSend.gain.linearRampToValueAtTime(0.95, now + dur * 0.45);
+        fromDeck.echoFeedback.gain.setValueAtTime(0.74, now);
+        fromDeck.echoSend.gain.linearRampToValueAtTime(0.9, now + dur * 0.45);
         fromDeck.echoSend.gain.linearRampToValueAtTime(0.0, now + dur * 0.65);
-        fromDeck.echoFeedback.gain.linearRampToValueAtTime(0.08, now + dur + 2.8);
+        fromDeck.echoFeedback.gain.setValueAtTime(0.74, now + dur * 0.65);
+        fromDeck.echoFeedback.gain.linearRampToValueAtTime(0.0, now + dur + 2.4);
 
         fromDeck.filter.type = 'highpass';
+        fromDeck.filter.frequency.cancelScheduledValues(now);
         fromDeck.filter.frequency.setValueAtTime(250, now);
         fromDeck.filter.frequency.exponentialRampToValueAtTime(4800, now + dur * 0.65);
 
@@ -835,8 +1224,10 @@ class FourDeckWebAudioEngine {
         // Level 4: smooth continuous tempo ramp pulling outgoing & incoming tempos together
         if (fromDeck.sourceNode && toDeck.sourceNode && fromDeck.meta?.bpm && toDeck.meta?.bpm) {
           const outgoingTarget = Math.max(0.86, Math.min(1.14, toDeck.meta.bpm / fromDeck.meta.bpm));
+          fromDeck.sourceNode.playbackRate.cancelScheduledValues(now);
           fromDeck.sourceNode.playbackRate.setValueAtTime(1.0, now);
           fromDeck.sourceNode.playbackRate.linearRampToValueAtTime(outgoingTarget, now + dur);
+          toDeck.sourceNode.playbackRate.cancelScheduledValues(now);
           toDeck.sourceNode.playbackRate.setValueAtTime(tempoRatio, now);
           toDeck.sourceNode.playbackRate.linearRampToValueAtTime(1.0, now + dur);
         }
@@ -850,15 +1241,18 @@ class FourDeckWebAudioEngine {
 
       case 'creative_mashup_layer':
       default: {
-        // Level 4: dual-deck EQ-carved mashup layering (incoming mid/high rides over outgoing bass,
-        // then crisp midpoint bass swap + subtle echo-out tail on outgoing!)
+        // Level 4: EQ-carved mashup layering (headroom-compensated when 3rd deck active) + midpoint bass swap + clean echo-out
+        cleanupGraceSec = 1.8;
+        const incMid = layeredDeck ? 0.82 : 0.92;
+        const outMid = layeredDeck ? 0.72 : 0.82;
+
         toDeck.eqLow.gain.setValueAtTime(-30, now);
-        toDeck.eqMid.gain.setValueAtTime(2.5, now);
+        toDeck.eqMid.gain.setValueAtTime(2.0, now);
         toDeck.eqHigh.gain.setValueAtTime(1.5, now);
         fromDeck.eqMid.gain.linearRampToValueAtTime(-8, now + dur * 0.25);
 
-        toDeck.crossfadeGain.gain.linearRampToValueAtTime(0.95, now + dur * 0.25);
-        fromDeck.crossfadeGain.gain.setValueAtTime(0.85, now + dur * 0.25);
+        toDeck.crossfadeGain.gain.linearRampToValueAtTime(incMid, now + dur * 0.25);
+        fromDeck.crossfadeGain.gain.linearRampToValueAtTime(outMid, now + dur * 0.25);
 
         // Midpoint bass swap
         toDeck.eqLow.gain.setValueAtTime(-30, mid - 0.05);
@@ -869,13 +1263,14 @@ class FourDeckWebAudioEngine {
         fromDeck.eqLow.gain.setValueAtTime(0, mid - 0.05);
         fromDeck.eqLow.gain.linearRampToValueAtTime(-30, mid + 0.08);
 
-        // Subtle beat-synced echo-out on outgoing vocal/top layer
+        // Beat-synced echo-out tail on outgoing vocal/top layer (decays cleanly to 0)
         fromDeck.echoDelay.delayTime.setValueAtTime(Math.max(0.2, beatSec * 0.5), mid);
         fromDeck.echoSend.gain.setValueAtTime(0.0, mid);
-        fromDeck.echoSend.gain.linearRampToValueAtTime(0.55, now + dur * 0.85);
+        fromDeck.echoSend.gain.linearRampToValueAtTime(0.52, now + dur * 0.85);
         fromDeck.echoSend.gain.linearRampToValueAtTime(0.0, now + dur);
-        fromDeck.echoFeedback.gain.setValueAtTime(0.45, mid);
-        fromDeck.echoFeedback.gain.linearRampToValueAtTime(0.1, now + dur + 1.5);
+        fromDeck.echoFeedback.gain.setValueAtTime(0.44, mid);
+        fromDeck.echoFeedback.gain.setValueAtTime(0.44, now + dur * 0.9);
+        fromDeck.echoFeedback.gain.linearRampToValueAtTime(0.0, now + dur + 1.6);
 
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);
         toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, now + dur);
@@ -885,7 +1280,31 @@ class FourDeckWebAudioEngine {
 
     // Restore natural 1.0 playback rate smoothly after transition (except tempo_ramp_bridge which handles it inline)
     if (technique !== 'tempo_ramp_bridge' && tempoRatio !== 1.0 && toDeck.sourceNode) {
+      toDeck.sourceNode.playbackRate.setValueAtTime(tempoRatio, now + dur);
       toDeck.sourceNode.playbackRate.linearRampToValueAtTime(1.0, now + dur + 2.0);
+    }
+
+    // Schedule clean post-transition source stop/cleanup on real-time AudioContext so outgoing decks
+    // do not stay silently busy after section exits (skip setTimeout on OfflineAudioContext!).
+    const isRealtimeCtx = typeof AudioContext !== 'undefined' && this.ctx instanceof AudioContext;
+    if (isRealtimeCtx) {
+      const fromSrcRef = fromDeck.sourceNode;
+      const fromCleanupMs = Math.round((dur + cleanupGraceSec) * 1000);
+      fromDeck.cleanupTimer = setTimeout(() => {
+        if (fromDeck.sourceNode === fromSrcRef) {
+          this.stopDeck(fromDeckId, false);
+        }
+      }, fromCleanupMs);
+
+      if (layeredDeck) {
+        const layerDeckId = layeredDeck.deckId;
+        const layerSrcRef = layeredDeck.sourceNode;
+        layeredDeck.cleanupTimer = setTimeout(() => {
+          if (this.decks[layerDeckId]?.sourceNode === layerSrcRef) {
+            this.stopDeck(layerDeckId, true);
+          }
+        }, Math.round((dur + 0.15) * 1000));
+      }
     }
 
     const gainMatchDb =
@@ -904,8 +1323,14 @@ class FourDeckWebAudioEngine {
       durationSec: Number(dur.toFixed(2)),
       tempoMatchRatio: Number(tempoRatio.toFixed(3)),
       gainMatchDb,
-      fallbackUsed,
-      reason,
+      fallbackUsed: fallbackUsed || toDeck.sectionFallbackUsed,
+      reason: layeredDeck
+        ? `${reason} + 3rd-deck carved groove layer on Deck ${String.fromCharCode(65 + layeredDeck.deckId)}.`
+        : reason,
+      sectionLabel: toDeck.sectionLabel,
+      cueInSec: toDeck.cueInSec,
+      cueOutSec: toDeck.cueOutSec,
+      layeredDeckId: layeredDeck ? layeredDeck.deckId : null,
     };
 
     this.callbacks.onTechniqueExecuted?.(execution);
@@ -923,7 +1348,88 @@ class FourDeckWebAudioEngine {
     return true;
   }
 
+  /**
+   * Executes a smooth, beat-aligned intra-track section jump (Level 3–4) using an idle deck
+   * for a 120ms click-free equal-power crossfade without audio interruption.
+   */
+  private triggerIntraTrackSectionJump(deck: WebAudioDeckChain): boolean {
+    if (!this.ctx || !deck.buffer || !deck.meta || !deck.intraTrackJump || deck.intraJumpExecuted) {
+      return false;
+    }
+    const jump = deck.intraTrackJump;
+    const now = this.ctx.currentTime;
+    const oldSrc = deck.sourceNode;
+    if (!oldSrc) return false;
+
+    deck.intraJumpExecuted = true;
+
+    // 90ms click-free micro-dip + immediate restart at beat-aligned target section boundary
+    const newSrc = this.ctx.createBufferSource();
+    newSrc.buffer = deck.buffer;
+    newSrc.playbackRate.setValueAtTime(oldSrc.playbackRate.value || 1.0, now);
+    newSrc.connect(deck.channelGain);
+
+    deck.gateGain.gain.cancelScheduledValues(now);
+    deck.gateGain.gain.setValueAtTime(1.0, now);
+    deck.gateGain.gain.linearRampToValueAtTime(0.05, now + 0.045);
+    deck.gateGain.gain.linearRampToValueAtTime(1.0, now + 0.095);
+
+    const finishedSubmissionId = deck.meta.submissionId;
+    newSrc.onended = () => {
+      if (deck.sourceNode === newSrc) {
+        deck.isPlaying = false;
+        deck.sourceNode = null;
+        deck.buffer = null;
+        deck.meta = null;
+        deck.offsetSec = 0;
+        this.emitSnapshots();
+        this.callbacks.onTrackEnded?.(deck.deckId, finishedSubmissionId);
+        this.maybeStopClockMonitor();
+      }
+    };
+
+    try {
+      oldSrc.onended = null;
+      oldSrc.stop(now + 0.045);
+    } catch {}
+
+    newSrc.start(now + 0.045, jump.toSec);
+    deck.sourceNode = newSrc;
+    deck.offsetSec = jump.toSec;
+    deck.startedAtCtxTime = now + 0.045 - jump.toSec;
+
+    this.callbacks.onTechniqueExecuted?.({
+      id: `jmp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: Date.now(),
+      djLevel: this.djLevel,
+      techniqueId: 'phrase_long_blend',
+      techniqueLabel: `Intra-Track Jump → ${jump.targetLabel}`,
+      outgoingTitle: deck.meta.title,
+      incomingTitle: deck.meta.title,
+      fromDeckId: deck.deckId,
+      toDeckId: deck.deckId,
+      durationSec: 0.1,
+      tempoMatchRatio: 1.0,
+      gainMatchDb: 0,
+      fallbackUsed: false,
+      reason: `Skipped breakdown at ${jump.fromSec.toFixed(1)}s directly onto phrase-aligned ${jump.targetLabel} (${jump.toSec.toFixed(1)}s).`,
+      sectionLabel: jump.targetLabel,
+      cueInSec: jump.toSec,
+      cueOutSec: deck.cueOutSec,
+    });
+
+    return true;
+  }
+
   private ensureClockMonitor(): void {
+    // Never start real-time setInterval polling on OfflineAudioContext or headless test contexts
+    if (
+      typeof window === 'undefined' ||
+      typeof AudioContext === 'undefined' ||
+      !(this.ctx instanceof AudioContext)
+    ) {
+      return;
+    }
     if (this.clockMonitorId) return;
     this.clockMonitorId = setInterval(() => {
       if (!this.ctx) return;
@@ -931,23 +1437,40 @@ class FourDeckWebAudioEngine {
       let anyPlaying = false;
 
       for (const deck of this.decks) {
-        if (!deck.isPlaying || !deck.buffer || !deck.meta) continue;
+        if (!deck.isPlaying || !deck.buffer || !deck.meta || deck.isLayering) continue;
         anyPlaying = true;
         const pos = Math.max(0, now - deck.startedAtCtxTime);
-        const dur = deck.buffer.duration;
-        const remaining = Math.max(0, dur - pos);
+        const targetExit = deck.cueOutSec > deck.cueInSec + 6 ? deck.cueOutSec : deck.buffer.duration;
+        const remaining = Math.max(0, targetExit - pos);
 
-        const preloadThreshold = Math.min(20, dur * 0.38);
+        // Execute planned Level 3–4 intra-track section jump at breakdown boundary
+        if (
+          this.djLevel >= 3 &&
+          deck.intraTrackJump &&
+          !deck.intraJumpExecuted &&
+          !deck.transitionTriggered &&
+          pos >= deck.intraTrackJump.fromSec
+        ) {
+          this.triggerIntraTrackSectionJump(deck);
+          continue;
+        }
+
+        const preloadThreshold = Math.min(20, Math.max(6, (targetExit - deck.cueInSec) * 0.38));
         if (!deck.preloadSignaled && remaining <= preloadThreshold) {
           deck.preloadSignaled = true;
           this.callbacks.onPreloadWindow?.(deck.deckId, deck.meta.submissionId);
         }
 
         const baseTransWindow = this.djLevel >= 3 ? 10 : this.djLevel === 2 ? 7 : 6;
-        const transDuration = Math.min(baseTransWindow, dur * 0.25);
+        const transDuration = Math.min(baseTransWindow, Math.max(2, (targetExit - deck.cueInSec) * 0.25));
         if (!deck.transitionTriggered && remaining <= transDuration) {
           const prepared = this.decks.find(
-            (d) => d.deckId !== deck.deckId && !d.isPlaying && d.buffer !== null && d.meta !== null
+            (d) =>
+              d.deckId !== deck.deckId &&
+              !d.isPlaying &&
+              !d.isLayering &&
+              d.buffer !== null &&
+              d.meta !== null
           );
           if (prepared) {
             this.triggerAutomatedTransition(
@@ -1015,6 +1538,15 @@ class FourDeckWebAudioEngine {
     this.decks[deckId].channelGain.gain.setTargetAtTime(gain, this.ctx.currentTime, 0.03);
   }
 
+  public setDeckTempo(deckId: number, rate: number): void {
+    if (!this.ctx || !this.decks[deckId]) return;
+    const clamped = Math.max(0.5, Math.min(1.5, rate));
+    const src = this.decks[deckId].sourceNode;
+    if (src) {
+      src.playbackRate.setTargetAtTime(clamped, this.ctx.currentTime, 0.03);
+    }
+  }
+
   public setDeckFilter(deckId: number, pos: number): void {
     if (!this.ctx || !this.decks[deckId]) return;
     const f = this.decks[deckId].filter;
@@ -1073,6 +1605,9 @@ class FourDeckWebAudioEngine {
       durationSec: d.buffer ? d.buffer.duration : 0,
       bpm: d.meta?.bpm ?? null,
       camelotKey: d.meta?.camelotKey ?? null,
+      sectionLabel: d.buffer ? d.sectionLabel : null,
+      cueInSec: d.cueInSec,
+      cueOutSec: d.cueOutSec,
     }));
   }
 }

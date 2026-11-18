@@ -61,6 +61,15 @@ export interface DjRecommendation {
   technique_reason: string;
 }
 
+export interface TrackSectionMarker {
+  section_type: 'intro' | 'groove' | 'breakdown' | 'build' | 'drop' | 'peak' | 'outro' | 'phrase' | string;
+  start_ms: number;
+  end_ms: number;
+  energy_level: number;
+  bass_energy?: number;
+  confidence?: number;
+}
+
 export interface DjTechniqueExecutionRecord {
   id: string;
   timestamp: number;
@@ -76,6 +85,10 @@ export interface DjTechniqueExecutionRecord {
   gainMatchDb: number;
   fallbackUsed: boolean;
   reason: string;
+  sectionLabel?: string;
+  cueInSec?: number;
+  cueOutSec?: number;
+  layeredDeckId?: number | null;
 }
 
 export interface MoodProfile {
@@ -147,6 +160,8 @@ export interface PlayableCandidatePointer {
   bpm?: number | null;
   camelot_key?: string | null;
   duration_ms?: number | null;
+  overall_energy?: number | null;
+  sections?: TrackSectionMarker[];
 }
 
 export interface LocalTempCacheStats {

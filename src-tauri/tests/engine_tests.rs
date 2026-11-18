@@ -3858,6 +3858,489 @@ mod tests {
         assert!(recs[0].missing_signals.iter().any(|m| m.contains("key")));
         assert_eq!(recs[0].suggested_technique, "safe_quick_cut");
     }
+
+    /// Regression test: verifies PhraseDetector performs real deterministic DSP bar/phrase analysis
+    /// (detecting intro, groove, breakdown, build, drop/peak, outro with confidence) and stays honest
+    /// on flat audio (low-confidence "phrase" fallback, never fabricating semantic drops).
+    #[test]
+    fn test_phrase_detector_real_dsp_sections_and_flat_audio_honesty() {
+        use dhun_lib::analysis::phrase_detector::PhraseDetector;
+        use std::sync::Arc;
+
+        let sr = 44_100u32;
+        let bpm = 120.0; // 1 beat = 0.5s, 1 bar = 2s, 8-bar phrase = 16s
+        let duration_sec = 96usize; // 6 x 16s phrases
+        let total_frames = sr as usize * duration_sec;
+        let mut samples = Vec::with_capacity(total_frames * 2);
+
+        // Build 6 distinct 16-second structural sections:
+        // 0: intro (low amp 0.08, high tone)
+        // 1: groove (mid amp 0.28, steady 90 Hz bass + 440 Hz lead)
+        // 2: breakdown (low amp 0.10, no bass — only 880 Hz pad)
+        // 3: build (rising amp 0.14 -> 0.40)
+        // 4: drop/peak (high amp 0.55, strong 65 Hz sub-bass + 440 Hz synth)
+        // 5: outro (quiet amp 0.09)
+        for frame in 0..total_frames {
+            let t = frame as f64 / sr as f64;
+            let phrase_idx = (frame / (sr as usize * 16)).min(5);
+            let local_frac = (frame % (sr as usize * 16)) as f64 / (sr as f64 * 16.0);
+            let s = match phrase_idx {
+                0 => 0.08 * (2.0 * std::f64::consts::PI * 520.0 * t).sin(),
+                1 => {
+                    0.22 * (2.0 * std::f64::consts::PI * 90.0 * t).sin()
+                        + 0.14 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+                }
+                2 => 0.10 * (2.0 * std::f64::consts::PI * 880.0 * t).sin(),
+                3 => {
+                    let amp = 0.14 + 0.24 * local_frac;
+                    amp * (2.0 * std::f64::consts::PI * 330.0 * t).sin()
+                }
+                4 => {
+                    0.45 * (2.0 * std::f64::consts::PI * 65.0 * t).sin()
+                        + 0.28 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+                }
+                _ => 0.09 * (2.0 * std::f64::consts::PI * 392.0 * t).sin(),
+            } as f32;
+            samples.push(s);
+            samples.push(s);
+        }
+
+        let (phrases, energy, _dance, mix_in_ms, mix_out_ms) =
+            PhraseDetector::analyze_phrasing_with_downbeat(
+                &Arc::new(samples),
+                sr,
+                bpm,
+                0,
+                (duration_sec * 1000) as u64,
+            );
+
+        assert_eq!(phrases.len(), 6, "Expected 6 beat/phrase-aligned 8-bar sections");
+        assert!(energy > 0.2);
+        assert_eq!(phrases[0].section_type, "intro");
+        assert_eq!(phrases[5].section_type, "outro");
+        assert!(
+            phrases.iter().any(|p| p.section_type == "breakdown" && p.confidence >= 0.55),
+            "Must detect low-bass/low-energy breakdown cleanly: {:?}",
+            phrases
+        );
+        assert!(
+            phrases.iter().any(|p| (p.section_type == "drop" || p.section_type == "peak") && p.confidence >= 0.60),
+            "Must detect high-energy bass drop/peak cleanly: {:?}",
+            phrases
+        );
+        assert!(mix_in_ms > 0, "Recommended mix-in should skip quiet intro");
+        assert!(mix_out_ms < (duration_sec * 1000) as i64, "Recommended mix-out should precede outro");
+
+        // Flat constant-energy sine wave: MUST stay honest and NOT fabricate confident drops/breakdowns
+        let flat_frames = sr as usize * 48;
+        let mut flat_samples = Vec::with_capacity(flat_frames * 2);
+        for frame in 0..flat_frames {
+            let t = frame as f64 / sr as f64;
+            let s = (0.25 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as f32;
+            flat_samples.push(s);
+            flat_samples.push(s);
+        }
+        let (flat_phrases, _, _, _, _) = PhraseDetector::analyze_phrasing_with_downbeat(
+            &Arc::new(flat_samples),
+            sr,
+            bpm,
+            0,
+            48_000,
+        );
+        assert!(
+            flat_phrases.iter().all(|p| p.confidence <= 0.50),
+            "Flat audio must report low structural confidence rather than faking drops: {:?}",
+            flat_phrases
+        );
+        assert!(
+            flat_phrases.iter().any(|p| p.section_type == "phrase"),
+            "Flat audio body must honestly fall back to generic 'phrase': {:?}",
+            flat_phrases
+        );
+    }
+
+    /// Regression test for async submission intake queue:
+    /// - Rapid duplicate URL deduplication (returns same submission_id, zero duplicate rows/jobs)
+    /// - Authorized audio end-to-end persistence of `cache_id` + `next_playable_candidate` + real `sections`
+    /// - Transient failure automatic retry (attempts < 3) without duplicating submissions
+    /// - Failed submission manual re-submission reuses the SAME `submission_id` (`retry_queued`)
+    /// - Stale in-flight job recovery (`recover_stale_intake_jobs`)
+    /// - WebSocket `dj.submission_ready` payload matches persisted SQLite DB state (`cache_id`, `acquisition_status`)
+    #[tokio::test]
+    async fn test_async_intake_queue_authorized_audio_cache_id_dedup_retry_and_stale_recovery_in_process() {
+        use axum::extract::{ConnectInfo, Path, State};
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use dhun_lib::library::pipeline::AuthorizedStreamProof;
+        use dhun_lib::library::resolver::AuthorizedResolverConfig;
+        use dhun_lib::network::local_helper_routes::{
+            create_local_room, get_host_room_dashboard, process_single_intake_job,
+            start_local_room, submit_song_to_local_room, CreateLocalRoomRequest,
+            LocalHelperState, UnifiedSongSubmissionRequest,
+        };
+        use dhun_lib::sync::MetadataSyncManager;
+        use sha2::{Digest, Sha256};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        // 1. Build a valid synthetic 4-second 16-bit stereo 44.1kHz WAV fixture in memory
+        let sample_rate: u32 = 44_100;
+        let num_frames: u32 = sample_rate * 4;
+        let data_bytes: u32 = num_frames * 2 * 2;
+        let mut wav_bytes = Vec::with_capacity((44 + data_bytes) as usize);
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVEfmt ");
+        wav_bytes.extend_from_slice(&16u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav_bytes.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        wav_bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        wav_bytes.extend_from_slice(&(sample_rate * 4).to_le_bytes());
+        wav_bytes.extend_from_slice(&4u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&16u16.to_le_bytes());
+        wav_bytes.extend_from_slice(b"data");
+        wav_bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for f in 0..num_frames {
+            let t = f as f64 / sample_rate as f64;
+            let sample = ((0.35 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) * 32767.0) as i16;
+            wav_bytes.extend_from_slice(&sample.to_le_bytes());
+            wav_bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let wav_sha = format!("{:x}", Sha256::digest(&wav_bytes));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wav_bytes_arc = Arc::new(wav_bytes.clone());
+        let audio_url_for_resolver = format!("http://127.0.0.1:{}/audio/test.wav", addr.port());
+        let sha_for_resolver = wav_sha.clone();
+
+        let mock_router = Router::new()
+            .route(
+                "/resolve",
+                axum::routing::post(move || {
+                    let url = audio_url_for_resolver.clone();
+                    let sha = sha_for_resolver.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "direct_https_audio_url": url,
+                            "license_or_authorization_note": "Automated test fixture license",
+                            "expected_sha256": sha
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/audio/test.wav",
+                get(move || {
+                    let bytes = wav_bytes_arc.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+                            (*bytes).clone(),
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_router).await;
+        });
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_async_auth_{}", uuid::Uuid::new_v4()));
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let resolver_cfg = AuthorizedResolverConfig::new_with_loopback(
+            format!("http://127.0.0.1:{}/resolve", addr.port()),
+            None,
+            true,
+        )
+        .unwrap();
+        let state = Arc::new(
+            LocalHelperState::new(
+                db.clone(),
+                47821,
+                temp_cache.clone(),
+                sync_mgr,
+                Some(Some("192.168.1.50".to_string())),
+                vec![],
+            )
+            .with_audio_resolver(Some(resolver_cfg)),
+        );
+        let mut ws_rx = state.ws_tx.subscribe();
+        let host_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+
+        let Json(created) = create_local_room(
+            State(state.clone()),
+            ConnectInfo(host_addr),
+            HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Async Auth Regression".to_string(),
+                dj_level: Some(3),
+                primary_mood_id: Some("house_party".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut host_headers = HeaderMap::new();
+        host_headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", created.host_token)).unwrap(),
+        );
+        let _ = start_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+        )
+        .await
+        .unwrap();
+
+        // 2. Rapid submission + duplicate URL submission must deduplicate cleanly
+        let Json(sub1) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sub1.status, "received_by_dj");
+
+        let Json(dup1) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://youtu.be/dQw4w9WgXcQ".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dup1.status, "already_queued", "Duplicate video ID in same room must deduplicate");
+        assert_eq!(dup1.id, sub1.id, "Duplicate URL must return the existing persistent submission ID");
+        assert_eq!(db.get_pending_intake_job_count(&created.room.room_id).unwrap(), 1);
+
+        // 3. Process the queued job -> verify `cache_id` IS persisted in SQLite & `next_playable_candidate` populated!
+        let job1 = db.claim_next_submission_intake_job().unwrap().expect("Job 1 must be claimable");
+        assert!(process_single_intake_job(&state, &job1).await);
+
+        let Json(dash) = get_host_room_dashboard(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+        )
+        .await
+        .unwrap();
+        let next_playable = dash
+            .next_playable_candidate
+            .expect("Async-processed authorized track MUST persist cache_id and become next_playable_candidate");
+        assert_eq!(next_playable.submission_id, sub1.id);
+        assert!(!next_playable.cache_id.is_empty());
+        assert!(next_playable.bpm.is_some());
+        assert!(
+            !next_playable.sections.is_empty(),
+            "Async-analyzed playable track MUST expose real DSP phrase/section markers from global_song_catalogue"
+        );
+
+        // Verify WS `dj.submission_ready` reflects the exact DB `cache_id`
+        let mut saw_matching_ws = false;
+        while let Ok(evt) = ws_rx.try_recv() {
+            if evt.event_type == "dj.submission_ready"
+                && evt.payload.get("submission_id").and_then(|v| v.as_str()) == Some(sub1.id.as_str())
+            {
+                assert_eq!(
+                    evt.payload.get("cache_id").and_then(|v| v.as_str()),
+                    Some(next_playable.cache_id.as_str()),
+                    "WS submission_ready cache_id must match persisted DB cache_id"
+                );
+                assert_eq!(
+                    evt.payload.get("acquisition_status").and_then(|v| v.as_str()),
+                    Some("cached_authorized")
+                );
+                saw_matching_ws = true;
+            }
+        }
+        assert!(saw_matching_ws, "Expected matching WS dj.submission_ready event");
+
+        // 4. Simulate non-retryable failure (empty license note) -> fails cleanly -> re-submitting retries SAME submission_id
+        let Json(sub_fail) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://www.youtube.com/watch?v=9bZkp7q19f0".to_string(),
+                authorized_stream: Some(AuthorizedStreamProof {
+                    direct_https_audio_url: "https://example.com/a.wav".to_string(),
+                    license_or_authorization_note: "".to_string(),
+                    expected_sha256: None,
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let job_fail = db.claim_next_submission_intake_job().unwrap().expect("Fail job claimable");
+        assert!(process_single_intake_job(&state, &job_fail).await);
+        let subs_after_fail = db.get_local_room_submissions(&created.room.room_id).unwrap();
+        let failed_row = subs_after_fail.iter().find(|s| s.id == sub_fail.id).unwrap();
+        assert_eq!(failed_row.acquisition_status, "failed");
+
+        // Re-submit same URL -> must retry on SAME submission_id without creating a duplicate row!
+        let Json(retried) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            ConnectInfo(host_addr),
+            host_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://www.youtube.com/watch?v=9bZkp7q19f0".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.status, "retry_queued");
+        assert_eq!(retried.id, sub_fail.id, "Retry must reuse existing submission_id");
+        assert_eq!(
+            db.get_local_room_submissions(&created.room.room_id).unwrap().len(),
+            2,
+            "No duplicate submission rows should exist after dedup + retry"
+        );
+
+        // 5. Stale in-flight job recovery test
+        let stale_job = db.claim_next_submission_intake_job().unwrap().unwrap();
+        {
+            let conn = db.conn();
+            let guard = conn.lock().unwrap();
+            let old_ts = chrono::Utc::now().timestamp_millis() - 300_000;
+            guard
+                .execute(
+                    "UPDATE submission_intake_jobs SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![old_ts, stale_job.id],
+                )
+                .unwrap();
+        }
+        let recovered = db.recover_stale_intake_jobs(60_000).unwrap();
+        assert_eq!(recovered, 1, "Stale in-flight job must be recovered automatically");
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
+    /// Comprehensive recommendation engine edge-case validation:
+    /// small pool, missing BPM/key/beat grid, conflicting energy, incompatible harmonic key,
+    /// cross-genre, half/double-time BPM on Level 2, and mixed playable/processing/metadata-only tracks.
+    #[test]
+    fn test_recommendations_edge_cases_small_pool_missing_meta_clashing_key_energy_and_half_double_bpm() {
+        use dhun_lib::dj::levels::DjLevel;
+        use dhun_lib::dj::moods::get_mood_by_id;
+        use dhun_lib::dj::selector::{build_dj_recommendations, choose_technique_for_pair};
+
+        let mood = get_mood_by_id("house_party").unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let make = |id: &str,
+                    dj_status: &str,
+                    acq: &str,
+                    bpm: Option<f64>,
+                    key: Option<&str>,
+                    energy: Option<f64>,
+                    genre: &str,
+                    meta_src: &str| LocalRoomSubmission {
+            id: id.to_string(),
+            room_id: "rm_rec".to_string(),
+            submitted_by_type: "host".to_string(),
+            submitted_by_id: "host".to_string(),
+            submitted_by_name: "Host".to_string(),
+            provider: "youtube".to_string(),
+            source_url: format!("https://www.youtube.com/watch?v={:0<11}", id),
+            provider_video_id: format!("{:0<11}", id),
+            song_id: Some(format!("gsng_{}", id)),
+            title: format!("Track {}", id),
+            artist: format!("Artist {}", id),
+            version_tag: "original".to_string(),
+            thumbnail_url: None,
+            duration_ms: Some(190_000),
+            bpm,
+            half_time_bpm: bpm.map(|b| b / 2.0),
+            double_time_bpm: bpm.map(|b| b * 2.0),
+            musical_key: key.map(|k| k.to_string()),
+            camelot_key: key.map(|k| k.to_string()),
+            overall_energy: energy,
+            danceability: Some(0.8),
+            genre_tags_json: format!(r#"["{}"]"#, genre),
+            mood_tags_json: "[]".to_string(),
+            metadata_source: meta_src.to_string(),
+            acquisition_status: acq.to_string(),
+            acquisition_note: None,
+            dj_status: dj_status.to_string(),
+            dj_score: 0.0,
+            local_cache_path: if acq == "cached_authorized" { Some("/tmp/x.wav".to_string()) } else { None },
+            cache_id: if acq == "cached_authorized" { Some(format!("c_{}", id)) } else { None },
+            created_at: now,
+            updated_at: now,
+        };
+
+        // 1. Very small pool: 1 metadata-only track with missing BPM, key, energy
+        let solo = make("solo", "queued_for_dj", "restricted_by_provider", None, None, None, "Pop", "oembed");
+        let solo_recs = build_dj_recommendations(&[solo], &mood, None, mood.target_energy, DjLevel::Level2SmartMixing);
+        assert_eq!(solo_recs.len(), 1);
+        assert!(!solo_recs[0].is_playable);
+        assert_eq!(solo_recs[0].playability_label, "metadata_only_restricted");
+        assert!(solo_recs[0].missing_signals.iter().any(|s| s.contains("Beat grid")));
+
+        // 2. Clashing key (8A -> 2B), conflicting energy drop (0.88 -> 0.35), cross-genre, + processing + playable
+        let playing = make("cur", "playing", "cached_authorized", Some(128.0), Some("8A"), Some(0.88), "House", "local_analysis");
+        let clash_playable = make("clash", "queued_for_dj", "cached_authorized", Some(64.0), Some("2B"), Some(0.35), "Classical", "local_analysis");
+        let processing = make("proc", "queued_for_dj", "metadata_processing", None, None, None, "EDM", "pending");
+        let meta_only = make("meta", "queued_for_dj", "restricted_by_provider", Some(128.0), Some("8A"), Some(0.90), "House", "global_catalogue");
+
+        let recs = build_dj_recommendations(
+            &[playing.clone(), clash_playable.clone(), processing, meta_only],
+            &mood,
+            None,
+            0.85,
+            DjLevel::Level2SmartMixing,
+        );
+
+        assert_eq!(recs.len(), 3);
+        // Playable track MUST come before non-playable tracks, and unavailable tracks NEVER labeled playable!
+        assert!(recs[0].is_playable, "First recommendation must be the genuinely playable track");
+        assert_eq!(recs[0].submission_id, "clash");
+        assert!(recs[0].reasons.iter().any(|r| r.contains("Incompatible harmonic key")));
+        assert!(recs[0].reasons.iter().any(|r| r.contains("Conflicting energy drop")));
+        assert!(recs[0].reasons.iter().any(|r| r.contains("Cross-genre shift")));
+
+        let proc_rec = recs.iter().find(|r| r.submission_id == "proc").unwrap();
+        assert!(!proc_rec.is_playable);
+        assert_eq!(proc_rec.playability_label, "processing");
+
+        let meta_rec = recs.iter().find(|r| r.submission_id == "meta").unwrap();
+        assert!(!meta_rec.is_playable);
+        assert_eq!(meta_rec.playability_label, "metadata_only_restricted");
+
+        // 3. Half/double-time BPM check on Level 2 (128 BPM -> 64 BPM harmonic match => timed_bass_swap!)
+        let half_time_harmonic = make("ht", "queued_for_dj", "cached_authorized", Some(64.0), Some("8A"), Some(0.85), "House", "local_analysis");
+        let (tech_l2, _) = choose_technique_for_pair(
+            DjLevel::Level2SmartMixing,
+            Some(&playing),
+            &half_time_harmonic,
+            &mood,
+            0.95,
+        );
+        assert_eq!(
+            tech_l2, "timed_bass_swap",
+            "Level 2 must recognize 64 BPM as half-time match for 128 BPM"
+        );
+    }
 }
 
 

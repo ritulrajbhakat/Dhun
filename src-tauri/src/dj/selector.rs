@@ -439,7 +439,16 @@ pub fn choose_technique_for_pair(
     let cand_bpm = candidate.bpm;
     let bpm_known = cur_bpm.is_some() && cand_bpm.is_some();
     let bpm_pct_diff = match (cur_bpm, cand_bpm) {
-        (Some(a), Some(b)) if a > 0.0 => (a - b).abs() / a,
+        (Some(a), Some(b)) if a > 0.0 && b > 0.0 => {
+            let direct = (a - b).abs() / a;
+            if dj_level >= DjLevel::Level2SmartMixing {
+                let half = (a - b * 2.0).abs() / a;
+                let double = (a - b * 0.5).abs() / a;
+                direct.min(half).min(double)
+            } else {
+                direct
+            }
+        }
         _ => 1.0,
     };
 
@@ -629,6 +638,11 @@ pub fn build_dj_recommendations(
                         reasons.push(format!("Harmonic Camelot lock ({} → {})", ck, k));
                     } else if key_compat >= 0.75 {
                         reasons.push(format!("Compatible energy key lift ({} → {})", ck, k));
+                    } else if key_compat < 0.50 {
+                        reasons.push(format!(
+                            "Incompatible harmonic key ({} → {}) — avoid long tonal overlap",
+                            ck, k
+                        ));
                     }
                 }
             } else {
@@ -641,21 +655,57 @@ pub fn build_dj_recommendations(
                 if let Some(ce) = current_energy {
                     if en - ce >= 0.06 {
                         reasons.push("Raises dancefloor energy".to_string());
+                    } else if en - ce <= -0.15 {
+                        reasons.push(format!(
+                            "Conflicting energy drop ({:.0}% → {:.0}%)",
+                            ce * 100.0,
+                            en * 100.0
+                        ));
                     } else if (en - ce).abs() < 0.06 {
                         reasons.push("Maintains steady party groove".to_string());
                     }
                 } else if (en - target_energy).abs() <= 0.15 {
                     reasons.push(format!("Fits {} target energy", primary_mood.display_name));
+                } else if (en - target_energy).abs() > 0.25 {
+                    reasons.push(format!(
+                        "Energy ({:.0}%) differs from {} target ({:.0}%)",
+                        en * 100.0,
+                        primary_mood.display_name,
+                        target_energy * 100.0
+                    ));
                 }
             } else {
                 missing.push("Energy profile unanalyzed".to_string());
             }
 
-            if s.duration_ms.unwrap_or(0) > 0 {
-                known.push(format!("Duration {}s", s.duration_ms.unwrap_or(0) / 1000));
+            let sub_genres: Vec<String> = serde_json::from_str(&s.genre_tags_json).unwrap_or_default();
+            if !sub_genres.is_empty() {
+                let genre_matches = primary_mood.genre_weights.iter().any(|(g, _)| {
+                    sub_genres
+                        .iter()
+                        .any(|sg| sg.to_lowercase().contains(&g.to_lowercase()))
+                });
+                if genre_matches {
+                    known.push(format!("Genre {}", sub_genres[0]));
+                    reasons.push(format!("Genre matches {} mood", primary_mood.display_name));
+                } else {
+                    known.push(format!("Genre {}", sub_genres[0]));
+                    reasons.push(format!(
+                        "Cross-genre shift ({} vs {} mood)",
+                        sub_genres[0], primary_mood.display_name
+                    ));
+                }
+            }
+
+            let has_local_analysis = s.metadata_source == "local_analysis" && s.duration_ms.unwrap_or(0) > 0;
+            if has_local_analysis {
+                known.push("Beat grid & phrases analyzed".to_string());
                 confidence += 0.05;
             } else {
-                missing.push("Phrase alignment unknown".to_string());
+                if s.duration_ms.unwrap_or(0) > 0 {
+                    known.push(format!("Duration {}s", s.duration_ms.unwrap_or(0) / 1000));
+                }
+                missing.push("Beat grid & phrase alignment unverified".to_string());
             }
 
             let is_playable = s.acquisition_status == "cached_authorized"

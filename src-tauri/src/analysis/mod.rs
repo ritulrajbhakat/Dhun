@@ -30,7 +30,7 @@ pub fn analyze_track_file<P: AsRef<Path>>(track_id: &str, file_path: P) -> Resul
     
     let downbeat_offset_ms = BpmDetector::detect_downbeat_offset(&decoded.samples, decoded.sample_rate, bpm);
     let (phrase_markers, overall_energy, dance_suitability, mix_in_ms, mix_out_ms) =
-        PhraseDetector::analyze_phrasing_and_energy(&decoded.samples, decoded.sample_rate, bpm, decoded.duration_ms);
+        PhraseDetector::analyze_phrasing_with_downbeat(&decoded.samples, decoded.sample_rate, bpm, downbeat_offset_ms, decoded.duration_ms);
 
     let beat_grid = BeatGridGenerator::generate_grid(bpm, downbeat_offset_ms, decoded.duration_ms);
 

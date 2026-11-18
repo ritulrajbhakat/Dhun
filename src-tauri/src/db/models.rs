@@ -61,10 +61,14 @@ pub struct BeatGridPoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhraseMarker {
-    pub section_type: String, // 'intro', 'verse', 'chorus', 'bridge', 'drop', 'outro'
+    pub section_type: String, // 'intro', 'groove', 'breakdown', 'build', 'drop', 'peak', 'outro', 'phrase'
     pub start_ms: i64,
     pub end_ms: i64,
     pub energy_level: f64,
+    #[serde(default)]
+    pub bass_energy: f64,
+    #[serde(default)]
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

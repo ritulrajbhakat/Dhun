@@ -1364,6 +1364,8 @@ impl Database {
     }
 
     /// Persists resolved metadata, local Symphonia analysis, and cache linkage for an asynchronously processed submission.
+    /// Intentionally preserves `dj_status` and `dj_score` so concurrent playback/evaluation is never corrupted.
+    /// Note: `cache_id` is stored via `local_temp_cache.submission_id` and joined in `get_local_room_submissions`.
     pub fn update_submission_pipeline_result(&self, sub: &LocalRoomSubmission) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp_millis();
@@ -1417,6 +1419,38 @@ impl Database {
         Ok(())
     }
 
+    /// Looks up an active (non-played, non-skipped) submission in a room for duplicate URL deduplication.
+    pub fn find_active_submission_by_video_id(
+        &self,
+        room_id: &str,
+        provider_video_id: &str,
+    ) -> Result<Option<LocalRoomSubmission>> {
+        let subs = self.get_local_room_submissions(room_id)?;
+        Ok(subs.into_iter().find(|s| {
+            s.provider_video_id == provider_video_id
+                && matches!(s.dj_status.as_str(), "queued_for_dj" | "prepared" | "playing")
+        }))
+    }
+
+    /// Reads analyzed phrase/section markers from `global_song_catalogue` for a given `song_id` (if analyzed).
+    pub fn get_phrase_markers_for_song(&self, song_id: &str) -> Result<Vec<PhraseMarker>> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT phrase_markers_json FROM global_song_catalogue WHERE song_id = ?1 LIMIT 1",
+                params![song_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(json) = raw {
+            if let Ok(markers) = serde_json::from_str::<Vec<PhraseMarker>>(&json) {
+                return Ok(markers);
+            }
+        }
+        Ok(Vec::new())
+    }
+
     // ========================================================================
     // Persistent Asynchronous Submission Intake Queue (`submission_intake_jobs`)
     // ========================================================================
@@ -1444,6 +1478,29 @@ impl Database {
         Ok(())
     }
 
+    /// Re-queues an existing failed intake job for the SAME `submission_id` without creating duplicate rows.
+    pub fn requeue_failed_submission_intake_job(
+        &self,
+        submission_id: &str,
+        raw_url: &str,
+        authorized_stream_json: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let updated = conn.execute(
+            "UPDATE submission_intake_jobs
+             SET raw_url = ?1,
+                 authorized_stream_json = COALESCE(?2, authorized_stream_json),
+                 status = 'received',
+                 attempts = 0,
+                 last_error = NULL,
+                 updated_at = ?3
+             WHERE submission_id = ?4",
+            params![raw_url, authorized_stream_json, now, submission_id],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Resets any jobs interrupted mid-flight by a helper restart back to `'received'` so they resume cleanly.
     pub fn recover_interrupted_intake_jobs(&self) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
@@ -1457,10 +1514,30 @@ impl Database {
         Ok(count)
     }
 
-    /// Atomically claims the oldest queued intake job (`status = 'received'`) for background processing.
+    /// Resets in-flight jobs that have stalled longer than `stale_after_ms` back to `'received'`
+    /// (up to retry limit 3), preventing permanent stuck queue states.
+    pub fn recover_stale_intake_jobs(&self, stale_after_ms: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let cutoff = now - stale_after_ms.max(5_000);
+        let count = conn.execute(
+            "UPDATE submission_intake_jobs
+             SET status = CASE WHEN attempts < 3 THEN 'received' ELSE 'failed' END,
+                 last_error = COALESCE(last_error, 'Recovered stale in-flight intake job'),
+                 updated_at = ?1
+             WHERE status IN ('metadata_processing', 'awaiting_authorized_audio', 'analysing')
+               AND updated_at < ?2",
+            params![now, cutoff],
+        )?;
+        Ok(count)
+    }
+
+    /// Atomically claims the oldest eligible queued intake job (`status = 'received'`, `attempts < 3`,
+    /// respecting retry backoff for previously failed attempts) for background processing.
     pub fn claim_next_submission_intake_job(&self) -> Result<Option<SubmissionIntakeJob>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp_millis();
 
         let next_job: Option<SubmissionIntakeJob> = {
             let mut stmt = tx.prepare(
@@ -1468,11 +1545,21 @@ impl Database {
                         j.status, j.attempts, j.last_error, j.created_at, j.updated_at
                  FROM submission_intake_jobs j
                  JOIN local_party_rooms r ON r.room_id = j.room_id
-                 WHERE j.status = 'received' AND r.status != 'closed'
+                 WHERE j.status = 'received'
+                   AND j.attempts < 3
+                   AND r.status != 'closed'
+                   AND (
+                        j.attempts = 0
+                        OR j.last_error IS NULL
+                        OR (j.attempts = 1 AND j.updated_at <= ?1)
+                        OR (j.attempts >= 2 AND j.updated_at <= ?2)
+                   )
                  ORDER BY j.created_at ASC
                  LIMIT 1",
             )?;
-            let mut rows = stmt.query_map([], |row| {
+            let retry1_cutoff = now - 1_500;
+            let retry2_cutoff = now - 4_000;
+            let mut rows = stmt.query_map(params![retry1_cutoff, retry2_cutoff], |row| {
                 Ok(SubmissionIntakeJob {
                     id: row.get(0)?,
                     room_id: row.get(1)?,
@@ -1493,7 +1580,6 @@ impl Database {
         };
 
         if let Some(mut job) = next_job {
-            let now = chrono::Utc::now().timestamp_millis();
             job.status = "metadata_processing".to_string();
             job.attempts += 1;
             job.updated_at = now;
@@ -1537,6 +1623,36 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    pub fn get_submission_intake_jobs_for_room(&self, room_id: &str) -> Result<Vec<SubmissionIntakeJob>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, room_id, submission_id, raw_url, authorized_stream_json,
+                    status, attempts, last_error, created_at, updated_at
+             FROM submission_intake_jobs
+             WHERE room_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![room_id], |row| {
+            Ok(SubmissionIntakeJob {
+                id: row.get(0)?,
+                room_id: row.get(1)?,
+                submission_id: row.get(2)?,
+                raw_url: row.get(3)?,
+                authorized_stream_json: row.get(4)?,
+                status: row.get(5)?,
+                attempts: row.get(6)?,
+                last_error: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        let mut jobs = Vec::new();
+        for r in rows {
+            jobs.push(r?);
+        }
+        Ok(jobs)
     }
 
     // ========================================================================

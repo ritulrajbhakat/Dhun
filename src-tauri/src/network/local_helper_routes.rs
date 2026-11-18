@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::db::models::{
     GuestOwnSubmissionView, LocalPartyRoom, LocalRoomGuest, LocalRoomSubmission,
-    LocalTempCacheStats, SubmissionIntakeJob, SyncStatusOverview,
+    LocalTempCacheStats, PhraseMarker, SubmissionIntakeJob, SyncStatusOverview,
 };
 use crate::db::Database;
 use crate::dj::levels::{DjLevel, DjSkillProfile};
@@ -393,6 +393,8 @@ pub struct PlayableCandidatePointer {
     pub bpm: Option<f64>,
     pub camelot_key: Option<String>,
     pub duration_ms: Option<i64>,
+    pub overall_energy: Option<f64>,
+    pub sections: Vec<PhraseMarker>,
 }
 
 #[derive(Debug, Serialize)]
@@ -499,11 +501,20 @@ pub struct PlaybackEventResponse {
 // Helper: Build Playable Pointer & Score Room
 // ============================================================================
 
-fn build_playable_pointer(room_id: &str, sub: &LocalRoomSubmission) -> Option<PlayableCandidatePointer> {
+fn build_playable_pointer(
+    room_id: &str,
+    sub: &LocalRoomSubmission,
+    db: &Database,
+) -> Option<PlayableCandidatePointer> {
     if sub.acquisition_status != "cached_authorized" {
         return None;
     }
     let cache_id = sub.cache_id.as_ref()?;
+    let sections = sub
+        .song_id
+        .as_deref()
+        .and_then(|sid| db.get_phrase_markers_for_song(sid).ok())
+        .unwrap_or_default();
     Some(PlayableCandidatePointer {
         submission_id: sub.id.clone(),
         cache_id: cache_id.clone(),
@@ -513,6 +524,8 @@ fn build_playable_pointer(room_id: &str, sub: &LocalRoomSubmission) -> Option<Pl
         bpm: sub.bpm,
         camelot_key: sub.camelot_key.clone(),
         duration_ms: sub.duration_ms,
+        overall_energy: sub.overall_energy,
+        sections,
     })
 }
 
@@ -590,7 +603,7 @@ fn evaluate_and_find_next_playable(
         primary_mood.transition_style.clone()
     };
 
-    let next_ptr = next_sub.and_then(|s| build_playable_pointer(&room.room_id, s));
+    let next_ptr = next_sub.and_then(|s| build_playable_pointer(&room.room_id, s, db));
 
     (scored, next_ptr, transition_style, recommendations)
 }
@@ -693,7 +706,9 @@ pub async fn process_single_intake_job(state: &LocalHelperState, job: &Submissio
     current_sub.metadata_source = metadata_source.clone();
     current_sub.acquisition_status = "awaiting_authorized_audio".to_string();
     current_sub.acquisition_note = Some("Metadata resolved; checking authorized audio source...".to_string());
-    let _ = state.db.update_submission_pipeline_result(&current_sub);
+    if let Err(e) = state.db.update_submission_pipeline_result(&current_sub) {
+        warn!("Failed to persist async pipeline result for submission {}: {}", current_sub.id, e);
+    }
     let _ = state
         .db
         .update_submission_intake_job_status(&job.id, "awaiting_authorized_audio", None);
@@ -782,7 +797,15 @@ pub async fn process_single_intake_job(state: &LocalHelperState, job: &Submissio
         }
     }
 
-    // Finalize submission record
+    let is_transient_failure = acq_status == AcquisitionStatus::Failed
+        && !acq_note.contains("Security violation")
+        && !acq_note.contains("license declaration")
+        && !acq_note.contains("SHA-256")
+        && !acq_note.contains("Invalid URL");
+
+    let will_retry = is_transient_failure && job.attempts < 3;
+
+    // Finalize submission record (or mark awaiting retry if transient failure and retries remain)
     current_sub.duration_ms = if metadata.duration_ms > 0 {
         Some(metadata.duration_ms)
     } else {
@@ -796,20 +819,34 @@ pub async fn process_single_intake_job(state: &LocalHelperState, job: &Submissio
     current_sub.overall_energy = metadata.overall_energy;
     current_sub.danceability = metadata.danceability;
     current_sub.metadata_source = metadata_source;
-    current_sub.acquisition_status = acq_status.as_str().to_string();
-    current_sub.acquisition_note = Some(acq_note.clone());
+    if will_retry {
+        current_sub.acquisition_status = "awaiting_authorized_audio".to_string();
+        current_sub.acquisition_note = Some(format!(
+            "Transient network/resolver failure (attempt {}/3); queued for automatic retry: {}",
+            job.attempts, acq_note
+        ));
+    } else {
+        current_sub.acquisition_status = acq_status.as_str().to_string();
+        current_sub.acquisition_note = Some(acq_note.clone());
+    }
     current_sub.local_cache_path = cached_entry.as_ref().map(|c| c.file_path.clone());
     current_sub.cache_id = cached_entry.as_ref().map(|c| c.id.clone());
 
-    let _ = state.db.update_submission_pipeline_result(&current_sub);
+    if let Err(e) = state.db.update_submission_pipeline_result(&current_sub) {
+        warn!("Failed to persist async pipeline result for submission {}: {}", current_sub.id, e);
+    }
 
     // Stage 6: Metadata-only sync (offline-safe outbox, zero audio bytes)
     let _ = stage_6_sync_metadata_only(&parsed, &metadata, &state.sync_manager, &state.db).await;
 
-    let final_job_status = match acq_status {
-        AcquisitionStatus::CachedAuthorized => "ready",
-        AcquisitionStatus::RestrictedByProvider => "restricted_by_provider",
-        AcquisitionStatus::Failed => "failed",
+    let final_job_status = if will_retry {
+        "received"
+    } else {
+        match acq_status {
+            AcquisitionStatus::CachedAuthorized => "ready",
+            AcquisitionStatus::RestrictedByProvider => "restricted_by_provider",
+            AcquisitionStatus::Failed => "failed",
+        }
     };
     let final_err = if acq_status == AcquisitionStatus::Failed {
         Some(acq_note.as_str())
@@ -820,25 +857,43 @@ pub async fn process_single_intake_job(state: &LocalHelperState, job: &Submissio
         .db
         .update_submission_intake_job_status(&job.id, final_job_status, final_err);
 
-    // Re-evaluate DJ recommendations and push real-time WebSocket notification
+    // Re-evaluate DJ recommendations and push real-time WebSocket notification reflecting DB truth
     if let Ok(Some(room)) = state.db.get_local_party_room(&job.room_id) {
         if room.status != "closed" {
             let _ = evaluate_and_find_next_playable(&room, &state.db);
         }
     }
 
+    let persisted_sub = state
+        .db
+        .get_local_room_submissions(&job.room_id)
+        .ok()
+        .and_then(|subs| subs.into_iter().find(|s| s.id == job.submission_id))
+        .unwrap_or(current_sub);
+
+    let ws_event_name = if will_retry {
+        "dj.submission_updated"
+    } else {
+        "dj.submission_ready"
+    };
+
     state.broadcast_event(
         &job.room_id,
-        "dj.submission_ready",
+        ws_event_name,
         true,
         None,
         serde_json::json!({
-            "submission_id": job.submission_id,
-            "title": current_sub.title,
-            "artist": current_sub.artist,
-            "acquisition_status": current_sub.acquisition_status,
-            "bpm": current_sub.bpm,
-            "camelot_key": current_sub.camelot_key
+            "submission_id": persisted_sub.id,
+            "title": persisted_sub.title,
+            "artist": persisted_sub.artist,
+            "acquisition_status": persisted_sub.acquisition_status,
+            "cache_id": persisted_sub.cache_id,
+            "dj_status": persisted_sub.dj_status,
+            "dj_score": persisted_sub.dj_score,
+            "bpm": persisted_sub.bpm,
+            "camelot_key": persisted_sub.camelot_key,
+            "attempts": job.attempts,
+            "will_retry": will_retry
         }),
     );
 
@@ -855,7 +910,16 @@ pub fn start_intake_queue_worker(state: Arc<LocalHelperState>) -> tokio::task::J
 
     tokio::spawn(async move {
         info!("Persistent async submission intake worker started.");
+        let mut tick_count: u64 = 0;
         loop {
+            tick_count = tick_count.wrapping_add(1);
+            if tick_count % 15 == 0 {
+                let stale = state.db.recover_stale_intake_jobs(120_000).unwrap_or(0);
+                if stale > 0 {
+                    warn!("Recovered {} stale in-flight submission intake job(s).", stale);
+                }
+            }
+
             let mut processed_any = false;
             while let Ok(Some(job)) = state.db.claim_next_submission_intake_job() {
                 processed_any = true;
@@ -1692,6 +1756,84 @@ pub async fn submit_song_to_local_room(
     let parsed = stage_1_validate_and_identify(&req.url)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid song submission: {}", e)))?;
 
+    let auth_json = req
+        .authorized_stream
+        .as_ref()
+        .and_then(|p| serde_json::to_string(p).ok());
+
+    // Duplicate URL deduplication & idempotent retry of previously failed submissions (never creates duplicate rows!)
+    if let Ok(Some(existing_sub)) = state
+        .db
+        .find_active_submission_by_video_id(&room_id, &parsed.video_id)
+    {
+        if existing_sub.acquisition_status == "failed" {
+            let retry_note = "Retrying previously failed submission on the same persistent submission ID.".to_string();
+            let _ = state.db.update_submission_processing_stage(
+                &existing_sub.id,
+                "received",
+                Some(&retry_note),
+            );
+            let requeued = state
+                .db
+                .requeue_failed_submission_intake_job(
+                    &existing_sub.id,
+                    &parsed.canonical_url,
+                    auth_json.as_deref(),
+                )
+                .unwrap_or(false);
+            if !requeued {
+                let retry_job = SubmissionIntakeJob {
+                    id: format!("job_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]),
+                    room_id: room_id.clone(),
+                    submission_id: existing_sub.id.clone(),
+                    raw_url: parsed.canonical_url.clone(),
+                    authorized_stream_json: auth_json,
+                    status: "received".to_string(),
+                    attempts: 0,
+                    last_error: None,
+                    created_at: chrono::Utc::now().timestamp_millis(),
+                    updated_at: chrono::Utc::now().timestamp_millis(),
+                };
+                let _ = state.db.enqueue_submission_intake_job(&retry_job);
+            }
+            state.intake_notify.notify_one();
+            return Ok(Json(UnifiedSongSubmissionResponse {
+                id: existing_sub.id,
+                submitted_by_type: existing_sub.submitted_by_type,
+                title: existing_sub.title,
+                artist: existing_sub.artist,
+                version_tag: existing_sub.version_tag,
+                provider: existing_sub.provider,
+                status: "retry_queued".to_string(),
+                metadata_source: existing_sub.metadata_source,
+                acquisition_status: "received".to_string(),
+                acquisition_note: retry_note,
+                cache_id: existing_sub.cache_id,
+                dj_score: existing_sub.dj_score,
+                interrupted_current_track: false,
+            }));
+        }
+
+        // Already active (queued, processing, prepared, or playing) — return idempotently without duplicating!
+        return Ok(Json(UnifiedSongSubmissionResponse {
+            id: existing_sub.id,
+            submitted_by_type: existing_sub.submitted_by_type,
+            title: existing_sub.title,
+            artist: existing_sub.artist,
+            version_tag: existing_sub.version_tag,
+            provider: existing_sub.provider,
+            status: "already_queued".to_string(),
+            metadata_source: existing_sub.metadata_source,
+            acquisition_status: existing_sub.acquisition_status,
+            acquisition_note: existing_sub.acquisition_note.unwrap_or_else(|| {
+                "Track is already in this party's DJ candidate pool (deduplicated).".to_string()
+            }),
+            cache_id: existing_sub.cache_id,
+            dj_score: existing_sub.dj_score,
+            interrupted_current_track: false,
+        }));
+    }
+
     let submission_id = format!("sub_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
     let job_id = format!("job_{}", &Uuid::new_v4().to_string().replace('-', "")[..12]);
     let now = chrono::Utc::now().timestamp_millis();
@@ -1772,11 +1914,6 @@ pub async fn submit_song_to_local_room(
         .db
         .insert_local_room_submission(&submission)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let auth_json = req
-        .authorized_stream
-        .as_ref()
-        .and_then(|p| serde_json::to_string(p).ok());
 
     let intake_job = SubmissionIntakeJob {
         id: job_id,
