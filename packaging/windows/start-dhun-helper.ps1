@@ -35,6 +35,18 @@ if (Test-Path $PidFile) {
 Stop-Process -Name "dhun-local-helper" -Force -ErrorAction SilentlyContinue
 
 $env:DHUN_LOCAL_PORT = "$Port"
+if (-not $ResolverUrl) {
+    foreach ($candPort in @(8000, 8080)) {
+        try {
+            $probe = Invoke-RestMethod -Uri "http://127.0.0.1:$candPort/api/local/health" -TimeoutSec 1 -ErrorAction SilentlyContinue
+            if ($probe -and ($probe.status -eq "healthy" -or $probe.status -eq "ok")) {
+                $ResolverUrl = "http://127.0.0.1:$candPort/resolve"
+                Write-Host "  Auto-detected active local audio resolver at $ResolverUrl" -ForegroundColor Cyan
+                break
+            }
+        } catch {}
+    }
+}
 if ($ResolverUrl) {
     $env:DHUN_AUDIO_RESOLVER_URL = $ResolverUrl
     if ($AllowLoopbackResolver -or $ResolverUrl -match '^https?://(127\.0\.0\.1|localhost)(:\d+)?/') {

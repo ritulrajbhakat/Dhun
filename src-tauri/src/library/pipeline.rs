@@ -185,6 +185,21 @@ pub async fn stage_3_authorized_acquisition(
         );
     }
 
+    if let Ok((loopback_file_url, loopback_addr)) =
+        crate::library::resolver::validate_loopback_resolver_url(&proof.direct_https_audio_url)
+    {
+        return crate::library::resolver::fetch_and_ingest_loopback_audio(
+            parsed,
+            &loopback_file_url,
+            loopback_addr,
+            None,
+            proof.expected_sha256.as_deref(),
+            downloader.cache_dir(),
+            db,
+        )
+        .await;
+    }
+
     let safe_name = format!("auth_{}", parsed.video_id);
     match downloader
         .download_audio(

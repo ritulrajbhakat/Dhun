@@ -100,6 +100,8 @@ export interface MeterAnalysis {
 export interface TrackTimingProfile {
   average_bpm: number;
   beatgrid_confidence: number;
+  bpm_confidence?: number;
+  downbeat_confidence?: number;
   downbeat_offset_ms: number;
   is_variable_tempo: boolean;
   tempo_drift_bpm: number;
@@ -154,9 +156,14 @@ export interface TransitionDecisionPlan {
   meter_compatible: boolean;
   meter_summary: string;
   beatgrid_confidence: number;
+  bpm_confidence?: number;
+  downbeat_confidence?: number;
+  meter_confidence?: number;
   duration_beats: number;
   duration_bars: number;
   duration_sec: number;
+  audio_crossfade_sec?: number;
+  musical_duration_sec?: number;
   vocal_overlap_policy: string;
   energy_progression: string;
   eq_bass_handover_schedule: EqBassHandoverSchedule;

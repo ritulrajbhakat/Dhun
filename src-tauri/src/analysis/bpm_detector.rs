@@ -137,14 +137,14 @@ impl BpmDetector {
         }
 
         // Compute weighted average BPM & genuine tempo drift across confident windows
-        let confident: Vec<&TempoSegment> = segments.iter().filter(|s| s.confidence >= 0.45).collect();
-        let ref_pool: Vec<&TempoSegment> = if confident.is_empty() {
-            segments.iter().collect()
-        } else {
-            confident
-        };
-
-        let mut bpms: Vec<f64> = ref_pool.iter().map(|s| s.bpm).collect();
+        let mut bpms: Vec<f64> = segments
+            .iter()
+            .filter(|s| s.confidence >= 0.45)
+            .map(|s| s.bpm)
+            .collect();
+        if bpms.is_empty() {
+            bpms = segments.iter().map(|s| s.bpm).collect();
+        }
         bpms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_bpm = bpms[bpms.len() / 2];
 
@@ -174,12 +174,28 @@ impl BpmDetector {
             }
         }
 
+        let (global_bpm, global_bpm_conf) = Self::detect_bpm(samples, sample_rate);
+
         let avg_bpm = if w_sum > 0.0 {
             ((w_bpm / w_sum) * 10.0).round() / 10.0
         } else {
             median_bpm
         };
-        let avg_conf = ((conf_sum / segments.len().max(1) as f64) * 100.0).round() / 100.0;
+
+        // Compute separate, honest confidence metrics:
+        // 1. Overall BPM confidence combines global 60s autocorrelation with confident segments
+        let confident_confs: Vec<f64> = segments
+            .iter()
+            .filter(|s| s.confidence >= 0.45)
+            .map(|s| s.confidence)
+            .collect();
+        let confident_conf_avg = if !confident_confs.is_empty() {
+            confident_confs.iter().sum::<f64>() / confident_confs.len() as f64
+        } else {
+            conf_sum / segments.len().max(1) as f64
+        };
+        let bpm_confidence = ((global_bpm_conf * 0.70 + confident_conf_avg * 0.30) * 100.0).round() / 100.0;
+
         let drift_bpm = if min_bpm < f64::MAX {
             ((max_bpm - min_bpm) * 10.0).round() / 10.0
         } else {
@@ -187,7 +203,7 @@ impl BpmDetector {
         };
         let is_variable_tempo = drift_bpm >= 3.5;
 
-        (avg_bpm, avg_conf, segments, drift_bpm, is_variable_tempo)
+        (avg_bpm, bpm_confidence, segments, drift_bpm, is_variable_tempo)
     }
 
     /// Detects rhythmic meter grouping (4/4, 3/4, 6/8, or honest `"uncertain"` fallback)
@@ -208,7 +224,7 @@ impl BpmDetector {
             return MeterAnalysis {
                 beats_per_bar: 4,
                 meter_label: "uncertain".to_string(),
-                confidence: 0.30,
+                confidence: 0.35,
             };
         }
 
@@ -238,7 +254,7 @@ impl BpmDetector {
             return MeterAnalysis {
                 beats_per_bar: 4,
                 meter_label: "uncertain".to_string(),
-                confidence: 0.30,
+                confidence: 0.35,
             };
         }
 
@@ -257,19 +273,21 @@ impl BpmDetector {
         let c4 = autocorr(4);
         let c6 = autocorr(6);
 
-        // Distinguish 6/8 (compound duple: strong 6-beat cycle, weaker 3-beat sub-accent) vs pure 3/4 vs 4/4
-        let (beats_per_bar, label, best_score, runner_up) = if c4 >= c3 && c4 >= c6 {
-            (4u8, "4/4", c4, c3.max(c6))
-        } else if c6 > c4 && c6 > c3 * 1.08 {
+        // Distinguish genuine 6/8 vs genuine 3/4 vs standard 4/4 (protecting syncopated 4/4 dance tracks):
+        // In 4/4 syncopated rhythms (Dhol/Bhangra, Reggaeton, Funk, Latin tresillo), lag 3 has natural energy.
+        // Therefore, 3/4 is ONLY declared when c3 strongly dominates c4 (c3 > c4 * 1.30 && c4 < 0.22).
+        let (beats_per_bar, label, best_score, runner_up) = if c6 > c4 * 1.25 && c6 > c3 * 1.10 && c6 >= 0.22 {
             (6u8, "6/8", c6, c3.max(c4))
-        } else {
+        } else if c3 > c4 * 1.30 && c4 < 0.22 && c3 >= 0.22 {
             (3u8, "3/4", c3, c4.max(c6))
+        } else {
+            (4u8, "4/4", c4.max(0.15), c3.max(c6))
         };
 
         let margin = (best_score - runner_up).max(0.0);
-        let confidence = (0.35 + best_score.max(0.0) * 0.45 + margin * 0.75).clamp(0.20, 0.96);
+        let confidence = (0.40 + best_score.max(0.0) * 0.40 + margin * 0.70).clamp(0.25, 0.96);
 
-        if best_score < 0.15 || confidence < 0.52 {
+        if best_score < 0.14 || confidence < 0.50 {
             MeterAnalysis {
                 beats_per_bar: 4,
                 meter_label: "uncertain".to_string(),
@@ -284,17 +302,16 @@ impl BpmDetector {
         }
     }
 
-    /// Detects phase-aligned downbeat offset in milliseconds from audio onset energies
-    pub fn detect_downbeat_offset(samples: &Arc<Vec<f32>>, sample_rate: u32, bpm: f64) -> i64 {
+    /// Detects downbeat offset in milliseconds and confidence from onset peak-to-average ratio
+    pub fn detect_downbeat(samples: &Arc<Vec<f32>>, sample_rate: u32, bpm: f64) -> (i64, f64) {
         let total_frames = samples.len() / 2;
         let beat_period_ms = 60000.0 / bpm.max(60.0);
         let beat_period_frames = ((sample_rate as f64 * beat_period_ms) / 1000.0) as usize;
 
         if total_frames < beat_period_frames || beat_period_frames == 0 {
-            return 0;
+            return (0, 0.40);
         }
 
-        // Subsample energy onset curve in 10ms steps across the first 4 bars (up to ~6s)
         let step_ms = 10;
         let step_frames = (sample_rate as usize * step_ms) / 1000;
         let max_search_ms = (beat_period_ms * 4.0).min(6000.0) as usize;
@@ -313,19 +330,34 @@ impl BpmDetector {
             envelope.push((sum_sq / chunk_size as f32).sqrt());
         }
 
-        // Calculate onset peaks
         let mut best_step = 0;
         let mut max_onset = 0.0f32;
+        let mut sum_onset = 0.0f32;
+        let mut onset_count = 0usize;
         for s in 1..num_steps {
-            let diff = envelope[s] - envelope[s - 1];
+            let diff = (envelope[s] - envelope[s - 1]).max(0.0);
+            sum_onset += diff;
+            onset_count += 1;
             if diff > max_onset {
                 max_onset = diff;
                 best_step = s;
             }
         }
 
+        let avg_onset = if onset_count > 0 { sum_onset / onset_count as f32 } else { 0.0 };
+        let conf = if avg_onset > 1e-5 {
+            (((max_onset / avg_onset - 1.0) / 2.5) as f64).clamp(0.25, 0.96)
+        } else {
+            0.45
+        };
+
         let detected_offset_ms = (best_step * step_ms) as f64;
         let phase_aligned = (detected_offset_ms % beat_period_ms).round() as i64;
-        phase_aligned.max(0)
+        (phase_aligned.max(0), ((conf * 100.0).round()) / 100.0)
+    }
+
+    /// Detects phase-aligned downbeat offset in milliseconds from audio onset energies
+    pub fn detect_downbeat_offset(samples: &Arc<Vec<f32>>, sample_rate: u32, bpm: f64) -> i64 {
+        Self::detect_downbeat(samples, sample_rate, bpm).0
     }
 }

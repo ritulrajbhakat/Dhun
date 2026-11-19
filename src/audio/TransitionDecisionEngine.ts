@@ -347,16 +347,24 @@ export function planDjTransition(
   const reasons: string[] = [];
   const rejectedAlternatives: RejectedTechniqueAlternative[] = [];
 
-  const outConf = outgoing.timingProfile?.beatgrid_confidence ?? (outgoing.bpm ? 0.65 : 0.25);
-  const inConf = incoming.timingProfile?.beatgrid_confidence ?? (incoming.bpm ? 0.65 : 0.25);
+  const outConf = outgoing.timingProfile?.beatgrid_confidence ?? (outgoing.bpm ? 0.85 : 0.40);
+  const inConf = incoming.timingProfile?.beatgrid_confidence ?? (incoming.bpm ? 0.85 : 0.40);
   const beatgridConfidence = Number(Math.min(outConf, inConf).toFixed(2));
 
-  const outMeter = outgoing.timingProfile?.meter || { beats_per_bar: 4, meter_label: '4/4', confidence: 0.6 };
-  const inMeter = incoming.timingProfile?.meter || { beats_per_bar: 4, meter_label: '4/4', confidence: 0.6 };
+  const outBpmConf = outgoing.timingProfile?.bpm_confidence ?? (outgoing.bpm ? 0.90 : 0.45);
+  const inBpmConf = incoming.timingProfile?.bpm_confidence ?? (incoming.bpm ? 0.90 : 0.45);
+  const bpmConfidence = Number(Math.min(outBpmConf, inBpmConf).toFixed(2));
+
+  const downbeatConfidence = outgoing.timingProfile?.downbeat_confidence ?? 0.80;
+
+  const outMeter = outgoing.timingProfile?.meter || { beats_per_bar: 4, meter_label: '4/4', confidence: 0.60 };
+  const inMeter = incoming.timingProfile?.meter || { beats_per_bar: 4, meter_label: '4/4', confidence: 0.60 };
+  const meterConfidence = Number(Math.min(outMeter.confidence ?? 0.60, inMeter.confidence ?? 0.60).toFixed(2));
   const meterUncertain = outMeter.meter_label === 'uncertain' || inMeter.meter_label === 'uncertain';
-  const meterCompatible = !meterUncertain && outMeter.beats_per_bar === inMeter.beats_per_bar;
+  // Low confidence meter measurement is never treated as confirmed incompatibility!
+  const meterCompatible = meterUncertain ? true : outMeter.beats_per_bar === inMeter.beats_per_bar;
   const meterSummary = `${outMeter.meter_label} → ${inMeter.meter_label}`;
-  const beatsPerBar = meterCompatible ? Math.max(3, outMeter.beats_per_bar) : 4;
+  const beatsPerBar = meterCompatible && !meterUncertain ? Math.max(3, outMeter.beats_per_bar) : 4;
 
   const outVariable = Boolean(
     outgoing.timingProfile &&
@@ -395,9 +403,14 @@ export function planDjTransition(
       meter_compatible: meterCompatible,
       meter_summary: meterSummary,
       beatgrid_confidence: beatgridConfidence,
+      bpm_confidence: bpmConfidence,
+      downbeat_confidence: downbeatConfidence,
+      meter_confidence: meterConfidence,
       duration_beats: 1,
       duration_bars: 0,
       duration_sec: 0.25,
+      audio_crossfade_sec: 0.25,
+      musical_duration_sec: 0.50,
       vocal_overlap_policy: 'clean_cut_handover',
       energy_progression: 'reset',
       eq_bass_handover_schedule: {
@@ -586,7 +599,14 @@ export function planDjTransition(
       selectedTechnique = 'backspin_cut';
     } else if (party.djLevel >= 3 && !moodRhythm.isPercussionHeavyDhol) {
       selectedTechnique = 'echo_out_blend';
+    } else if (party.djLevel === 2 && beatgridConfidence >= 0.50 && remainingSec >= 5.0 && !recentUsed('filter_sweep_drop')) {
+      reasons.push('Level 2 filter sweep drop resolves cleanly into incoming track without tempo clash.');
+      selectedTechnique = 'filter_sweep_drop';
+    } else if ((party.djLevel === 1 || party.djLevel === 2) && beatgridConfidence >= 0.50 && (remainingSec >= 6.0 || outSectionType === 'outro' || inSectionType === 'intro')) {
+      reasons.push('Phrase-aligned 2-deck EQ handover selected to transition cleanly between unbeatmatched / differing meter tracks.');
+      selectedTechnique = 'eq3_handover';
     } else {
+      reasons.push('Safe clean quick cut preserves rhythmic integrity when remaining runway is short or beatgrid is unreliable.');
       selectedTechnique = 'safe_quick_cut';
     }
   } else if (bpmDecision.relationship === 'gradual_tempo_ramp') {
@@ -600,7 +620,13 @@ export function planDjTransition(
       technique: 'phrase_long_blend',
       reason: 'Rejected: 3:4 bridge works best via echo-out/cut rather than sustained overlap.',
     });
-    selectedTechnique = party.djLevel >= 3 ? 'echo_out_blend' : 'safe_quick_cut';
+    if (party.djLevel >= 3) {
+      selectedTechnique = 'echo_out_blend';
+    } else if (party.djLevel === 2) {
+      selectedTechnique = 'filter_sweep_drop';
+    } else {
+      selectedTechnique = 'eq3_handover';
+    }
   } else if (vocalClash || moodRhythm.preferShortCleanMix) {
     rejectedAlternatives.push({
       technique: 'phrase_long_blend',
@@ -696,22 +722,24 @@ export function planDjTransition(
   );
   const allowedLengths = [64, 32, 16, 8, 4];
   const durationBeats = allowedLengths.find((b) => b <= rawBeats && b * beatSec <= maxFitSec) ?? 4;
-  const durationSec =
+  const durationBars = Math.max(1, Math.floor(durationBeats / Math.max(3, beatsPerBar)));
+  const musicalDurationSec = Number((durationBeats * beatSec).toFixed(2));
+  const audioCrossfadeSec =
     selectedTechnique === 'safe_quick_cut'
-      ? Math.max(0.25, Math.min(0.55, beatSec * 0.75))
+      ? Math.max(0.25, Math.min(0.50, beatSec * 0.70))
       : selectedTechnique === 'backspin_cut'
       ? Math.max(0.65, Math.min(1.35, beatSec * 2.0))
-      : Math.max(0.5, Math.min(maxFitSec, durationBeats * beatSec));
-  const durationBars = Math.max(1, Math.floor(durationBeats / Math.max(3, beatsPerBar)));
+      : Math.max(0.5, Math.min(maxFitSec, musicalDurationSec));
+  const durationSec = audioCrossfadeSec;
 
-  // Snap scheduled execution time to nearest outgoing downbeat when beatgrid is confident
+  // Snap scheduled execution time to nearest outgoing downbeat when beatgrid or downbeat is confident
   let scheduledExecutionSec = Math.min(
     Math.max(outgoing.currentPosSec, outgoing.durationSec - durationSec),
     Math.max(outgoing.currentPosSec, outMixOutSec)
   );
   let beatAlignmentOffsetSec = 0;
 
-  if (beatgridConfidence >= 0.50 && outgoing.timingProfile?.downbeat_timestamps_ms?.length) {
+  if ((downbeatConfidence >= 0.50 || beatgridConfidence >= 0.50) && outgoing.timingProfile?.downbeat_timestamps_ms?.length) {
     const targetMs = Math.round(scheduledExecutionSec * 1000);
     const futureDownbeats = outgoing.timingProfile.downbeat_timestamps_ms.filter(
       (ms) => ms / 1000 >= outgoing.currentPosSec
@@ -744,7 +772,7 @@ export function planDjTransition(
   };
 
   reasons.push(
-    `Exit ${outgoing.title} at ${scheduledExecutionSec.toFixed(1)}s (${outSectionType}) → Enter ${incoming.title} at ${inMixInSec.toFixed(1)}s (${inSectionType}) over ${durationBeats} beats (${durationBars} bars, ${durationSec.toFixed(1)}s) via ${selectedTechnique}.`
+    `Exit ${outgoing.title} at ${scheduledExecutionSec.toFixed(1)}s (${outSectionType}) → Enter ${incoming.title} at ${inMixInSec.toFixed(1)}s (${inSectionType}) over ${durationBeats} beats (${durationBars} bars, ${musicalDurationSec.toFixed(1)}s) [crossfade: ${audioCrossfadeSec.toFixed(2)}s] via ${selectedTechnique}.`
   );
 
   const confidence = Number(
@@ -784,9 +812,14 @@ export function planDjTransition(
     meter_compatible: meterCompatible,
     meter_summary: meterSummary,
     beatgrid_confidence: beatgridConfidence,
+    bpm_confidence: bpmConfidence,
+    downbeat_confidence: downbeatConfidence,
+    meter_confidence: meterConfidence,
     duration_beats: durationBeats,
     duration_bars: durationBars,
-    duration_sec: Number(durationSec.toFixed(2)),
+    duration_sec: durationSec,
+    audio_crossfade_sec: audioCrossfadeSec,
+    musical_duration_sec: musicalDurationSec,
     vocal_overlap_policy: vocalOverlapPolicy,
     energy_progression: energyProgression,
     eq_bass_handover_schedule: eqBassHandoverSchedule,

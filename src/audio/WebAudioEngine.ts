@@ -401,7 +401,7 @@ export function planMusicalPerformanceWindow(
 
   // Determine phrase-aligned exit boundary based on DJ Level
   const targetWindowSec =
-    djLevel === 4 ? 52 : djLevel === 3 ? 68 : djLevel === 2 ? 110 : safeDur;
+    djLevel === 4 ? 52 : djLevel === 3 ? 68 : djLevel === 2 ? 110 : 140;
 
   const cueInSec = Math.max(0, Math.min(safeDur - 12, chosenStart.start_ms / 1000));
   let cueOutSec = safeDur;
@@ -412,12 +412,12 @@ export function planMusicalPerformanceWindow(
     const sec = sections[i];
     const endSec = Math.min(safeDur, sec.end_ms / 1000);
     const span = endSec - cueInSec;
-    if (sec.section_type === 'outro' && (sec.confidence ?? 0) >= 0.55 && sec.start_ms / 1000 - cueInSec >= 18) {
+    if (sec.section_type === 'outro' && (sec.confidence ?? 0) >= 0.50 && sec.start_ms / 1000 - cueInSec >= 18) {
       cueOutSec = Math.min(safeDur, sec.start_ms / 1000);
       endSectionType = i > fullStartIdx ? sections[i - 1].section_type : chosenStart.section_type;
       break;
     }
-    if (djLevel >= 2 && span >= targetWindowSec && span >= 24) {
+    if (span >= targetWindowSec && span >= 24) {
       cueOutSec = endSec;
       endSectionType = sec.section_type;
       break;
@@ -1572,7 +1572,7 @@ export class FourDeckWebAudioEngine {
           continue;
         }
 
-        const preloadThreshold = Math.min(28, Math.max(10, (targetExit - deck.cueInSec) * 0.45));
+        const preloadThreshold = Math.min(90, Math.max(30, (targetExit - deck.cueInSec) * 0.60));
         if (!deck.preloadSignaled && remaining <= preloadThreshold) {
           deck.preloadSignaled = true;
           this.callbacks.onPreloadWindow?.(deck.deckId, deck.meta.submissionId);
@@ -1606,15 +1606,26 @@ export class FourDeckWebAudioEngine {
               } else if (tick === 'execute') {
                 this.executePlannedTransition(activePlan);
               }
-            } else if (remaining <= Math.min(6, Math.max(2, (targetExit - deck.cueInSec) * 0.25))) {
-              // Safe end-of-track fallback only if planner rejected earlier window
+            } else if (remaining <= 10.0 && remaining >= 1.0) {
+              // Automatic mix-out controller:
+              // Outgoing track is nearing end (<= 10s remaining) and no transition executed yet.
+              // Execute an intentional musical handover rather than playing indefinitely into silence!
+              const fallbackTechnique: DjTechniqueId =
+                this.djLevel === 1 ? 'eq3_handover' : 'filter_sweep_drop';
+              const handoverDur = Math.max(1.5, Math.min(4.5, remaining - 0.4));
               this.triggerAutomatedTransition(
                 deck.deckId,
                 prepared.deckId,
-                Math.min(4, remaining),
-                'safe_quick_cut'
+                handoverDur,
+                fallbackTechnique
               );
             }
+          } else if (remaining <= 2.2 && !deck.transitionTriggered) {
+            // Clean fade-out safeguard when no incoming track is available, preventing click/hang
+            deck.transitionTriggered = true;
+            const t = this.ctx.currentTime;
+            deck.crossfadeGain.gain.setValueAtTime(deck.crossfadeGain.gain.value, t);
+            deck.crossfadeGain.gain.linearRampToValueAtTime(0.0, t + Math.max(0.5, remaining - 0.2));
           }
         }
       }

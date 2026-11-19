@@ -4235,6 +4235,219 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_cache);
     }
 
+    #[tokio::test]
+    async fn test_loopback_resolver_cross_port_and_direct_proof_download() {
+        use axum::extract::{Path, State};
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use dhun_lib::db::Database;
+        use dhun_lib::library::downloader::AudioDownloader;
+        use dhun_lib::library::pipeline::{stage_1_validate_and_identify, AuthorizedStreamProof};
+        use dhun_lib::library::resolver::{download_authorized_proof, AuthorizedResolverConfig};
+        use dhun_lib::network::local_helper_routes::{
+            create_local_room, process_single_intake_job, submit_song_to_local_room,
+            CreateLocalRoomRequest, LocalHelperState, UnifiedSongSubmissionRequest,
+        };
+        use dhun_lib::sync::MetadataSyncManager;
+        use sha2::{Digest, Sha256};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        // 1. Verify loopback opt-in in AuthorizedResolverConfig::new_with_loopback
+        let auto_loop = AuthorizedResolverConfig::new_with_loopback(
+            "http://127.0.0.1:8000/resolve".to_string(),
+            None,
+            true,
+        )
+        .expect("Should accept 127.0.0.1 loopback when allowed");
+        assert!(auto_loop.allow_loopback);
+
+        let auto_local = AuthorizedResolverConfig::new_with_loopback(
+            "http://localhost:8080/resolve".to_string(),
+            None,
+            true,
+        )
+        .expect("Should accept localhost loopback when allowed");
+        assert!(auto_local.allow_loopback);
+
+        // Remote insecure HTTP must still be rejected
+        assert!(AuthorizedResolverConfig::new_with_loopback(
+            "http://example.com/resolve".to_string(),
+            None,
+            false,
+        )
+        .is_err());
+
+        // 2. Build a valid synthetic 2-second WAV in memory
+        let sample_rate: u32 = 44_100;
+        let num_frames: u32 = sample_rate * 2;
+        let data_bytes: u32 = num_frames * 2 * 2;
+        let mut wav_bytes = Vec::with_capacity((44 + data_bytes) as usize);
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVEfmt ");
+        wav_bytes.extend_from_slice(&16u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&1u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&2u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        wav_bytes.extend_from_slice(&(sample_rate * 4).to_le_bytes());
+        wav_bytes.extend_from_slice(&4u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&16u16.to_le_bytes());
+        wav_bytes.extend_from_slice(b"data");
+        wav_bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for f in 0..num_frames {
+            let t = f as f64 / sample_rate as f64;
+            let sample = ((0.30 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) * 32767.0) as i16;
+            wav_bytes.extend_from_slice(&sample.to_le_bytes());
+            wav_bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let wav_sha = format!("{:x}", Sha256::digest(&wav_bytes));
+
+        // 3. Bind TWO separate loopback listeners (Cross-Port: Resolver on Port A, Audio Server on Port B)
+        let audio_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let audio_port = audio_listener.local_addr().unwrap().port();
+        let wav_bytes_arc = Arc::new(wav_bytes.clone());
+
+        let audio_router = Router::new().route(
+            "/cache/test_crossport.wav",
+            get(move || {
+                let bytes = wav_bytes_arc.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+                        (*bytes).clone(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(audio_listener, audio_router).await;
+        });
+
+        let audio_url = format!("http://127.0.0.1:{}/cache/test_crossport.wav", audio_port);
+        let audio_url_clone = audio_url.clone();
+        let sha_clone = wav_sha.clone();
+
+        let resolver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resolver_port = resolver_listener.local_addr().unwrap().port();
+        assert_ne!(resolver_port, audio_port, "Ports must be different to test cross-port loopback");
+
+        let resolver_router = Router::new().route(
+            "/resolve",
+            axum::routing::post(move || {
+                let u = audio_url_clone.clone();
+                let s = sha_clone.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "direct_https_audio_url": u,
+                        "license_or_authorization_note": "Cross-port local resolver test license",
+                        "expected_sha256": s
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(resolver_listener, resolver_router).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let db = Database::new_in_memory().unwrap();
+        let temp_cache = std::env::temp_dir().join(format!("dhun_cross_port_{}", uuid::Uuid::new_v4()));
+        let sync_mgr = MetadataSyncManager::new(None, None).unwrap();
+        let resolver_cfg = AuthorizedResolverConfig::new_with_loopback(
+            format!("http://127.0.0.1:{}/resolve", resolver_port),
+            None,
+            true,
+        )
+        .unwrap();
+
+        let state = Arc::new(
+            LocalHelperState::new(
+                db.clone(),
+                47822,
+                temp_cache.clone(),
+                sync_mgr,
+                Some(Some("192.168.1.50".to_string())),
+                vec![],
+            )
+            .with_audio_resolver(Some(resolver_cfg)),
+        );
+
+        let host_addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let Json(created) = create_local_room(
+            State(state.clone()),
+            axum::extract::ConnectInfo(host_addr),
+            axum::http::HeaderMap::new(),
+            Json(CreateLocalRoomRequest {
+                party_name: "Cross Port Loopback Room".to_string(),
+                dj_level: Some(2),
+                primary_mood_id: Some("house_party".to_string()),
+                secondary_mood_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut host_headers = axum::http::HeaderMap::new();
+        host_headers.insert("X-Host-Token", created.host_token.parse().unwrap());
+
+        let _ = dhun_lib::network::local_helper_routes::start_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            axum::extract::ConnectInfo(host_addr),
+            host_headers.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Submit YouTube URL -> worker processes via cross-port resolver -> must SUCCEED with cached_authorized!
+        let Json(sub) = submit_song_to_local_room(
+            State(state.clone()),
+            Path(created.room.room_id.clone()),
+            axum::extract::ConnectInfo(host_addr),
+            host_headers.clone(),
+            Json(UnifiedSongSubmissionRequest {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                authorized_stream: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let job = db.claim_next_submission_intake_job().unwrap().expect("Job should be queued");
+        let processed = process_single_intake_job(&state, &job).await;
+        assert!(processed, "Intake job should process successfully across ports");
+
+        let subs = db.get_local_room_submissions(&created.room.room_id).unwrap();
+        let sub_row = subs.iter().find(|s| s.id == sub.id).unwrap();
+        println!("TEST DEBUG SUB ROW: status={}, note={:?}", sub_row.acquisition_status, sub_row.acquisition_note);
+        assert_eq!(
+            sub_row.acquisition_status, "cached_authorized",
+            "Cross-port loopback audio MUST be acquired and cached as cached_authorized (not failed!)"
+        );
+        assert!(sub_row.local_cache_path.is_some());
+        assert!(sub_row.cache_id.is_some());
+
+        // 4. Verify direct download_authorized_proof with loopback URL
+        let parsed = stage_1_validate_and_identify("https://www.youtube.com/watch?v=oHg5SJYRHA0").unwrap();
+        let proof = AuthorizedStreamProof {
+            direct_https_audio_url: audio_url.clone(),
+            license_or_authorization_note: "Direct proof loopback license".to_string(),
+            expected_sha256: Some(wav_sha.clone()),
+        };
+        let downloader = AudioDownloader::new(temp_cache.clone());
+        let (proof_status, note, path) = download_authorized_proof(&parsed, &proof, &downloader, &db).await;
+        assert_eq!(
+            proof_status,
+            dhun_lib::library::pipeline::AcquisitionStatus::CachedAuthorized,
+            "Direct proof with loopback URL must acquire successfully"
+        );
+        assert!(path.is_some());
+        assert!(note.contains("cached locally"));
+
+        let _ = std::fs::remove_dir_all(&temp_cache);
+    }
+
     /// Comprehensive recommendation engine edge-case validation:
     /// small pool, missing BPM/key/beat grid, conflicting energy, incompatible harmonic key,
     /// cross-genre, half/double-time BPM on Level 2, and mixed playable/processing/metadata-only tracks.
@@ -4355,7 +4568,7 @@ mod tests {
         // 1. Variable tempo track: first 16s at 100 BPM clicks, next 16s at 140 BPM clicks
         let var_sec = 32usize;
         let mut var_samples = vec![0.0f32; sr as usize * var_sec * 2];
-        let mut add_clicks = |buf: &mut [f32], start_s: f64, end_s: f64, bpm: f64, accent_every: usize| {
+        let add_clicks = |buf: &mut [f32], start_s: f64, end_s: f64, bpm: f64, accent_every: usize| {
             let step = 60.0 / bpm;
             let mut t = start_s;
             let mut idx = 0usize;
@@ -4441,8 +4654,10 @@ mod tests {
 
         let make_timing = |bpm: f64, conf: f64, beats_per_bar: u8, meter_label: &str, var: bool| TrackTimingProfile {
             average_bpm: bpm,
+            bpm_confidence: conf,
             beatgrid_confidence: conf,
             downbeat_offset_ms: 0,
+            downbeat_confidence: conf,
             is_variable_tempo: var,
             tempo_drift_bpm: if var { 9.0 } else { 0.4 },
             meter: MeterAnalysis {

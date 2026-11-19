@@ -126,6 +126,21 @@ pub async fn download_authorized_proof(
         );
     }
 
+    if let Ok((loopback_file_url, loopback_addr)) =
+        validate_loopback_resolver_url(&proof.direct_https_audio_url)
+    {
+        return fetch_and_ingest_loopback_audio(
+            parsed,
+            &loopback_file_url,
+            loopback_addr,
+            None,
+            proof.expected_sha256.as_deref(),
+            downloader.cache_dir(),
+            db,
+        )
+        .await;
+    }
+
     let safe_name = format!("auth_{}", parsed.video_id);
     match downloader
         .download_audio(
@@ -224,6 +239,128 @@ pub fn save_and_ingest_audio_bytes_to_cache(
     };
 
     Ok((canonical_path, ingest_res.sha256_hash))
+}
+
+/// Fetches audio bytes from a strictly validated loopback address (127.0.0.1 or localhost),
+/// applies streaming size limits, validates the format with Symphonia, and ingests/deduplicates into SQLite.
+pub async fn fetch_and_ingest_loopback_audio(
+    parsed: &ParsedYouTubeUrl,
+    loopback_file_url: &reqwest::Url,
+    loopback_addr: std::net::SocketAddr,
+    api_key: Option<&str>,
+    expected_sha256: Option<&str>,
+    cache_dir: &Path,
+    db: &Database,
+) -> (AcquisitionStatus, String, Option<PathBuf>) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .redirect(Policy::none())
+        .resolve("localhost", loopback_addr)
+        .resolve("127.0.0.1", loopback_addr)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                AcquisitionStatus::Failed,
+                format!("Failed to initialize loopback HTTP client: {}", e),
+                None,
+            );
+        }
+    };
+
+    let mut file_req = client.get(loopback_file_url.clone());
+    if let Some(key) = api_key {
+        file_req = file_req.bearer_auth(key);
+    }
+
+    let file_resp = match file_req.send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            return (
+                AcquisitionStatus::Failed,
+                format!("Loopback resolver audio file returned HTTP {}", r.status()),
+                None,
+            );
+        }
+        Err(e) => {
+            return (
+                AcquisitionStatus::Failed,
+                format!("Loopback resolver audio file fetch failed: {}", e),
+                None,
+            );
+        }
+    };
+
+    if let Some(len) = file_resp.content_length() {
+        if len as i64 > DEFAULT_MAX_AUDIO_DOWNLOAD_BYTES {
+            return (
+                AcquisitionStatus::Failed,
+                format!("Loopback audio size ({} bytes) exceeds 500 MB limit", len),
+                None,
+            );
+        }
+    }
+
+    let mut file_buf = Vec::new();
+    let mut file_stream = file_resp.bytes_stream();
+    while let Some(chunk_res) = file_stream.next().await {
+        match chunk_res {
+            Ok(chunk) => {
+                if (file_buf.len() + chunk.len()) as i64 > DEFAULT_MAX_AUDIO_DOWNLOAD_BYTES {
+                    return (
+                        AcquisitionStatus::Failed,
+                        "Loopback audio stream exceeded 500 MB limit".to_string(),
+                        None,
+                    );
+                }
+                file_buf.extend_from_slice(&chunk);
+            }
+            Err(e) => {
+                return (
+                    AcquisitionStatus::Failed,
+                    format!("Loopback audio stream read failed: {}", e),
+                    None,
+                );
+            }
+        }
+    }
+
+    match save_and_ingest_audio_bytes_to_cache(
+        &file_buf,
+        &parsed.video_id,
+        loopback_file_url.as_str(),
+        cache_dir,
+        db,
+    ) {
+        Ok((path, sha256)) => {
+            if let Some(expected) = expected_sha256 {
+                if !sha256.eq_ignore_ascii_case(expected.trim()) {
+                    return (
+                        AcquisitionStatus::Failed,
+                        format!(
+                            "Loopback audio SHA-256 mismatch: expected '{}', got '{}'",
+                            expected, sha256
+                        ),
+                        None,
+                    );
+                }
+            }
+            (
+                AcquisitionStatus::CachedAuthorized,
+                format!(
+                    "Audio fetched from loopback resolver and cached locally (sha256={})",
+                    &sha256[..12.min(sha256.len())]
+                ),
+                Some(path),
+            )
+        }
+        Err(e) => (
+            AcquisitionStatus::Failed,
+            format!("Loopback audio validation/caching failed: {}", e),
+            None,
+        ),
+    }
 }
 
 /// Calls the host-configured HTTPS media resolver (`DHUN_AUDIO_RESOLVER_URL`) with song metadata/URL.
@@ -339,111 +476,21 @@ pub async fn acquire_via_authorized_resolver(
             }
         };
 
-        // If the host explicitly opted into a local loopback resolver (`DHUN_ALLOW_LOOPBACK_RESOLVER=1`)
-        // and the JSON points to a file on that EXACT same loopback host + port (e.g. http://127.0.0.1:8000/files/...),
-        // fetch it directly from that same pinned loopback origin (still blocking any other port, LAN IP, or remote HTTP).
-        if resolver.allow_loopback {
-            if let Ok((loopback_file_url, loopback_addr)) =
-                validate_loopback_resolver_url(&json_body.direct_https_audio_url)
-            {
-                if loopback_addr.port() == pinned_addr.port() {
-                    let mut file_req = client.get(loopback_file_url.clone());
-                    if let Some(ref key) = resolver.api_key {
-                        file_req = file_req.bearer_auth(key);
-                    }
-                    let file_resp = match file_req.send().await {
-                        Ok(r) if r.status().is_success() => r,
-                        Ok(r) => {
-                            return (
-                                AcquisitionStatus::Failed,
-                                format!("Loopback resolver audio file returned HTTP {}", r.status()),
-                                None,
-                            );
-                        }
-                        Err(e) => {
-                            return (
-                                AcquisitionStatus::Failed,
-                                format!("Loopback resolver audio file fetch failed: {}", e),
-                                None,
-                            );
-                        }
-                    };
-
-                    if let Some(len) = file_resp.content_length() {
-                        if len as i64 > DEFAULT_MAX_AUDIO_DOWNLOAD_BYTES {
-                            return (
-                                AcquisitionStatus::Failed,
-                                format!("Loopback audio size ({} bytes) exceeds 500 MB limit", len),
-                                None,
-                            );
-                        }
-                    }
-
-                    let mut file_buf = Vec::new();
-                    let mut file_stream = file_resp.bytes_stream();
-                    while let Some(chunk_res) = file_stream.next().await {
-                        match chunk_res {
-                            Ok(chunk) => {
-                                if (file_buf.len() + chunk.len()) as i64
-                                    > DEFAULT_MAX_AUDIO_DOWNLOAD_BYTES
-                                {
-                                    return (
-                                        AcquisitionStatus::Failed,
-                                        "Loopback audio stream exceeded 500 MB limit".to_string(),
-                                        None,
-                                    );
-                                }
-                                file_buf.extend_from_slice(&chunk);
-                            }
-                            Err(e) => {
-                                return (
-                                    AcquisitionStatus::Failed,
-                                    format!("Loopback audio stream read failed: {}", e),
-                                    None,
-                                );
-                            }
-                        }
-                    }
-
-                    match save_and_ingest_audio_bytes_to_cache(
-                        &file_buf,
-                        &parsed.video_id,
-                        loopback_file_url.as_str(),
-                        downloader.cache_dir(),
-                        db,
-                    ) {
-                        Ok((path, sha256)) => {
-                            if let Some(ref expected) = json_body.expected_sha256 {
-                                if !sha256.eq_ignore_ascii_case(expected.trim()) {
-                                    return (
-                                        AcquisitionStatus::Failed,
-                                        format!(
-                                            "Loopback audio SHA-256 mismatch: expected '{}', got '{}'",
-                                            expected, sha256
-                                        ),
-                                        None,
-                                    );
-                                }
-                            }
-                            return (
-                                AcquisitionStatus::CachedAuthorized,
-                                format!(
-                                    "Audio fetched from same-origin loopback resolver and cached locally (sha256={})",
-                                    &sha256[..12.min(sha256.len())]
-                                ),
-                                Some(path),
-                            );
-                        }
-                        Err(e) => {
-                            return (
-                                AcquisitionStatus::Failed,
-                                format!("Loopback audio validation/caching failed: {}", e),
-                                None,
-                            );
-                        }
-                    }
-                }
-            }
+        // If the direct audio URL points to loopback (127.0.0.1 or localhost),
+        // fetch it directly via dedicated safe loopback client
+        if let Ok((loopback_file_url, loopback_addr)) =
+            validate_loopback_resolver_url(&json_body.direct_https_audio_url)
+        {
+            return fetch_and_ingest_loopback_audio(
+                parsed,
+                &loopback_file_url,
+                loopback_addr,
+                resolver.api_key.as_deref(),
+                json_body.expected_sha256.as_deref(),
+                downloader.cache_dir(),
+                db,
+            )
+            .await;
         }
 
         let proof = AuthorizedStreamProof {

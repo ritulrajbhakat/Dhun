@@ -30,7 +30,7 @@ pub fn analyze_track_file<P: AsRef<Path>>(track_id: &str, file_path: P) -> Resul
         BpmDetector::detect_tempo_map(&decoded.samples, decoded.sample_rate, decoded.duration_ms);
     let (key_name, camelot_key, key_confidence) = KeyDetector::detect_key(&decoded.samples, decoded.sample_rate);
     
-    let downbeat_offset_ms = BpmDetector::detect_downbeat_offset(&decoded.samples, decoded.sample_rate, bpm);
+    let (downbeat_offset_ms, downbeat_confidence) = BpmDetector::detect_downbeat(&decoded.samples, decoded.sample_rate, bpm);
     let meter = BpmDetector::detect_meter(&decoded.samples, decoded.sample_rate, bpm, downbeat_offset_ms);
     let (phrase_markers, overall_energy, dance_suitability, mix_in_ms, mix_out_ms) =
         PhraseDetector::analyze_phrasing_with_timing(
@@ -42,12 +42,18 @@ pub fn analyze_track_file<P: AsRef<Path>>(track_id: &str, file_path: P) -> Resul
             decoded.duration_ms,
         );
 
+    // Compute separate, distinct beatgrid confidence measuring rhythmic alignment & drift
+    let beatgrid_confidence = {
+        let drift_penalty = (tempo_drift_bpm / 12.0).clamp(0.0, 0.35);
+        ((bpm_confidence * 0.80 + downbeat_confidence * 0.20 - drift_penalty) * 100.0).round() / 100.0
+    }.clamp(0.25, 0.98);
+
     let beat_grid = BeatGridGenerator::generate_variable_grid(
         &tempo_map,
         downbeat_offset_ms,
         meter.beats_per_bar,
         decoded.duration_ms,
-        bpm_confidence,
+        beatgrid_confidence,
     );
 
     let beat_timestamps_ms: Vec<i64> = beat_grid.iter().map(|b| b.time_offset_ms).collect();
@@ -59,7 +65,9 @@ pub fn analyze_track_file<P: AsRef<Path>>(track_id: &str, file_path: P) -> Resul
 
     let timing_profile = TrackTimingProfile {
         average_bpm: bpm,
-        beatgrid_confidence: bpm_confidence,
+        beatgrid_confidence,
+        bpm_confidence,
+        downbeat_confidence,
         downbeat_offset_ms,
         is_variable_tempo,
         tempo_drift_bpm,

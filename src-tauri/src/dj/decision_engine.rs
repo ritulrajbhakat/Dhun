@@ -143,9 +143,19 @@ pub struct TransitionDecisionPlan {
     pub meter_compatible: bool,
     pub meter_summary: String,
     pub beatgrid_confidence: f64,
+    #[serde(default = "default_metric_conf")]
+    pub bpm_confidence: f64,
+    #[serde(default = "default_metric_conf")]
+    pub downbeat_confidence: f64,
+    #[serde(default = "default_metric_conf")]
+    pub meter_confidence: f64,
     pub duration_beats: u32,
     pub duration_bars: u32,
     pub duration_sec: f64,
+    #[serde(default = "default_crossfade_sec")]
+    pub audio_crossfade_sec: f64,
+    #[serde(default = "default_crossfade_sec")]
+    pub musical_duration_sec: f64,
     pub vocal_overlap_policy: String,
     pub energy_progression: String,
     pub eq_bass_handover_schedule: EqBassHandoverSchedule,
@@ -155,6 +165,14 @@ pub struct TransitionDecisionPlan {
     pub reasons: Vec<String>,
     pub rejected_alternatives: Vec<RejectedTechniqueAlternative>,
     pub rejection_reason: Option<String>,
+}
+
+fn default_crossfade_sec() -> f64 {
+    2.0
+}
+
+fn default_metric_conf() -> f64 {
+    0.85
 }
 
 #[derive(Debug, Clone)]
@@ -451,34 +469,58 @@ pub fn plan_dj_transition(
     let mut reasons = Vec::new();
     let mut rejected_alternatives = Vec::new();
 
-    // 1. Meter & beatgrid confidence evaluation
+    // 1. Meter & separate, honest confidence evaluations
     let out_conf = outgoing
         .timing_profile
         .as_ref()
         .map(|t| t.beatgrid_confidence)
-        .unwrap_or(if outgoing.bpm.is_some() { 0.65 } else { 0.25 });
+        .unwrap_or(if outgoing.bpm.is_some() { 0.85 } else { 0.40 });
     let in_conf = incoming
         .timing_profile
         .as_ref()
         .map(|t| t.beatgrid_confidence)
-        .unwrap_or(if incoming.bpm.is_some() { 0.65 } else { 0.25 });
+        .unwrap_or(if incoming.bpm.is_some() { 0.85 } else { 0.40 });
     let beatgrid_confidence = ((out_conf.min(in_conf)) * 100.0).round() / 100.0;
+
+    let out_bpm_conf = outgoing
+        .timing_profile
+        .as_ref()
+        .map(|t| t.bpm_confidence)
+        .unwrap_or(if outgoing.bpm.is_some() { 0.90 } else { 0.45 });
+    let in_bpm_conf = incoming
+        .timing_profile
+        .as_ref()
+        .map(|t| t.bpm_confidence)
+        .unwrap_or(if incoming.bpm.is_some() { 0.90 } else { 0.45 });
+    let bpm_confidence = ((out_bpm_conf.min(in_bpm_conf)) * 100.0).round() / 100.0;
+
+    let downbeat_confidence = outgoing
+        .timing_profile
+        .as_ref()
+        .map(|t| t.downbeat_confidence)
+        .unwrap_or(0.80);
 
     let out_meter = outgoing
         .timing_profile
         .as_ref()
         .map(|t| (t.meter.beats_per_bar, t.meter.meter_label.as_str(), t.meter.confidence))
-        .unwrap_or((4, "4/4", 0.6));
+        .unwrap_or((4, "4/4", 0.60));
     let in_meter = incoming
         .timing_profile
         .as_ref()
         .map(|t| (t.meter.beats_per_bar, t.meter.meter_label.as_str(), t.meter.confidence))
-        .unwrap_or((4, "4/4", 0.6));
+        .unwrap_or((4, "4/4", 0.60));
 
+    let meter_confidence = ((out_meter.2.min(in_meter.2)) * 100.0).round() / 100.0;
     let meter_uncertain = out_meter.1 == "uncertain" || in_meter.1 == "uncertain";
-    let meter_compatible = !meter_uncertain && out_meter.0 == in_meter.0;
+    // Uncertain meter is never treated as confirmed incompatibility! Assume standard 4/4 phrasing:
+    let meter_compatible = if meter_uncertain {
+        true
+    } else {
+        out_meter.0 == in_meter.0
+    };
     let meter_summary = format!("{} → {}", out_meter.1, in_meter.1);
-    let beats_per_bar = if meter_compatible { out_meter.0.max(3) } else { 4 };
+    let beats_per_bar = if meter_compatible && out_meter.1 != "uncertain" { out_meter.0.max(3) } else { 4 };
 
     let out_variable = outgoing
         .timing_profile
@@ -517,9 +559,14 @@ pub fn plan_dj_transition(
             meter_compatible,
             meter_summary,
             beatgrid_confidence,
+            bpm_confidence,
+            downbeat_confidence,
+            meter_confidence,
             duration_beats: 1,
             duration_bars: 0,
             duration_sec: 0.25,
+            audio_crossfade_sec: 0.25,
+            musical_duration_sec: 0.50,
             vocal_overlap_policy: "clean_cut_handover".to_string(),
             energy_progression: "reset".to_string(),
             eq_bass_handover_schedule: EqBassHandoverSchedule {
@@ -769,8 +816,21 @@ pub fn plan_dj_transition(
         } else if party.dj_level >= DjLevel::Level3AdvancedPerformance && !mood_rhythm.is_percussion_heavy_dhol {
             reasons.push("Beatmatch unavailable/unsuitable — Level 3+ beat-free echo-out tail into clean incoming drop.".to_string());
             "echo_out_blend".to_string()
+        } else if party.dj_level == DjLevel::Level2SmartMixing
+            && beatgrid_confidence >= 0.50
+            && remaining_sec >= 5.0
+            && !recent_used("filter_sweep_drop")
+        {
+            reasons.push("Level 2 filter sweep drop resolves cleanly into incoming track without tempo clash.".to_string());
+            "filter_sweep_drop".to_string()
+        } else if (party.dj_level == DjLevel::Level1TwoDeckMixer || party.dj_level == DjLevel::Level2SmartMixing)
+            && beatgrid_confidence >= 0.50
+            && (remaining_sec >= 6.0 || out_section_type == "outro" || in_section_type == "intro")
+        {
+            reasons.push("Phrase-aligned 2-deck EQ handover selected to transition cleanly between unbeatmatched / differing meter tracks.".to_string());
+            "eq3_handover".to_string()
         } else {
-            reasons.push("Safe clean quick cut preserves rhythmic integrity when beatmatch is unsuitable.".to_string());
+            reasons.push("Safe clean quick cut preserves rhythmic integrity when remaining time is short or beatgrid is unreliable.".to_string());
             "safe_quick_cut".to_string()
         }
     } else if bpm_decision.relationship == BpmRelationship::GradualTempoRamp {
@@ -792,8 +852,10 @@ pub fn plan_dj_transition(
         });
         if party.dj_level >= DjLevel::Level3AdvancedPerformance {
             "echo_out_blend".to_string()
+        } else if party.dj_level == DjLevel::Level2SmartMixing {
+            "filter_sweep_drop".to_string()
         } else {
-            "safe_quick_cut".to_string()
+            "eq3_handover".to_string()
         }
     } else if vocal_clash || mood_rhythm.prefer_short_clean_mix {
         rejected_alternatives.push(RejectedTechniqueAlternative {
@@ -924,14 +986,17 @@ pub fn plan_dj_transition(
         .find(|&b| b <= raw_beats && (b as f64) * beat_sec <= max_fit_sec)
         .unwrap_or(4);
 
-    let duration_sec = if selected_technique == "safe_quick_cut" {
-        (beat_sec * 0.75).clamp(0.25, 0.55)
+    let duration_bars = (duration_beats / (beats_per_bar as u32).max(3)).max(1);
+    let musical_duration_sec = (((duration_beats as f64) * beat_sec) * 100.0).round() / 100.0;
+
+    let audio_crossfade_sec = if selected_technique == "safe_quick_cut" {
+        (beat_sec * 0.70).clamp(0.25, 0.50)
     } else if selected_technique == "backspin_cut" {
         (beat_sec * 2.0).clamp(0.65, 1.35)
     } else {
-        ((duration_beats as f64) * beat_sec).min(max_fit_sec).max(0.5)
+        musical_duration_sec.min(max_fit_sec).max(0.5)
     };
-    let duration_bars = (duration_beats / (beats_per_bar as u32).max(3)).max(1);
+    let duration_sec = audio_crossfade_sec; // For backwards-compatible audio execution
 
     // Snap scheduled execution time to nearest outgoing beatgrid downbeat when confident
     let mut scheduled_execution_sec = out_mix_out_sec
@@ -939,7 +1004,7 @@ pub fn plan_dj_transition(
         .min((outgoing.duration_sec - duration_sec).max(outgoing.current_pos_sec));
     let mut beat_alignment_offset_sec = 0.0;
 
-    if beatgrid_confidence >= 0.50 {
+    if downbeat_confidence >= 0.50 || beatgrid_confidence >= 0.50 {
         if let Some(ref tp) = outgoing.timing_profile {
             if !tp.downbeat_timestamps_ms.is_empty() {
                 let target_ms = (scheduled_execution_sec * 1000.0).round() as i64;
@@ -975,7 +1040,7 @@ pub fn plan_dj_transition(
     };
 
     reasons.push(format!(
-        "Exit {} at {:.1}s ({}) → Enter {} at {:.1}s ({}) over {} beats ({} bars, {:.1}s) via {}.",
+        "Exit {} at {:.1}s ({}) → Enter {} at {:.1}s ({}) over {} beats ({} bars, {:.1}s) [crossfade: {:.2}s] via {}.",
         outgoing.title,
         scheduled_execution_sec,
         out_section_type,
@@ -984,7 +1049,8 @@ pub fn plan_dj_transition(
         in_section_type,
         duration_beats,
         duration_bars,
-        duration_sec,
+        musical_duration_sec,
+        audio_crossfade_sec,
         selected_technique
     ));
 
@@ -1018,9 +1084,14 @@ pub fn plan_dj_transition(
         meter_compatible,
         meter_summary,
         beatgrid_confidence,
+        bpm_confidence,
+        downbeat_confidence,
+        meter_confidence,
         duration_beats,
         duration_bars,
         duration_sec: (duration_sec * 100.0).round() / 100.0,
+        audio_crossfade_sec: (audio_crossfade_sec * 100.0).round() / 100.0,
+        musical_duration_sec: (musical_duration_sec * 100.0).round() / 100.0,
         vocal_overlap_policy,
         energy_progression,
         eq_bass_handover_schedule,

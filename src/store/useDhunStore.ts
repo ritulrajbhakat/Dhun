@@ -612,8 +612,19 @@ export const useDhunStore = create<DhunState>((set, get) => {
         return;
       }
 
+      let candidate = nextPlayableCandidate;
+      if (!candidate || candidate.submission_id === playingDeck?.submissionId) {
+        try {
+          const fresh = await localHelperClient.evaluateDjPool(activeRoom.room_id);
+          if (fresh.next_playable_candidate) {
+            candidate = fresh.next_playable_candidate;
+            set({ nextPlayableCandidate: candidate });
+          }
+        } catch {}
+      }
+
       // No playable cached candidate exists right now
-      if (!nextPlayableCandidate) {
+      if (!candidate) {
         if (!playingDeck) {
           const hasRestricted = submissions.some((s) => s.acquisition_status === 'restricted_by_provider');
           set({
@@ -628,8 +639,8 @@ export const useDhunStore = create<DhunState>((set, get) => {
 
       // Avoid re-loading a candidate already active or preloaded on a deck
       if (
-        playingDeck?.submissionId === nextPlayableCandidate.submission_id ||
-        preparedDeck?.submissionId === nextPlayableCandidate.submission_id
+        playingDeck?.submissionId === candidate.submission_id ||
+        preparedDeck?.submissionId === candidate.submission_id
       ) {
         return;
       }
@@ -641,27 +652,27 @@ export const useDhunStore = create<DhunState>((set, get) => {
       if (!playingDeck) {
         set({
           autoDjPlaybackState: 'preparing',
-          autoDjStatusNote: `Preparing "${nextPlayableCandidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)}...`,
+          autoDjStatusNote: `Preparing "${candidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)}...`,
         });
       }
 
       try {
         const audioBytes = await localHelperClient.fetchAuthorizedCachedAudio(
           activeRoom.room_id,
-          nextPlayableCandidate.cache_id
+          candidate.cache_id
         );
 
         const ok = await webAudioEngine.prepareAuthorizedDeckBuffer(idleDeckId, audioBytes, {
-          submissionId: nextPlayableCandidate.submission_id,
-          cacheId: nextPlayableCandidate.cache_id,
-          title: nextPlayableCandidate.title,
-          artist: nextPlayableCandidate.artist,
-          bpm: nextPlayableCandidate.bpm,
-          camelotKey: nextPlayableCandidate.camelot_key,
-          overallEnergy: nextPlayableCandidate.overall_energy,
-          genreTags: nextPlayableCandidate.genre_tags,
-          sections: nextPlayableCandidate.sections,
-          timingProfile: nextPlayableCandidate.timing_profile ?? null,
+          submissionId: candidate.submission_id,
+          cacheId: candidate.cache_id,
+          title: candidate.title,
+          artist: candidate.artist,
+          bpm: candidate.bpm,
+          camelotKey: candidate.camelot_key,
+          overallEnergy: candidate.overall_energy,
+          genreTags: candidate.genre_tags,
+          sections: candidate.sections,
+          timingProfile: candidate.timing_profile ?? null,
         });
 
         if (!ok) {
@@ -673,14 +684,16 @@ export const useDhunStore = create<DhunState>((set, get) => {
           if (started) {
             set({
               autoDjPlaybackState: 'playing',
-              autoDjStatusNote: `Playing "${nextPlayableCandidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)}`,
+              autoDjStatusNote: `Playing "${candidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)}`,
             });
             const evRes = await localHelperClient.recordPlaybackEvent(activeRoom.room_id, {
-              submission_id: nextPlayableCandidate.submission_id,
+              submission_id: candidate.submission_id,
               event: 'playing',
               deck_id: idleDeckId,
             });
             set({ nextPlayableCandidate: evRes.next_playable_candidate });
+            // Immediately kick off background preload on the next idle deck!
+            void get().driveAutoDjLoop();
           }
         } else {
           // Track preloaded onto idle deck: immediately plan musical transition ahead of time!
@@ -688,13 +701,13 @@ export const useDhunStore = create<DhunState>((set, get) => {
             webAudioEngine.schedulePlannedTransition(playingDeck.deckId, idleDeckId);
           }
           await localHelperClient.recordPlaybackEvent(activeRoom.room_id, {
-            submission_id: nextPlayableCandidate.submission_id,
+            submission_id: candidate.submission_id,
             event: 'prepared',
             deck_id: idleDeckId,
           });
           set({
             autoDjPlaybackState: 'playing',
-            autoDjStatusNote: `Preloaded "${nextPlayableCandidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)} for transition`,
+            autoDjStatusNote: `Preloaded "${candidate.title}" on Deck ${String.fromCharCode(65 + idleDeckId)} for transition`,
           });
         }
       } catch (err: any) {
@@ -703,7 +716,7 @@ export const useDhunStore = create<DhunState>((set, get) => {
         webAudioEngine.cancelPendingTransition(`Incoming track preload failed: ${errMsg}`);
         await localHelperClient
           .recordPlaybackEvent(activeRoom.room_id, {
-            submission_id: nextPlayableCandidate.submission_id,
+            submission_id: candidate.submission_id,
             event: 'decode_failed',
             deck_id: idleDeckId,
             error_detail: errMsg,

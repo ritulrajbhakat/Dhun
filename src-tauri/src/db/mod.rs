@@ -1482,6 +1482,8 @@ impl Database {
                     return Ok(Some(TrackTimingProfile {
                         average_bpm: bpm,
                         beatgrid_confidence: conf,
+                        bpm_confidence: conf,
+                        downbeat_confidence: 0.80,
                         downbeat_offset_ms: beats.first().copied().unwrap_or(0),
                         is_variable_tempo: false,
                         tempo_drift_bpm: 0.0,

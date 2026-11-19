@@ -94,6 +94,10 @@ pub struct MeterAnalysis {
 pub struct TrackTimingProfile {
     pub average_bpm: f64,
     pub beatgrid_confidence: f64,
+    #[serde(default = "default_bpm_conf")]
+    pub bpm_confidence: f64,
+    #[serde(default = "default_downbeat_conf")]
+    pub downbeat_confidence: f64,
     pub downbeat_offset_ms: i64,
     pub is_variable_tempo: bool,
     pub tempo_drift_bpm: f64,
@@ -101,6 +105,14 @@ pub struct TrackTimingProfile {
     pub tempo_map: Vec<TempoSegment>,
     pub beat_timestamps_ms: Vec<i64>,
     pub downbeat_timestamps_ms: Vec<i64>,
+}
+
+fn default_bpm_conf() -> f64 {
+    0.85
+}
+
+fn default_downbeat_conf() -> f64 {
+    0.80
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

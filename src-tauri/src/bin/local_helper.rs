@@ -6,7 +6,7 @@ use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use dhun_lib::db::Database;
-use dhun_lib::library::resolver::AuthorizedResolverConfig;
+use dhun_lib::library::resolver::{validate_loopback_resolver_url, AuthorizedResolverConfig};
 use dhun_lib::network::local_helper_routes::{
     create_local_helper_router, start_intake_queue_worker, LocalHelperState,
     DEFAULT_LOCAL_HELPER_PORT,
@@ -148,23 +148,26 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(false);
 
     let audio_resolver = match resolver_url {
-        Some(url) => match AuthorizedResolverConfig::new_with_loopback(
-            url.clone(),
-            resolver_key,
-            allow_loopback_resolver,
-        ) {
-            Ok(cfg) => {
-                info!(
-                    "Authorized Audio Resolver configured: {} (loopback={})",
-                    cfg.endpoint_url, cfg.allow_loopback
-                );
-                Some(cfg)
+        Some(url) => {
+            let is_loopback = validate_loopback_resolver_url(&url).is_ok();
+            match AuthorizedResolverConfig::new_with_loopback(
+                url.clone(),
+                resolver_key,
+                allow_loopback_resolver || is_loopback,
+            ) {
+                Ok(cfg) => {
+                    info!(
+                        "Authorized Audio Resolver configured: {} (loopback={})",
+                        cfg.endpoint_url, cfg.allow_loopback
+                    );
+                    Some(cfg)
+                }
+                Err(e) => {
+                    warn!("Ignored invalid DHUN_AUDIO_RESOLVER_URL '{}': {}", url, e);
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Ignored invalid DHUN_AUDIO_RESOLVER_URL '{}': {}", url, e);
-                None
-            }
-        },
+        }
         None => None,
     };
 
