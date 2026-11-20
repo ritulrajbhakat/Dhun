@@ -1,0 +1,629 @@
+{
+  "frameworkUpdates": {
+    "entityBatchUpdate": {
+      "mutations": [
+        {
+          "entityKey": "EgZ0b3BiYXIg9QEoAQ%3D%3D",
+          "type": "ENTITY_MUTATION_TYPE_DELETE",
+          "options": {
+            "persistenceOption": "ENTITY_PERSISTENCE_OPTION_INMEMORY_AND_PERSIST"
+          }
+        },
+        {
+          "entityKey": "EgpIRUFUU0VFS0VSIJICKAE%3D",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "macroMarkersListEntity": {
+              "key": "EgpIRUFUU0VFS0VSIJICKAE%3D",
+              "externalVideoId": "am3QWc8A4xI",
+              "markersList": {
+                "markerType": "MARKER_TYPE_HEATMAP",
+                "markers": [
+                  {
+                    "startMillis": "0",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.044745048241097624
+                  },
+                  {
+                    "startMillis": "1960",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0
+                  },
+                  {
+                    "startMillis": "3920",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.07853609946792091
+                  },
+                  {
+                    "startMillis": "5880",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.09708819896203559
+                  },
+                  {
+                    "startMillis": "7840",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.10820481561497781
+                  },
+                  {
+                    "startMillis": "9800",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.12016599936225453
+                  },
+                  {
+                    "startMillis": "11760",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.1402734447405189
+                  },
+                  {
+                    "startMillis": "13720",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.17949215378433545
+                  },
+                  {
+                    "startMillis": "15680",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.2299970113639113
+                  },
+                  {
+                    "startMillis": "17640",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.25979078455972004
+                  },
+                  {
+                    "startMillis": "19600",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.26919662078573664
+                  },
+                  {
+                    "startMillis": "21560",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.27718499220826376
+                  },
+                  {
+                    "startMillis": "23520",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.3076310629703623
+                  },
+                  {
+                    "startMillis": "25480",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.34096299566474964
+                  },
+                  {
+                    "startMillis": "27440",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.35976429975055896
+                  },
+                  {
+                    "startMillis": "29400",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.36859669256393507
+                  },
+                  {
+                    "startMillis": "31360",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.3819709754868175
+                  },
+                  {
+                    "startMillis": "33320",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.4044895207650181
+                  },
+                  {
+                    "startMillis": "35280",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.4197894093869367
+                  },
+                  {
+                    "startMillis": "37240",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.4558494047557331
+                  },
+                  {
+                    "startMillis": "39200",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.4722605275752157
+                  },
+                  {
+                    "startMillis": "41160",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5104793259325027
+                  },
+                  {
+                    "startMillis": "43120",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5174413200494553
+                  },
+                  {
+                    "startMillis": "45080",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5198627883156153
+                  },
+                  {
+                    "startMillis": "47040",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5492500124147542
+                  },
+                  {
+                    "startMillis": "49000",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5636966026865711
+                  },
+                  {
+                    "startMillis": "50960",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5751593772504584
+                  },
+                  {
+                    "startMillis": "52920",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.6366251440884578
+                  },
+                  {
+                    "startMillis": "54880",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.6523961567194926
+                  },
+                  {
+                    "startMillis": "56840",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.704418888543883
+                  },
+                  {
+                    "startMillis": "58800",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7147936213083387
+                  },
+                  {
+                    "startMillis": "60760",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7050908314356494
+                  },
+                  {
+                    "startMillis": "62720",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7195356026958479
+                  },
+                  {
+                    "startMillis": "64680",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.726008737440407
+                  },
+                  {
+                    "startMillis": "66640",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7247397039849633
+                  },
+                  {
+                    "startMillis": "68600",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7450386912866251
+                  },
+                  {
+                    "startMillis": "70560",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7412972572397117
+                  },
+                  {
+                    "startMillis": "72520",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7356023866160035
+                  },
+                  {
+                    "startMillis": "74480",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.765431084834882
+                  },
+                  {
+                    "startMillis": "76440",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7596600885749517
+                  },
+                  {
+                    "startMillis": "78400",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7708962142912102
+                  },
+                  {
+                    "startMillis": "80360",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7673160356242511
+                  },
+                  {
+                    "startMillis": "82320",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7477662992081296
+                  },
+                  {
+                    "startMillis": "84280",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.756044984884923
+                  },
+                  {
+                    "startMillis": "86240",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7492366062991281
+                  },
+                  {
+                    "startMillis": "88200",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7473982222071851
+                  },
+                  {
+                    "startMillis": "90160",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7757145032161035
+                  },
+                  {
+                    "startMillis": "92120",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7719266843729258
+                  },
+                  {
+                    "startMillis": "94080",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7727719790719075
+                  },
+                  {
+                    "startMillis": "96040",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7945770170428655
+                  },
+                  {
+                    "startMillis": "98000",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8038090467087622
+                  },
+                  {
+                    "startMillis": "99960",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8361596226351258
+                  },
+                  {
+                    "startMillis": "101920",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8557900322165147
+                  },
+                  {
+                    "startMillis": "103880",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8505836571628766
+                  },
+                  {
+                    "startMillis": "105840",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.868616065037669
+                  },
+                  {
+                    "startMillis": "107800",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8656037817979148
+                  },
+                  {
+                    "startMillis": "109760",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.868891281495504
+                  },
+                  {
+                    "startMillis": "111720",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8905406120719433
+                  },
+                  {
+                    "startMillis": "113680",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9046555965257606
+                  },
+                  {
+                    "startMillis": "115640",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.910547193255978
+                  },
+                  {
+                    "startMillis": "117600",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9111078126367101
+                  },
+                  {
+                    "startMillis": "119560",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9081382761699838
+                  },
+                  {
+                    "startMillis": "121520",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9206783603647555
+                  },
+                  {
+                    "startMillis": "123480",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9177595743221771
+                  },
+                  {
+                    "startMillis": "125440",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9111989451187824
+                  },
+                  {
+                    "startMillis": "127400",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9362661985258366
+                  },
+                  {
+                    "startMillis": "129360",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9429159592985237
+                  },
+                  {
+                    "startMillis": "131320",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9450989551415364
+                  },
+                  {
+                    "startMillis": "133280",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9792692702907563
+                  },
+                  {
+                    "startMillis": "135240",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9817511297426408
+                  },
+                  {
+                    "startMillis": "137200",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 1
+                  },
+                  {
+                    "startMillis": "139160",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9982795788114979
+                  },
+                  {
+                    "startMillis": "141120",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.979984687560198
+                  },
+                  {
+                    "startMillis": "143080",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9880976612785723
+                  },
+                  {
+                    "startMillis": "145040",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9882073476791504
+                  },
+                  {
+                    "startMillis": "147000",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9735282877225265
+                  },
+                  {
+                    "startMillis": "148960",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.98351920903554
+                  },
+                  {
+                    "startMillis": "150920",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9705951314881643
+                  },
+                  {
+                    "startMillis": "152880",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9599719217366613
+                  },
+                  {
+                    "startMillis": "154840",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9429741676703063
+                  },
+                  {
+                    "startMillis": "156800",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9227342072956555
+                  },
+                  {
+                    "startMillis": "158760",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.9162221457024669
+                  },
+                  {
+                    "startMillis": "160720",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8822431905754825
+                  },
+                  {
+                    "startMillis": "162680",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8400852316083828
+                  },
+                  {
+                    "startMillis": "164640",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.8195815145490916
+                  },
+                  {
+                    "startMillis": "166600",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7848689520364835
+                  },
+                  {
+                    "startMillis": "168560",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7578755472269076
+                  },
+                  {
+                    "startMillis": "170520",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7495793080879987
+                  },
+                  {
+                    "startMillis": "172480",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.720731057131335
+                  },
+                  {
+                    "startMillis": "174440",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.7004649939399628
+                  },
+                  {
+                    "startMillis": "176400",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.6832028465349012
+                  },
+                  {
+                    "startMillis": "178360",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.6452208834903049
+                  },
+                  {
+                    "startMillis": "180320",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.6283739254870995
+                  },
+                  {
+                    "startMillis": "182280",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5968749198498006
+                  },
+                  {
+                    "startMillis": "184240",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5696240339456672
+                  },
+                  {
+                    "startMillis": "186200",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5732678780192637
+                  },
+                  {
+                    "startMillis": "188160",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5626257505469313
+                  },
+                  {
+                    "startMillis": "190120",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5539294198025972
+                  },
+                  {
+                    "startMillis": "192080",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5618641303823871
+                  },
+                  {
+                    "startMillis": "194040",
+                    "durationMillis": "1960",
+                    "intensityScoreNormalized": 0.5775767527404775
+                  }
+                ],
+                "markersMetadata": {
+                  "heatmapMetadata": {
+                    "maxHeightDp": 40,
+                    "minHeightDp": 4,
+                    "showHideAnimationDurationMillis": 200
+                  }
+                },
+                "markersDecoration": {
+                  "timedMarkerDecorations": [
+                    {
+                      "visibleTimeRangeStartMillis": 96040,
+                      "visibleTimeRangeEndMillis": 166600,
+                      "decorationTimeMillis": 98000,
+                      "label": {
+                        "runs": [
+                          {
+                            "text": "Most replayed"
+                          }
+                        ]
+                      },
+                      "icon": "UNKNOWN"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "entityKey": "EhxsaWtlX2J1dHRvbl9hbmltYXRpb25fZW50aXR5ILcEKAE%3D",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "likeButtonAnimationEntity": {
+              "key": "EhxsaWtlX2J1dHRvbl9hbmltYXRpb25fZW50aXR5ILcEKAE%3D",
+              "animationLightUrl": "https://www.gstatic.com/youtube/img/lottie/custom_animated_like_icon/animated_like_music_light_v5.json",
+              "animationDarkUrl": "https://www.gstatic.com/youtube/img/lottie/custom_animated_like_icon/animated_like_music_dark_v5.json"
+            }
+          }
+        },
+        {
+          "entityKey": "EgthbTNRV2M4QTR4SSA-KAE%3D",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "likeStatusEntity": {
+              "key": "EgthbTNRV2M4QTR4SSA-KAE%3D",
+              "likeStatus": "INDIFFERENT"
+            }
+          }
+        },
+        {
+          "entityKey": "EhhVQ3EtRmo1amtuTHNVZi1NV1N5NF9ickEgMygB",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "subscriptionStateEntity": {
+              "key": "EhhVQ3EtRmo1amtuTHNVZi1NV1N5NF9ickEgMygB",
+              "subscribed": false
+            }
+          }
+        },
+        {
+          "entityKey": "EhhVQ3EtRmo1amtuTHNVZi1NV1N5NF9ickEgjAEoAQ%3D%3D",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "subscriptionNotificationStateEntity": {
+              "key": "EhhVQ3EtRmo1amtuTHNVZi1NV1N5NF9ickEgjAEoAQ%3D%3D",
+              "state": "SUBSCRIPTION_NOTIFICATION_STATE_OCCASIONAL"
+            }
+          }
+        },
+        {
+          "entityKey": "EhhVQ2Y0cmREVWZqamJ4MFViR2FlaXJPRFEgMygB",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "subscriptionStateEntity": {
+              "key": "EhhVQ2Y0cmREVWZqamJ4MFViR2FlaXJPRFEgMygB",
+              "subscribed": false
+            }
+          }
+        },
+        {
+          "entityKey": "EhhVQ2Y0cmREVWZqamJ4MFViR2FlaXJPRFEgjAEoAQ%3D%3D",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "subscriptionNotificationStateEntity": {
+              "key": "EhhVQ2Y0cmREVWZqamJ4MFViR2FlaXJPRFEgjAEoAQ%3D%3D",
+              "state": "SUBSCRIPTION_NOTIFICATION_STATE_OCCASIONAL"
+            }
+          }
+        },
+        {
+          "entityKey": "EjFVQ3EtRmo1amtuTHNVZi1NV1N5NF9ickEsVUNmNHJkRFVmampieDBVYkdhZWlyT0RRIDMoAQ%3D%3D",
+          "type": "ENTITY_MUTATION_TYPE_REPLACE",
+          "payload": {
+            "subscriptionStateEntity": {
+              "key": "EjFVQ3EtRmo1amtuTHNVZi1NV1N5NF9ickEsVUNmNHJkRFVmampieDBVYkdhZWlyT0RRIDMoAQ%3D%3D",
+              "subscribed": false
+            }
+          }
+        }
+      ],
+      "timestamp": {
+        "seconds": "1795166834",
+        "nanos": 940884165
+      }
+    }
+  }
+}

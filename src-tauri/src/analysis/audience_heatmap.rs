@@ -17,6 +17,12 @@ pub struct ParsedHeatmapData {
     pub markers: Vec<HeatmapMarker>,
     pub labelled_regions: Vec<ReplayRegion>,
     pub parser_version: i32,
+    #[serde(default = "default_source_object")]
+    pub source_object: String,
+}
+
+fn default_source_object() -> String {
+    "unknown".to_string()
 }
 
 pub struct AudienceHeatmapAdapter;
@@ -92,6 +98,117 @@ impl AudienceHeatmapAdapter {
         id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }
 
+    /// Safely extracts a balanced JSON object from HTML starting after a prefix needle.
+    /// Tracks string escapes and brace nesting levels to avoid fragile substring splits.
+    pub fn extract_balanced_json(html: &str, needle: &str) -> Option<serde_json::Value> {
+        let pos = html.find(needle)?;
+        let start_pos = pos + needle.len();
+        let bytes = html.as_bytes();
+        let len = bytes.len();
+
+        let mut idx = start_pos;
+        while idx < len && (bytes[idx] == b' ' || bytes[idx] == b'\t' || bytes[idx] == b'\r' || bytes[idx] == b'\n' || bytes[idx] == b'=') {
+            idx += 1;
+        }
+
+        if idx >= len || (bytes[idx] != b'{' && bytes[idx] != b'[') {
+            return None;
+        }
+
+        let start_idx = idx;
+        let mut depth: usize = 0;
+        let mut in_string = false;
+        let mut is_escaped = false;
+
+        while idx < len {
+            let b = bytes[idx];
+
+            if in_string {
+                if is_escaped {
+                    is_escaped = false;
+                } else if b == b'\\' {
+                    is_escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        if depth > 0 {
+                            depth -= 1;
+                            if depth == 0 {
+                                let json_str = &html[start_idx..=idx];
+                                return serde_json::from_str(json_str).ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            idx += 1;
+        }
+
+        None
+    }
+
+    /// Extracts audience heatmap markers from watch page HTML.
+    /// Inspects both `ytInitialData` and `ytInitialPlayerResponse` without preferring either blindly.
+    /// Selects whichever object actually contains valid heatmap markers and reports the source.
+    /// If neither contains heatmap markers, returns a typed Err with an honest diagnostic reason.
+    pub fn extract_heatmap_from_watch_html(html: &str) -> Result<ParsedHeatmapData> {
+        let mut yt_initial_data = None;
+        let mut yt_player_response = None;
+
+        // Try extracting ytInitialData (supports variable declarations and window properties)
+        for needle in &["var ytInitialData = ", "ytInitialData = ", "window[\"ytInitialData\"] = "] {
+            if let Some(val) = Self::extract_balanced_json(html, needle) {
+                yt_initial_data = Some(val);
+                break;
+            }
+        }
+
+        // Try extracting ytInitialPlayerResponse
+        for needle in &["var ytInitialPlayerResponse = ", "ytInitialPlayerResponse = ", "window[\"ytInitialPlayerResponse\"] = "] {
+            if let Some(val) = Self::extract_balanced_json(html, needle) {
+                yt_player_response = Some(val);
+                break;
+            }
+        }
+
+        // Attempt 1: Check ytInitialData (standard desktop SSR location for macroMarkersListEntity)
+        if let Some(ref data) = yt_initial_data {
+            if let Ok(mut parsed) = Self::parse_player_response(data) {
+                if !parsed.markers.is_empty() {
+                    parsed.source_object = "ytInitialData".to_string();
+                    return Ok(parsed);
+                }
+            }
+        }
+
+        // Attempt 2: Check ytInitialPlayerResponse (historical or mobile SSR location)
+        if let Some(ref resp) = yt_player_response {
+            if let Ok(mut parsed) = Self::parse_player_response(resp) {
+                if !parsed.markers.is_empty() {
+                    parsed.source_object = "ytInitialPlayerResponse".to_string();
+                    return Ok(parsed);
+                }
+            }
+        }
+
+        // If neither produced valid markers, report diagnostic reason honestly
+        if yt_initial_data.is_some() || yt_player_response.is_some() {
+            Err(anyhow!(
+                "Audience heatmap unavailable: Watch page JSON was parsed successfully, but neither ytInitialData nor ytInitialPlayerResponse contained heatmap markers (this video may lack sufficient audience replay data or markers are ungenerated)"
+            ))
+        } else {
+            Err(anyhow!(
+                "Audience heatmap unavailable: Neither ytInitialData nor ytInitialPlayerResponse was found in watch HTML (page may be bot-gated, consent-blocked, or uses an unsupported markup structure)"
+            ))
+        }
+    }
+
     /// Fetches public YouTube watch page and attempts to extract embedded player response with heatmap markers.
     /// Strictly metadata-only: NEVER plays video, loads video streams, or creates video players.
     /// Honestly reports errors if YouTube rate limits (HTTP 429), blocks, or gates access.
@@ -127,21 +244,7 @@ impl AudienceHeatmapAdapter {
             .await
             .map_err(|e| anyhow!("Failed to read YouTube response body: {}", e))?;
 
-        let needle = "ytInitialPlayerResponse = ";
-        if let Some(pos) = html.find(needle) {
-            let start = pos + needle.len();
-            let slice = &html[start..];
-            if let Some(end_idx) = slice.find(";</script>").or_else(|| slice.find(";\n")) {
-                let json_str = &slice[..end_idx];
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    return Self::parse_player_response(&json_val);
-                }
-            }
-        }
-
-        Err(anyhow!(
-            "Audience heatmap unavailable: ytInitialPlayerResponse not found in public page (likely bot-gated or requires authentication)"
-        ))
+        Self::extract_heatmap_from_watch_html(&html)
     }
 
     /// Extracts raw heatmap markers and labelled regions from arbitrary YouTube player response JSON.
@@ -163,6 +266,7 @@ impl AudienceHeatmapAdapter {
                     markers,
                     labelled_regions,
                     parser_version: HEATMAP_PARSER_VERSION,
+                    source_object: "json_payload".to_string(),
                 });
             }
         }
@@ -251,6 +355,7 @@ impl AudienceHeatmapAdapter {
             markers,
             labelled_regions,
             parser_version: HEATMAP_PARSER_VERSION,
+            source_object: "json_payload".to_string(),
         })
     }
 

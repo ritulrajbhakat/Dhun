@@ -732,4 +732,219 @@ mod heatmap_hook_fusion_tests {
         assert_eq!(preserved.raw_markers.len(), 2, "Must NOT wipe out raw markers on failed retry");
         assert_eq!(preserved.extracted_regions.len(), 1, "Must NOT wipe out extracted regions on failed retry");
     }
+
+    // ========================================================================
+    // 6. Focused ytInitialData & Live Payload Validation Tests (am3QWc8A4xI)
+    // ========================================================================
+
+    #[test]
+    fn test_yt_initial_data_macro_markers_entity() {
+        let html = r#"
+            <!DOCTYPE html><html><head>
+            <script>
+            var ytInitialData = {
+                "frameworkUpdates": {
+                    "entityBatchUpdate": {
+                        "mutations": [
+                            {
+                                "payload": {
+                                    "macroMarkersListEntity": {
+                                        "markersList": {
+                                            "markerType": "MARKER_TYPE_HEATMAP",
+                                            "markers": [
+                                                { "startMillis": "0", "durationMillis": "2000", "intensityScoreNormalized": 0.15 },
+                                                { "startMillis": "2000", "durationMillis": "2000", "intensityScoreNormalized": 0.85 }
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            };
+            </script></head><body></body></html>
+        "#;
+
+        let parsed = AudienceHeatmapAdapter::extract_heatmap_from_watch_html(html)
+            .expect("Must extract heatmap from ytInitialData");
+        assert_eq!(parsed.source_object, "ytInitialData");
+        assert_eq!(parsed.markers.len(), 2);
+        assert_eq!(parsed.markers[1].start_ms, 2000);
+        assert_eq!(parsed.markers[1].intensity, 0.85);
+    }
+
+    #[test]
+    fn test_captured_fixture_100_markers() {
+        let fixture_str = include_str!("./fixtures/ishq_samajh_paaye_am3QWc8A4xI_frameworkUpdates.json");
+        let val: serde_json::Value = serde_json::from_str(fixture_str).expect("Valid JSON fixture");
+
+        let parsed = AudienceHeatmapAdapter::parse_player_response(&val)
+            .expect("Must parse real captured Ishq Samajh Paaye payload");
+        assert_eq!(parsed.markers.len(), 100, "Genuine captured payload must contain exactly 100 markers");
+    }
+
+    #[test]
+    fn test_captured_fixture_first_middle_last_markers() {
+        let fixture_str = include_str!("./fixtures/ishq_samajh_paaye_am3QWc8A4xI_frameworkUpdates.json");
+        let val: serde_json::Value = serde_json::from_str(fixture_str).expect("Valid JSON fixture");
+        let parsed = AudienceHeatmapAdapter::parse_player_response(&val).unwrap();
+
+        // 1. First marker (index 0)
+        let first = &parsed.markers[0];
+        assert_eq!(first.start_ms, 0);
+        assert_eq!(first.duration_ms, 1960);
+        assert!((first.intensity - 0.044745).abs() < 1e-4);
+
+        // 2. Middle marker (index 50)
+        let mid = &parsed.markers[50];
+        assert_eq!(mid.start_ms, 98000);
+        assert_eq!(mid.duration_ms, 1960);
+        assert!((mid.intensity - 0.803809).abs() < 1e-4);
+
+        // 3. Last marker (index 99)
+        let last = &parsed.markers[99];
+        assert_eq!(last.start_ms, 194040);
+        assert_eq!(last.duration_ms, 1960);
+        assert!((last.intensity - 0.577577).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_captured_fixture_global_peak_at_137200ms() {
+        let fixture_str = include_str!("./fixtures/ishq_samajh_paaye_am3QWc8A4xI_frameworkUpdates.json");
+        let val: serde_json::Value = serde_json::from_str(fixture_str).unwrap();
+        let parsed = AudienceHeatmapAdapter::parse_player_response(&val).unwrap();
+
+        // Extract smoothed regions
+        let regions = AudienceHeatmapAdapter::extract_replay_regions(&parsed.markers, &[]);
+        assert!(!regions.is_empty(), "Must extract at least one replay region");
+
+        // The highest peak must align to 137,200 ms (137.2s / 2:17 into track)
+        let highest = regions.iter().max_by(|a, b| a.peak_intensity.partial_cmp(&b.peak_intensity).unwrap()).unwrap();
+        assert_eq!(highest.peak_ms, 137200, "Global peak must be at 137,200ms");
+        assert!(highest.peak_intensity >= 0.99, "Peak intensity must be near 1.0");
+    }
+
+    #[test]
+    fn test_captured_fixture_secondary_peak_at_78400ms() {
+        let fixture_str = include_str!("./fixtures/ishq_samajh_paaye_am3QWc8A4xI_frameworkUpdates.json");
+        let val: serde_json::Value = serde_json::from_str(fixture_str).unwrap();
+        let parsed = AudienceHeatmapAdapter::parse_player_response(&val).unwrap();
+
+        // Check local maximum around 78,400ms (78.4s / 1:18, the first chorus entry)
+        let chorus_marker = parsed.markers.iter().find(|m| m.start_ms == 78400).expect("Marker at 78400ms");
+        assert!(chorus_marker.intensity >= 0.75, "First chorus intensity must be elevated (>= 0.75)");
+    }
+
+    #[test]
+    fn test_missing_yt_initial_data() {
+        let html = "<html><body><h1>No data here</h1></body></html>";
+        let res = AudienceHeatmapAdapter::extract_heatmap_from_watch_html(html);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Neither ytInitialData nor ytInitialPlayerResponse was found"));
+    }
+
+    #[test]
+    fn test_malformed_or_truncated_yt_initial_data() {
+        let truncated_html = r#"
+            <html><head><script>
+            var ytInitialData = { "frameworkUpdates": { "entityBatchUpdate": { "mutations": [ { "incomplete": true
+        "#;
+        let res = AudienceHeatmapAdapter::extract_heatmap_from_watch_html(truncated_html);
+        assert!(res.is_err(), "Truncated JSON must not panic and must return Err");
+    }
+
+    #[test]
+    fn test_yt_initial_player_response_fallback_compatibility() {
+        let html = r#"
+            <!DOCTYPE html><html><head><script>
+            var ytInitialPlayerResponse = {
+                "playerOverlays": {
+                    "playerOverlayRenderer": {
+                        "decoratedPlayerBarRenderer": {
+                            "playerBar": {
+                                "multiMarkersPlayerBarRenderer": {
+                                    "markersMap": [
+                                        {
+                                            "key": "HEATMAPS",
+                                            "value": {
+                                                "heatmap": {
+                                                    "heatMarkers": [
+                                                        {
+                                                            "heatMarkerRenderer": {
+                                                                "timeRangeStartMillis": 15000,
+                                                                "markerDurationMillis": 2000,
+                                                                "heatMarkerIntensityScoreNormalized": 0.88
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            </script></head><body></body></html>
+        "#;
+
+        let parsed = AudienceHeatmapAdapter::extract_heatmap_from_watch_html(html)
+            .expect("Must fall back to ytInitialPlayerResponse");
+        assert_eq!(parsed.source_object, "ytInitialPlayerResponse");
+        assert_eq!(parsed.markers.len(), 1);
+        assert_eq!(parsed.markers[0].start_ms, 15000);
+    }
+
+    #[test]
+    fn test_both_objects_present_correct_source_selected() {
+        // Both objects present: ytInitialPlayerResponse has empty/no markers, ytInitialData has valid markers
+        let html = r#"
+            <!DOCTYPE html><html><head><script>
+            var ytInitialPlayerResponse = { "playabilityStatus": { "status": "OK" }, "contents": {} };
+            var ytInitialData = {
+                "frameworkUpdates": {
+                    "entityBatchUpdate": {
+                        "mutations": [
+                            {
+                                "payload": {
+                                    "macroMarkersListEntity": {
+                                        "markersList": {
+                                            "markerType": "MARKER_TYPE_HEATMAP",
+                                            "markers": [
+                                                { "startMillis": "50000", "durationMillis": "2000", "intensityScoreNormalized": 0.95 }
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            };
+            </script></head><body></body></html>
+        "#;
+
+        let parsed = AudienceHeatmapAdapter::extract_heatmap_from_watch_html(html)
+            .expect("Must extract from valid source object");
+        assert_eq!(parsed.source_object, "ytInitialData");
+        assert_eq!(parsed.markers[0].start_ms, 50000);
+    }
+
+    #[test]
+    fn test_valid_watch_page_no_markers_returns_unavailable() {
+        let html = r#"
+            <!DOCTYPE html><html><head><script>
+            var ytInitialData = { "contents": { "twoColumnWatchNextResults": {} } };
+            var ytInitialPlayerResponse = { "playabilityStatus": { "status": "OK" } };
+            </script></head><body></body></html>
+        "#;
+
+        let res = AudienceHeatmapAdapter::extract_heatmap_from_watch_html(html);
+        assert!(res.is_err(), "Must return Err when page JSON exists but has no heatmap");
+        let err_str = res.unwrap_err().to_string();
+        assert!(err_str.contains("neither ytInitialData nor ytInitialPlayerResponse contained heatmap markers"));
+    }
 }
