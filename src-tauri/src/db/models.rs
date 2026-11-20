@@ -61,7 +61,7 @@ pub struct BeatGridPoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhraseMarker {
-    pub section_type: String, // 'intro', 'verse', 'chorus', 'instrumental', 'groove', 'breakdown', 'build', 'drop', 'peak', 'outro', 'phrase'
+    pub section_type: String, // 'intro', 'verse', 'pre_chorus', 'chorus', 'instrumental', 'groove', 'breakdown', 'build', 'drop', 'bridge', 'peak', 'outro', 'phrase'
     pub start_ms: i64,
     pub end_ms: i64,
     pub energy_level: f64,
@@ -73,6 +73,33 @@ pub struct PhraseMarker {
     pub confidence: f64,
     #[serde(default)]
     pub bar_index: i32,
+    #[serde(default)]
+    pub sub_bass_energy: f64,
+    #[serde(default)]
+    pub mid_energy: f64,
+    #[serde(default)]
+    pub high_energy: f64,
+    #[serde(default)]
+    pub loudness_lufs_est: f64,
+}
+
+impl Default for PhraseMarker {
+    fn default() -> Self {
+        Self {
+            section_type: "phrase".to_string(),
+            start_ms: 0,
+            end_ms: 0,
+            energy_level: 0.5,
+            bass_energy: 0.4,
+            vocal_activity: 0.3,
+            confidence: 0.6,
+            bar_index: 0,
+            sub_bass_energy: 0.35,
+            mid_energy: 0.45,
+            high_energy: 0.40,
+            loudness_lufs_est: -14.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +132,116 @@ pub struct TrackTimingProfile {
     pub tempo_map: Vec<TempoSegment>,
     pub beat_timestamps_ms: Vec<i64>,
     pub downbeat_timestamps_ms: Vec<i64>,
+    // Version 3 enriched musical analysis:
+    #[serde(default)]
+    pub alternative_bpms: Vec<f64>,
+    #[serde(default)]
+    pub sub_bass_energy: f64,
+    #[serde(default)]
+    pub mid_energy: f64,
+    #[serde(default)]
+    pub high_energy: f64,
+    #[serde(default)]
+    pub dynamic_range_db: f64,
+    #[serde(default)]
+    pub kick_presence: f64,
+    #[serde(default)]
+    pub snare_clap_presence: f64,
+    #[serde(default)]
+    pub hihat_presence: f64,
+    #[serde(default)]
+    pub syncopation_index: f64,
+    #[serde(default = "default_rhythm_pattern")]
+    pub rhythmic_pattern_detected: String,
+    #[serde(default = "default_rhythm_conf")]
+    pub rhythm_confidence: f64,
+    #[serde(default)]
+    pub has_lead_vocal: bool,
+    #[serde(default)]
+    pub has_backing_vocal: bool,
+    #[serde(default = "default_vocal_conf")]
+    pub vocal_confidence: f64,
+    // Version 4 multi-cue & non-musical structural classification:
+    #[serde(default)]
+    pub first_musical_ms: i64,
+    #[serde(default)]
+    pub dialogue_end_ms: i64,
+    #[serde(default)]
+    pub main_drop_ms: i64,
+    #[serde(default)]
+    pub first_vocal_entry_ms: i64,
+    #[serde(default)]
+    pub first_hook_ms: i64,
+    #[serde(default)]
+    pub has_theatrical_alaap: bool,
+    #[serde(default)]
+    pub theatrical_alaap_start_ms: i64,
+    #[serde(default)]
+    pub theatrical_alaap_end_ms: i64,
+    #[serde(default)]
+    pub mix_in_point_ms: i64,
+    #[serde(default)]
+    pub mix_out_point_ms: i64,
+    // Version 5 Hook Intelligence & Audience Heatmap Fusion:
+    #[serde(default)]
+    pub hook_candidates: Vec<HookCandidate>,
+    #[serde(default)]
+    pub timeline_alignment: Option<TimelineAlignment>,
+    #[serde(default = "default_profile_version_4")]
+    pub profile_version: i32,
+}
+
+fn default_profile_version_4() -> i32 {
+    4
+}
+
+impl Default for TrackTimingProfile {
+    fn default() -> Self {
+        Self {
+            average_bpm: 120.0,
+            beatgrid_confidence: 0.75,
+            bpm_confidence: 0.85,
+            downbeat_confidence: 0.80,
+            downbeat_offset_ms: 0,
+            is_variable_tempo: false,
+            tempo_drift_bpm: 0.0,
+            meter: MeterAnalysis {
+                beats_per_bar: 4,
+                meter_label: "4/4".to_string(),
+                confidence: 0.80,
+            },
+            tempo_map: Vec::new(),
+            beat_timestamps_ms: Vec::new(),
+            downbeat_timestamps_ms: Vec::new(),
+            alternative_bpms: vec![60.0, 240.0, 90.0],
+            sub_bass_energy: 0.35,
+            mid_energy: 0.45,
+            high_energy: 0.40,
+            dynamic_range_db: 12.0,
+            kick_presence: 0.70,
+            snare_clap_presence: 0.65,
+            hihat_presence: 0.60,
+            syncopation_index: 0.20,
+            rhythmic_pattern_detected: "standard_pop_groove".to_string(),
+            rhythm_confidence: 0.70,
+            has_lead_vocal: true,
+            has_backing_vocal: false,
+            vocal_confidence: 0.75,
+            first_musical_ms: 0,
+            dialogue_end_ms: 0,
+            main_drop_ms: 0,
+            first_vocal_entry_ms: 0,
+            first_hook_ms: 0,
+            has_theatrical_alaap: false,
+            theatrical_alaap_start_ms: 0,
+            theatrical_alaap_end_ms: 0,
+            mix_in_point_ms: 0,
+            mix_out_point_ms: 0,
+            hook_candidates: Vec::new(),
+            timeline_alignment: None,
+            profile_version: 4,
+        }
+    }
 }
 
 fn default_bpm_conf() -> f64 {
@@ -113,6 +250,137 @@ fn default_bpm_conf() -> f64 {
 
 fn default_downbeat_conf() -> f64 {
     0.80
+}
+
+fn default_rhythm_pattern() -> String {
+    "unclassified".to_string()
+}
+
+fn default_rhythm_conf() -> f64 {
+    0.50
+}
+
+fn default_vocal_conf() -> f64 {
+    0.60
+}
+
+fn default_profile_version_3() -> i32 {
+    3
+}
+
+/// Single audience engagement marker from YouTube Player response
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeatmapMarker {
+    pub start_ms: i64,
+    pub duration_ms: i64,
+    pub intensity: f64, // Normalized 0.0 - 1.0
+}
+
+/// Extracted continuous audience replay-interest region
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplayRegion {
+    pub id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub peak_ms: i64,
+    pub peak_intensity: f64,
+    pub avg_intensity: f64,
+    pub is_youtube_labelled: bool,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Verification status of timeline relationship between video and authorized audio
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineAlignmentStatus {
+    Verified,
+    PartiallyVerified,
+    Unverified,
+    Incompatible,
+    Unavailable,
+}
+
+impl TimelineAlignmentStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::PartiallyVerified => "partially_verified",
+            Self::Unverified => "unverified",
+            Self::Incompatible => "incompatible",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Vertical timeline alignment between YouTube video and DHUN authorized audio
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelineAlignment {
+    pub video_to_audio_offset_ms: i64, // audio_ms = video_ms - offset_ms
+    pub alignment_confidence: f64,     // 0.0 to 1.0
+    pub matched_event_count: usize,
+    pub duration_discrepancy_ms: i64,  // abs(video_duration - audio_duration)
+    pub alignment_method: String,      // "acoustic_landmark", "duration_and_skit_offset", "section_boundary_match", "fallback_unavailable"
+    pub status: TimelineAlignmentStatus,
+}
+
+/// Evaluated Hook Candidate containing independent Stage 1, Stage 2, Stage 3, and Stage 4 values
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HookCandidate {
+    pub id: String,
+    pub track_id: String,
+    #[serde(default)]
+    pub video_id: Option<String>,
+    // Video timeline coordinates (ms)
+    #[serde(default)]
+    pub video_start_ms: Option<i64>,
+    #[serde(default)]
+    pub video_end_ms: Option<i64>,
+    // Audio timeline coordinates (ms) — only populated/mapped if alignment is verified or partially_verified
+    pub audio_start_ms: i64,
+    pub audio_end_ms: i64,
+    // Independent stage scores:
+    pub dhun_musical_score: f64,              // Stage 1: 0.0 - 1.0
+    #[serde(default)]
+    pub audience_replay_score: Option<f64>,   // Stage 2: 0.0 - 1.0 (None if unavailable)
+    pub combined_hook_score: f64,             // Stage 2: 65% audience + 35% musical, or 100% musical fallback
+    pub alignment_status: TimelineAlignmentStatus, // Stage 3
+    #[serde(default)]
+    pub alignment_offset_ms: i64,             // Stage 3
+    #[serde(default)]
+    pub dj_usability_score: f64,              // Stage 4: 0.0 - 1.0
+    // Stage 4 distinction flags:
+    #[serde(default)]
+    pub is_audience_popular: bool,            // 1. Audience-popular moment
+    #[serde(default)]
+    pub is_musical_hook: bool,                // 2. Musically strong hook
+    #[serde(default)]
+    pub is_aligned_hook: bool,                // 3. Verified audio-aligned hook
+    #[serde(default)]
+    pub is_usable_entry: bool,                // 4. DJ-usable entry point
+    #[serde(default)]
+    pub is_usable_exit: bool,                 // 5. DJ-usable exit point
+    pub candidate_type: String,               // "chorus", "main_drop", "popular_hook", "vocal_hook", "peak"
+    pub entry_cue_ms: i64,                    // Snapped to downbeat / phrase boundary
+    pub exit_cue_ms: i64,                     // Safe exit timestamp
+    #[serde(default)]
+    pub usability_reasons: Vec<String>,
+    #[serde(default)]
+    pub rejection_reasons: Vec<String>,
+}
+
+/// Complete stored audience heatmap entity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackAudienceHeatmap {
+    pub id: String,
+    pub track_id: String,
+    pub provider_video_id: String,
+    pub retrieval_status: String,             // "available", "unavailable", "failed", "blocked"
+    pub raw_markers: Vec<HeatmapMarker>,
+    pub labelled_regions: Vec<ReplayRegion>,
+    pub extracted_regions: Vec<ReplayRegion>,
+    pub parser_version: i32,
+    pub retrieved_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

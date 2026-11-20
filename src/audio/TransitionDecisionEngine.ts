@@ -78,6 +78,12 @@ export interface TrackDecisionInput {
   genreTags?: string[];
   sections?: TrackSectionMarker[];
   timingProfile?: TrackTimingProfile | null;
+  vocalDensity?: number | null;
+  isElectronicDance?: boolean;
+  isAcousticBallad?: boolean;
+  isPercussionHeavy?: boolean;
+  predictedEnergyDirection?: string | null;
+  vocalStyle?: string | null;
 }
 
 export interface PartyDecisionContext {
@@ -302,35 +308,66 @@ export function evaluateBpmRelationship(
 function classifyMoodRhythm(moodId: string, outGenres: string[], inGenres: string[]) {
   const m = (moodId || '').toLowerCase();
   const g = [...outGenres, ...inGenres].join(' ').toLowerCase();
+
+  const isShaadiRegal = m.includes('shaadi');
+  const isBaraatDholProcession = m.includes('baraat');
+  const isMehendiWarmth = m.includes('mehendi');
+  const isHaldiFolk = m.includes('haldi');
+  const isSangeetChoreography = m.includes('sangeet');
+  const isDesiClub = m.includes('desi_club');
+  const isPunjabiTashan = m.includes('punjabi_tashan');
+  const isGarbaCyclic = m.includes('garba') && !m.includes('dandiya');
+  const isDandiyaSticks = m.includes('dandiya');
+  const isRetroBollywood = m.includes('retro');
+  const isHouseParty = m.includes('house_party');
+  const isCocktailLounge = m.includes('cocktail');
+  const isFestivalMainstage = m.includes('festival');
+  const isInternationalGlobal = m.includes('international');
+
   const isCyclicFolkGarba =
-    m.includes('garba') || m.includes('dandiya') || g.includes('garba') || g.includes('dandiya');
+    isGarbaCyclic || isDandiyaSticks || g.includes('garba') || g.includes('dandiya');
   const isPercussionHeavyDhol =
-    m.includes('baraat') || g.includes('dhol') || g.includes('bhangra');
+    isBaraatDholProcession || isPunjabiTashan || g.includes('dhol') || g.includes('bhangra');
   const isIndianVocalCentric =
-    m.includes('shaadi') ||
-    m.includes('bollywood') ||
-    m.includes('mehendi') ||
-    m.includes('haldi') ||
-    m.includes('sangeet') ||
-    m.includes('retro_bollywood') ||
-    m.includes('punjabi') ||
+    isShaadiRegal ||
+    isMehendiWarmth ||
+    isHaldiFolk ||
+    isSangeetChoreography ||
+    isRetroBollywood ||
     g.includes('bollywood') ||
     g.includes('punjabi') ||
     g.includes('sufi');
   const isElectronicClub =
-    m.includes('desi_club') ||
+    isDesiClub ||
+    isFestivalMainstage ||
+    isCocktailLounge ||
     m.includes('house') ||
     m.includes('club') ||
     g.includes('edm') ||
     g.includes('house') ||
     g.includes('techno') ||
     g.includes('remix');
+
   return {
+    isShaadiRegal,
+    isBaraatDholProcession,
+    isMehendiWarmth,
+    isHaldiFolk,
+    isSangeetChoreography,
+    isDesiClub,
+    isPunjabiTashan,
+    isGarbaCyclic,
+    isDandiyaSticks,
+    isRetroBollywood,
+    isHouseParty,
+    isCocktailLounge,
+    isFestivalMainstage,
+    isInternationalGlobal,
     isCyclicFolkGarba,
     isPercussionHeavyDhol,
     isIndianVocalCentric,
     isElectronicClub,
-    preferShortCleanMix: isPercussionHeavyDhol || isCyclicFolkGarba,
+    preferShortCleanMix: isBaraatDholProcession || (isPercussionHeavyDhol && !isShaadiRegal && !isMehendiWarmth),
   };
 }
 
@@ -368,13 +405,13 @@ export function planDjTransition(
 
   const outVariable = Boolean(
     outgoing.timingProfile &&
-      (outgoing.timingProfile.is_variable_tempo ||
-        outgoing.timingProfile.tempo_drift_bpm >= policy.maxVariableDriftBpm)
+    (outgoing.timingProfile.is_variable_tempo ||
+      outgoing.timingProfile.tempo_drift_bpm >= policy.maxVariableDriftBpm)
   );
   const inVariable = Boolean(
     incoming.timingProfile &&
-      (incoming.timingProfile.is_variable_tempo ||
-        incoming.timingProfile.tempo_drift_bpm >= policy.maxVariableDriftBpm)
+    (incoming.timingProfile.is_variable_tempo ||
+      incoming.timingProfile.tempo_drift_bpm >= policy.maxVariableDriftBpm)
   );
 
   // Reject transition cleanly when remaining playback time is insufficient (< 1.2s)
@@ -413,6 +450,8 @@ export function planDjTransition(
       musical_duration_sec: 0.50,
       vocal_overlap_policy: 'clean_cut_handover',
       energy_progression: 'reset',
+      musical_purpose: 'create_breathing_room',
+      vocal_handover_type: 'clean_instrumental',
       eq_bass_handover_schedule: {
         incoming_low_cut_until_frac: 0,
         bass_swap_at_frac: 0.5,
@@ -451,20 +490,24 @@ export function planDjTransition(
   let outEnergy = outgoing.overallEnergy ?? 0.7;
 
   if (upcomingOut.length > 0) {
-    let best: { sec: TrackSectionMarker; exitPt: number; sc: number } | null = null;
+    let best: { sec: TrackSectionMarker; exitPt: number; sc: number; sType: string; vocalAct: number; energyLevel: number } | null = null;
     for (let i = 0; i < upcomingOut.length; i++) {
-      const sec = upcomingOut[i];
-      const st = Math.max(outgoing.currentPosSec + 1.0, sec.start_ms / 1000);
-      const en = Math.min(outgoing.durationSec, sec.end_ms / 1000);
-      if (sec.section_type === 'build') {
-        const nextSec = upcomingOut[i + 1];
-        if (nextSec && ['drop', 'peak', 'chorus'].includes(nextSec.section_type)) {
+      const sec = upcomingOut[i] as any;
+      const sType = sec.section_type || sec.sectionType || 'phrase';
+      const startMs = sec.start_ms ?? sec.startMs ?? 0;
+      const endMs = sec.end_ms ?? sec.endMs ?? (outgoing.durationSec * 1000);
+      const st = Math.max(outgoing.currentPosSec + 1.0, startMs / 1000);
+      const en = Math.min(outgoing.durationSec, endMs / 1000);
+      if (sType === 'build') {
+        const nextSec = upcomingOut[i + 1] as any;
+        const nextType = nextSec ? (nextSec.section_type || nextSec.sectionType) : null;
+        if (nextType && ['drop', 'peak', 'chorus'].includes(nextType)) {
           continue; // Never cut a build-up right before its drop/payoff!
         }
       }
       let sc = 0;
       let exitPt = st;
-      switch (sec.section_type) {
+      switch (sType) {
         case 'outro':
           sc += 5.0;
           exitPt = st;
@@ -496,54 +539,95 @@ export function planDjTransition(
           exitPt = st;
       }
       if (outgoing.durationSec - exitPt < 2.0) sc -= 2.5;
-      if ((sec.vocal_activity ?? 0.45) < 0.40) sc += 0.8;
-      if (!best || sc > best.sc) best = { sec, exitPt, sc };
+      const vocalAct = sec.vocal_activity ?? sec.vocalActivity ?? 0.45;
+      if (vocalAct < 0.40) sc += 0.8;
+      if (!best || sc > best.sc) best = { sec, exitPt, sc, sType, vocalAct, energyLevel: sec.energy_level ?? sec.energyLevel ?? 0.7 };
     }
     if (best) {
       if (protectingBuild) {
         reasons.push('Protected active build-up so its drop/payoff completes before mix-out.');
       }
       outMixOutSec = best.exitPt;
-      outSectionType = best.sec.section_type;
-      outVocalAct = best.sec.vocal_activity ?? 0.45;
-      outEnergy = best.sec.energy_level;
+      outSectionType = best.sType;
+      outVocalAct = best.vocalAct;
+      outEnergy = best.energyLevel;
     }
   }
 
   // Select incoming entry point (avoiding vocal clash & competing drops!)
   const inSections = incoming.sections || [];
-  let inMixInSec = 0;
+  const inDialogueEndSec = (incoming.timingProfile?.dialogue_end_ms ?? 0) / 1000;
+  const inMainDropSec = (incoming.timingProfile?.main_drop_ms ?? 0) / 1000;
+  const inHasTheatricalAlaap = incoming.timingProfile?.has_theatrical_alaap ?? false;
+  const inFirstHookSec = (incoming.timingProfile?.first_hook_ms ?? 0) / 1000;
+
+  let inMixInSec = inMainDropSec > 0 ? inMainDropSec : inDialogueEndSec;
   let inSectionType = 'intro';
   let inVocalAct = 0.25;
   let inEnergy = incoming.overallEnergy ?? 0.7;
 
   if (inSections.length > 0) {
-    let bestIn: { sec: TrackSectionMarker; sc: number } | null = null;
-    for (const sec of inSections) {
-      const st = Math.max(0, sec.start_ms / 1000);
-      if (incoming.durationSec - st < 12.0 || sec.section_type === 'outro') continue;
+    let bestIn: { sec: TrackSectionMarker; sc: number; sType: string; vocalAct: number; energyLevel: number } | null = null;
+    for (const raw of inSections) {
+      const sec = raw as any;
+      const sType = sec.section_type || sec.sectionType || 'intro';
+      const startMs = sec.start_ms ?? sec.startMs ?? 0;
+      const st = Math.max(0, startMs / 1000);
+      if (incoming.durationSec - st < 12.0 || sType === 'outro') continue;
+
+      // CRITICAL: Never cue inside spoken dialogue / comedy skits!
+      if (inDialogueEndSec > 0 && st < inDialogueEndSec) continue;
+
       let sc = 0;
-      const t = sec.section_type;
-      if (t === 'intro' && ['chorus', 'peak', 'outro', 'verse'].includes(outSectionType)) sc += 4.5;
-      else if ((t === 'instrumental' || t === 'groove') && outVocalAct >= 0.50) sc += 4.8;
-      else if (t === 'breakdown' && ['outro', 'peak', 'chorus'].includes(outSectionType)) sc += 4.0;
-      else if (t === 'build' && ['breakdown', 'groove', 'outro'].includes(outSectionType)) sc += 4.3;
-      else if (['drop', 'chorus', 'peak'].includes(t) && outSectionType === 'breakdown') sc += 4.6;
-      else if (t === 'intro') sc += 3.2;
-      else if (t === 'groove' || t === 'instrumental') sc += 3.5;
-      else if (t === 'chorus') sc += 2.4;
+      const vocalAct = sec.vocal_activity ?? sec.vocalActivity ?? 0.25;
+      const energyLevel = sec.energy_level ?? sec.energyLevel ?? (incoming.overallEnergy ?? 0.7);
 
-      if (outVocalAct >= 0.55 && (sec.vocal_activity ?? 0.25) >= 0.55) sc -= 4.5;
-      if (outSectionType === 'drop' && t === 'drop') sc -= 5.0;
-      sc -= Math.abs(sec.energy_level - party.targetEnergy) * 1.2;
+      if (sType === 'intro' && ['chorus', 'peak', 'outro', 'verse'].includes(outSectionType)) sc += 4.5;
+      else if ((sType === 'instrumental' || sType === 'groove') && outVocalAct >= 0.50) sc += 4.8;
+      else if (sType === 'breakdown' && ['outro', 'peak', 'chorus'].includes(outSectionType)) sc += 4.0;
+      else if (sType === 'build' && ['breakdown', 'groove', 'outro'].includes(outSectionType)) sc += 4.3;
+      else if (['drop', 'chorus', 'peak'].includes(sType) && outSectionType === 'breakdown') sc += 4.6;
+      else if (sType === 'intro') sc += 3.2;
+      else if (sType === 'groove' || sType === 'instrumental') sc += 3.5;
+      else if (sType === 'chorus') sc += 2.4;
 
-      if (!bestIn || sc > bestIn.sc) bestIn = { sec, sc };
+      // High energy preference: favor main drops and hooks over beatless intros
+      if (party.targetEnergy >= 0.65 || outEnergy >= 0.70) {
+        if (Math.abs(st - inMainDropSec) < 1.5 || Math.abs(st - inFirstHookSec) < 1.5 || sType === 'drop') {
+          sc += 4.0;
+        } else if (sType === 'intro' && energyLevel < 0.50) {
+          sc -= 3.5;
+        }
+      }
+
+      // Stage 4 Hook Candidate Intelligence Fusion:
+      if (incoming.timingProfile?.hook_candidates) {
+        const matchingCand = incoming.timingProfile.hook_candidates.find(
+          c => Math.abs(c.entry_cue_ms / 1000 - st) < 1.5
+        );
+        if (matchingCand) {
+          if (matchingCand.is_usable_entry) {
+            const popBonus = matchingCand.is_audience_popular ? 2.5 : 0;
+            const musBonus = matchingCand.is_musical_hook ? 1.5 : 0;
+            sc += popBonus + musBonus + matchingCand.combined_hook_score * 3.0;
+          } else {
+            sc -= 5.0; // Unusable entry penalized
+          }
+        }
+      }
+
+      if (outVocalAct >= 0.55 && vocalAct >= 0.55) sc -= 4.5;
+      if (outSectionType === 'drop' && sType === 'drop') sc -= 5.0;
+      sc -= Math.abs(energyLevel - party.targetEnergy) * 1.2;
+
+      if (!bestIn || sc > bestIn.sc) bestIn = { sec, sc, sType, vocalAct, energyLevel };
     }
     if (bestIn) {
-      inMixInSec = Math.max(0, bestIn.sec.start_ms / 1000);
-      inSectionType = bestIn.sec.section_type;
-      inVocalAct = bestIn.sec.vocal_activity ?? 0.25;
-      inEnergy = bestIn.sec.energy_level;
+      const rawSec = bestIn.sec as any;
+      inMixInSec = Math.max(0, (rawSec.start_ms ?? rawSec.startMs ?? 0) / 1000);
+      inSectionType = bestIn.sType;
+      inVocalAct = bestIn.vocalAct;
+      inEnergy = bestIn.energyLevel;
     }
   }
 
@@ -561,19 +645,68 @@ export function planDjTransition(
   );
   reasons.push(bpmDecision.reason);
 
+  // 4. Musical Vocal Interaction, Vocal Overlap Policy & Harmonic Key Evaluation
+  const outHasVocal = outSectionType === 'outro'
+    ? outVocalAct >= 0.45
+    : outVocalAct >= 0.40 || Boolean(outgoing.isAcousticBallad) || ((outgoing.vocalDensity ?? 0) >= 0.65 && !['instrumental', 'groove', 'breakdown'].includes(outSectionType));
+
+  const inHasVocal = inSectionType === 'intro'
+    ? inVocalAct >= 0.45
+    : inVocalAct >= 0.40 || ((incoming.vocalDensity ?? 0) >= 0.65 && !['instrumental', 'groove'].includes(inSectionType));
+
+  const outIsChorus = outSectionType === 'chorus' || outSectionType === 'peak';
+  const inIsChorus = inSectionType === 'chorus' || inSectionType === 'peak';
+  const outIsRap = (outgoing.genreTags || []).some((g) => {
+    const gl = g.toLowerCase();
+    return gl.includes('rap') || gl.includes('hip') || gl.includes('trap');
+  });
+  const inIsRap = (incoming.genreTags || []).some((g) => {
+    const gl = g.toLowerCase();
+    return gl.includes('rap') || gl.includes('hip') || gl.includes('trap');
+  });
+
+  const isRapMelodicPair =
+    (outIsRap && !inIsRap && (outHasVocal || inHasVocal)) ||
+    (!outIsRap && inIsRap && (outHasVocal || Boolean(outgoing.isAcousticBallad))) ||
+    (Boolean(outgoing.isAcousticBallad) && inIsRap);
+
   const vocalClash = outVocalAct >= 0.55 && inVocalAct >= 0.55;
+  const vocalHandoverType = isRapMelodicPair
+    ? 'rap_to_melodic'
+    : outHasVocal && inHasVocal
+    ? outIsChorus && inIsChorus
+      ? 'chorus_to_chorus'
+      : moodRhythm.isIndianVocalCentric && (outSectionType === 'verse' || inSectionType === 'verse')
+      ? 'call_and_response'
+      : 'competing_lead_vocals'
+    : outHasVocal && !inHasVocal
+    ? 'vocal_over_instrumental'
+    : !outHasVocal && inHasVocal
+    ? 'instrumental_to_vocal'
+    : 'clean_instrumental';
+
   const vocalOverlapPolicy = vocalClash
     ? 'avoid_vocal_clash'
-    : outVocalAct >= 0.50 && inVocalAct <= 0.35
+    : vocalHandoverType === 'vocal_over_instrumental'
     ? 'instrumental_under_vocal'
+    : vocalHandoverType === 'instrumental_to_vocal'
+    ? 'instrumental_lift_into_vocal'
+    : vocalHandoverType === 'rap_to_melodic'
+    ? 'rap_melodic_carve'
+    : vocalHandoverType === 'call_and_response'
+    ? 'call_and_response_handover'
     : bpmDecision.relationship === 'no_beatmatch'
     ? 'clean_cut_handover'
     : 'vocal_clear_blend';
 
   if (vocalClash) {
-    reasons.push('High vocal activity on both decks — enforcing vocal-clash avoidance.');
-  } else if (vocalOverlapPolicy === 'instrumental_under_vocal') {
+    reasons.push('High vocal activity on both decks — enforcing vocal-clash avoidance (clean handover / mid carve).');
+  } else if (vocalHandoverType === 'vocal_over_instrumental') {
     reasons.push('Incoming instrumental/intro cleanly supports outgoing vocal phrase.');
+  } else if (vocalHandoverType === 'chorus_to_chorus') {
+    reasons.push('Chorus-to-chorus handover: delaying mix-out until outgoing hook phrase completes, then launching incoming hook on downbeat.');
+  } else if (vocalHandoverType === 'rap_to_melodic') {
+    reasons.push('Rap-to-melodic transition: carving low-mids on melodic/vocal range while cleanly catching rhyme scheme/groove entrance.');
   }
 
   const keyCompat = calculateCamelotCompatibility(outgoing.camelotKey, incoming.camelotKey);
@@ -582,12 +715,30 @@ export function planDjTransition(
     energyDelta >= 0.12
       ? 'build'
       : energyDelta <= -0.14
-      ? 'drop_relief'
-      : outEnergy >= 0.8 && inEnergy >= 0.8
-      ? 'peak_hold'
-      : 'sustain';
+        ? 'drop_relief'
+        : outEnergy >= 0.8 && inEnergy >= 0.8
+          ? 'peak_hold'
+          : 'sustain';
 
-  const recentUsed = (name: string) => party.recentTechniques.slice(0, 2).includes(name);
+  const musicalPurpose = (protectingBuild || (activeOut?.section_type === 'chorus' && outSectionType === 'chorus'))
+    ? 'protect_hook'
+    : energyDelta >= 0.10 || incoming.predictedEnergyDirection === 'boost' || moodRhythm.isBaraatDholProcession || moodRhythm.isFestivalMainstage
+    ? 'build_excitement'
+    : energyDelta <= -0.12 || incoming.predictedEnergyDirection === 'relief' || moodRhythm.isMehendiWarmth
+    ? 'create_breathing_room'
+    : outSectionType === 'breakdown' && (inSectionType === 'drop' || inSectionType === 'peak')
+    ? 'dramatic_drop'
+    : bpmDecision.relationship === 'half_time' || bpmDecision.relationship === 'double_time'
+    ? 'intentional_surprise'
+    : genresConflict && party.djLevel >= 3
+    ? 'smooth_genre_shift'
+    : outSectionType !== inSectionType && !outgoing.isElectronicDance && (incoming.isPercussionHeavy || incoming.isElectronicDance)
+    ? 'introduce_new_groove'
+    : 'preserve_dance_momentum';
+
+  const djLevel = party.djLevel ?? (party as any).dj_level ?? 1;
+  const recentTechs = party.recentTechniques ?? (party as any).recent_techniques ?? [];
+  const recentUsed = (name: string) => recentTechs.slice(0, 2).includes(name);
 
   let selectedTechnique: DjTechniqueId;
   if (bpmDecision.relationship === 'no_beatmatch') {
@@ -595,14 +746,14 @@ export function planDjTransition(
       { technique: 'phrase_long_blend', reason: 'Rejected: no reliable beatmatch/meter alignment for multi-bar blend.' },
       { technique: 'timed_bass_swap', reason: 'Rejected: requires beat-locked tempo match.' }
     );
-    if (party.djLevel >= 4 && genresConflict && !recentUsed('backspin_cut')) {
+    if (djLevel >= 4 && genresConflict && !recentUsed('backspin_cut')) {
       selectedTechnique = 'backspin_cut';
-    } else if (party.djLevel >= 3 && !moodRhythm.isPercussionHeavyDhol) {
+    } else if (djLevel >= 3 && !moodRhythm.isPercussionHeavyDhol) {
       selectedTechnique = 'echo_out_blend';
-    } else if (party.djLevel === 2 && beatgridConfidence >= 0.50 && remainingSec >= 5.0 && !recentUsed('filter_sweep_drop')) {
+    } else if (djLevel === 2 && beatgridConfidence >= 0.50 && remainingSec >= 5.0 && !recentUsed('filter_sweep_drop')) {
       reasons.push('Level 2 filter sweep drop resolves cleanly into incoming track without tempo clash.');
       selectedTechnique = 'filter_sweep_drop';
-    } else if ((party.djLevel === 1 || party.djLevel === 2) && beatgridConfidence >= 0.50 && (remainingSec >= 6.0 || outSectionType === 'outro' || inSectionType === 'intro')) {
+    } else if ((djLevel === 1 || djLevel === 2) && beatgridConfidence >= 0.50 && (remainingSec >= 6.0 || outSectionType === 'outro' || inSectionType === 'intro')) {
       reasons.push('Phrase-aligned 2-deck EQ handover selected to transition cleanly between unbeatmatched / differing meter tracks.');
       selectedTechnique = 'eq3_handover';
     } else {
@@ -614,15 +765,15 @@ export function planDjTransition(
       technique: 'timed_bass_swap',
       reason: 'Rejected: BPM difference exceeds static pitch-lock limit; gradual ramp required.',
     });
-    selectedTechnique = party.djLevel >= 4 ? 'tempo_ramp_bridge' : 'echo_out_blend';
+    selectedTechnique = djLevel >= 4 ? 'tempo_ramp_bridge' : 'echo_out_blend';
   } else if (bpmDecision.relationship === 'three_quarter_bridge') {
     rejectedAlternatives.push({
       technique: 'phrase_long_blend',
       reason: 'Rejected: 3:4 bridge works best via echo-out/cut rather than sustained overlap.',
     });
-    if (party.djLevel >= 3) {
+    if (djLevel >= 3) {
       selectedTechnique = 'echo_out_blend';
-    } else if (party.djLevel === 2) {
+    } else if (djLevel === 2) {
       selectedTechnique = 'filter_sweep_drop';
     } else {
       selectedTechnique = 'eq3_handover';
@@ -634,33 +785,43 @@ export function planDjTransition(
         ? 'Rejected: long overlap would cause vocal-vs-vocal clash.'
         : 'Rejected: Indian dhol/garba percussion clarity degrades under long overlapping blends.',
     });
-    if (party.djLevel === 1) selectedTechnique = 'eq3_handover';
-    else if (party.djLevel === 2) {
-      selectedTechnique = moodRhythm.isPercussionHeavyDhol && genresConflict ? 'safe_quick_cut' : 'timed_bass_swap';
-    } else if (party.djLevel === 3) selectedTechnique = 'echo_out_blend';
+    if (djLevel === 1) selectedTechnique = 'eq3_handover';
+    else if (djLevel === 2) {
+      selectedTechnique = moodRhythm.isPercussionHeavyDhol && genresConflict
+        ? 'safe_quick_cut'
+        : !recentUsed('timed_bass_swap')
+        ? 'timed_bass_swap'
+        : 'filter_sweep_drop';
+    } else if (djLevel === 3) selectedTechnique = 'echo_out_blend';
     else selectedTechnique = outSectionType === 'breakdown' || energyDelta >= 0.1 ? 'echo_freeze_drop' : 'echo_out_blend';
   } else {
-    if (party.djLevel === 1) {
+    if (djLevel === 1) {
       rejectedAlternatives.push({
         technique: 'timed_bass_swap',
         reason: 'Rejected: Level 1 preserves classic 2-deck EQ/phrase mixing.',
       });
       selectedTechnique = bpmDecision.adjustmentPct <= 3.0 && keyCompat >= 0.75 ? 'phrase_long_blend' : 'eq3_handover';
-    } else if (party.djLevel === 2) {
+    } else if (djLevel === 2) {
       rejectedAlternatives.push({
         technique: 'beat_roll_buildup',
         reason: 'Rejected: performance FX unlocked at Level 3+.',
       });
-      selectedTechnique = keyCompat >= 0.80 && !recentUsed('timed_bass_swap') ? 'timed_bass_swap' : 'filter_sweep_drop';
-    } else if (party.djLevel === 3) {
+      selectedTechnique = keyCompat >= 0.80 && !recentUsed('timed_bass_swap')
+        ? 'timed_bass_swap'
+        : !recentUsed('filter_sweep_drop')
+        ? 'filter_sweep_drop'
+        : 'eq3_handover';
+    } else if (djLevel === 3) {
       if ((outSectionType === 'breakdown' || energyDelta >= 0.08) && !recentUsed('beat_roll_buildup')) {
         selectedTechnique = 'beat_roll_buildup';
       } else if (moodRhythm.isElectronicClub && keyCompat >= 0.85 && !recentUsed('four_deck_layer')) {
         selectedTechnique = 'four_deck_layer';
       } else if (energyDelta <= -0.10) {
         selectedTechnique = 'echo_out_blend';
-      } else {
+      } else if (!recentUsed('filtered_buildup_drop')) {
         selectedTechnique = 'filtered_buildup_drop';
+      } else {
+        selectedTechnique = 'beat_roll_buildup';
       }
     } else {
       if (keyCompat >= 0.88 && inVocalAct <= 0.45 && !recentUsed('creative_mashup_layer')) {
@@ -696,20 +857,43 @@ export function planDjTransition(
     selectedTechnique === 'tempo_ramp_bridge'
   ) {
     rawBeats =
-      vocalClash || moodRhythm.isIndianVocalCentric || genresConflict
-        ? 8
-        : moodRhythm.isElectronicClub && inVocalAct < 0.35
+      moodRhythm.isCocktailLounge
         ? 32
-        : 16;
+        : moodRhythm.isBaraatDholProcession
+        ? 8
+        : vocalClash || (moodRhythm.isIndianVocalCentric && !moodRhythm.isShaadiRegal) || genresConflict || musicalPurpose === 'build_excitement'
+        ? 8
+        : moodRhythm.isElectronicClub && inVocalAct < 0.35 && musicalPurpose === 'preserve_dance_momentum'
+          ? 32
+          : 16;
   } else if (selectedTechnique === 'phrase_long_blend') {
     rawBeats =
-      moodRhythm.isElectronicClub && outVocalAct < 0.3 && inVocalAct < 0.3 && keyCompat >= 0.85
+      moodRhythm.isCocktailLounge
         ? 64
-        : vocalClash || moodRhythm.isIndianVocalCentric
-        ? 16
-        : 32;
+        : moodRhythm.isElectronicClub && outVocalAct < 0.3 && inVocalAct < 0.3 && keyCompat >= 0.85
+        ? 64
+        : vocalClash || (moodRhythm.isIndianVocalCentric && !moodRhythm.isShaadiRegal)
+          ? 16
+          : 32;
   } else if (selectedTechnique === 'four_deck_layer' || selectedTechnique === 'creative_mashup_layer') {
     rawBeats = moodRhythm.isElectronicClub && outVocalAct < 0.35 && inVocalAct < 0.35 ? 64 : 32;
+  }
+
+  // Technique-specific cue refinement:
+  if (['safe_quick_cut', 'backspin_cut', 'filter_sweep_drop', 'stutter_gate_drop'].includes(selectedTechnique)) {
+    if (inMainDropSec > 0) {
+      inMixInSec = inMainDropSec;
+      inSectionType = 'drop';
+    } else if (inDialogueEndSec > 0) {
+      inMixInSec = Math.max(inMixInSec, inDialogueEndSec);
+    }
+  } else if (selectedTechnique === 'echo_out_blend') {
+    if (inHasTheatricalAlaap) {
+      inMixInSec = inDialogueEndSec;
+      inSectionType = 'alaap';
+    } else if (inDialogueEndSec > 0) {
+      inMixInSec = Math.max(inMixInSec, inDialogueEndSec);
+    }
   }
 
   const maxFitSec = Math.max(
@@ -728,8 +912,8 @@ export function planDjTransition(
     selectedTechnique === 'safe_quick_cut'
       ? Math.max(0.25, Math.min(0.50, beatSec * 0.70))
       : selectedTechnique === 'backspin_cut'
-      ? Math.max(0.65, Math.min(1.35, beatSec * 2.0))
-      : Math.max(0.5, Math.min(maxFitSec, musicalDurationSec));
+        ? Math.max(0.65, Math.min(1.35, beatSec * 2.0))
+        : Math.max(0.5, Math.min(maxFitSec, musicalDurationSec));
   const durationSec = audioCrossfadeSec;
 
   // Snap scheduled execution time to nearest outgoing downbeat when beatgrid or downbeat is confident
@@ -757,18 +941,40 @@ export function planDjTransition(
     }
   }
 
+  const midCarveDb = vocalClash || vocalHandoverType === 'competing_lead_vocals' || vocalHandoverType === 'rap_to_melodic' || outgoing.isAcousticBallad
+    ? -12
+    : vocalHandoverType === 'clean_instrumental'
+    ? -3
+    : outVocalAct >= 0.50 || (outgoing.vocalDensity ?? 0) >= 0.60
+    ? -8
+    : -4;
+
+  const bassSwapFrac = ['filter_sweep_drop', 'filtered_buildup_drop', 'beat_roll_buildup', 'stutter_gate_drop'].includes(
+    selectedTechnique
+  )
+    ? 0.86
+    : selectedTechnique === 'echo_freeze_drop'
+    ? 0.56
+    : incoming.isPercussionHeavy
+    ? 0.48
+    : 0.50;
+
+  const [incLowCutFrac, outLowCutFrac, finalMidCarveDb] = durationBeats >= 32
+    ? [0.50, 0.48, Math.min(midCarveDb, -6)]
+    : selectedTechnique === 'safe_quick_cut'
+    ? [0, 0.50, midCarveDb]
+    : [
+        incoming.isPercussionHeavy ? 0.44 : 0.48,
+        vocalClash ? 0.40 : incoming.isElectronicDance ? 0.46 : 0.50,
+        midCarveDb,
+      ];
+
   const eqBassHandoverSchedule: EqBassHandoverSchedule = {
-    incoming_low_cut_until_frac: selectedTechnique === 'safe_quick_cut' ? 0 : 0.48,
-    bass_swap_at_frac: ['filter_sweep_drop', 'filtered_buildup_drop', 'beat_roll_buildup', 'stutter_gate_drop'].includes(
-      selectedTechnique
-    )
-      ? 0.86
-      : selectedTechnique === 'echo_freeze_drop'
-      ? 0.56
-      : 0.50,
-    outgoing_low_cut_at_frac: vocalClash ? 0.40 : 0.50,
-    mid_carve_db: vocalClash ? -10 : outVocalAct >= 0.50 ? -6 : -3,
-    high_handover_frac: 0.35,
+    incoming_low_cut_until_frac: incLowCutFrac,
+    bass_swap_at_frac: bassSwapFrac,
+    outgoing_low_cut_at_frac: outLowCutFrac,
+    mid_carve_db: finalMidCarveDb,
+    high_handover_frac: incoming.isPercussionHeavy ? 0.28 : 0.35,
   };
 
   reasons.push(
@@ -781,9 +987,9 @@ export function planDjTransition(
       Math.min(
         0.98,
         beatgridConfidence * 0.45 +
-          (meterCompatible ? 0.25 : 0.05) +
-          (vocalClash ? 0.05 : 0.15) +
-          keyCompat * 0.15
+        (meterCompatible ? 0.25 : 0.05) +
+        (vocalClash ? 0.05 : 0.15) +
+        keyCompat * 0.15
       )
     ).toFixed(2)
   );
@@ -822,10 +1028,24 @@ export function planDjTransition(
     musical_duration_sec: musicalDurationSec,
     vocal_overlap_policy: vocalOverlapPolicy,
     energy_progression: energyProgression,
+    musical_purpose: musicalPurpose,
+    vocal_handover_type: vocalHandoverType,
     eq_bass_handover_schedule: eqBassHandoverSchedule,
     selected_technique: selectedTechnique,
     scheduled_execution_sec: Number(scheduledExecutionSec.toFixed(2)),
     confidence,
+    layered_deck_id:
+      djLevel >= 3 && selectedTechnique === 'four_deck_layer'
+        ? 2
+        : djLevel >= 4 && selectedTechnique === 'creative_mashup_layer'
+        ? 2
+        : null,
+    layered_role:
+      djLevel >= 3 && selectedTechnique === 'four_deck_layer'
+        ? 'percussion_groove_layer'
+        : djLevel >= 4 && selectedTechnique === 'creative_mashup_layer'
+        ? 'vocal_mashup_over_groove'
+        : null,
     reasons,
     rejected_alternatives: rejectedAlternatives,
     rejection_reason: null,

@@ -1,4 +1,5 @@
-use crate::db::models::{PlayableTrackCandidate, PlaybackHistoryItem, GuestRequest};
+use crate::db::models::{GuestRequest, LocalRoomSubmission, PlayableTrackCandidate, PlaybackHistoryItem};
+use crate::dj::levels::DjLevel;
 use crate::dj::moods::MoodDefinition;
 
 pub struct TrackSelector;
@@ -134,12 +135,40 @@ impl TrackSelector {
                 0.0
             };
 
+            // 7. Timbre & Texture clash prevention (prevents acoustic ballad vs high-energy EDM shock)
+            let mut timbre_penalty = 0.0;
+            let mut contrast_bonus = 0.0;
+            if let Some(curr) = currently_playing {
+                let curr_is_dance = curr.track.genre.to_lowercase().contains("dance")
+                    || curr.track.genre.to_lowercase().contains("club")
+                    || curr.track.genre.to_lowercase().contains("house")
+                    || curr.track.genre.to_lowercase().contains("edm");
+                let cand_is_acoustic = candidate.track.genre.to_lowercase().contains("acoustic")
+                    || candidate.track.genre.to_lowercase().contains("ghazal")
+                    || candidate.track.genre.to_lowercase().contains("ballad")
+                    || candidate.analysis.overall_energy < 0.35;
+                if curr_is_dance && cand_is_acoustic && (curr.analysis.overall_energy - candidate.analysis.overall_energy) > 0.35 {
+                    timbre_penalty = 0.30;
+                }
+
+                // Exciting genre contrast bonus when harmonic key and energy match
+                if key_score >= 0.75
+                    && candidate.analysis.overall_energy >= 0.70
+                    && curr.analysis.overall_energy >= 0.70
+                    && !candidate.track.genre.eq_ignore_ascii_case(&curr.track.genre)
+                {
+                    contrast_bonus = 0.08;
+                }
+            }
+
             // Deterministic Weighted Sum
             let total_score = (genre_score * 0.25)
                 + (bpm_score * 0.30)
                 + (key_score * 0.25)
                 + (energy_score * 0.20)
                 - repetition_penalty
+                - timbre_penalty
+                + contrast_bonus
                 + request_boost;
 
             let mut c = candidate.clone();
@@ -230,79 +259,681 @@ pub fn calculate_camelot_compatibility(key_a: &str, key_b: &str) -> f64 {
     0.35 // Clash / chromatic distance
 }
 
+#[derive(Debug, Clone)]
+pub struct TrackMusicalProfile {
+    pub bpm: f64,
+    pub camelot_key: Option<String>,
+    pub energy: f64,
+    pub danceability: f64,
+    pub vocal_density: f64,
+    pub is_acoustic: bool,
+    pub is_electronic_dance: bool,
+    pub is_percussion_heavy: bool,
+    pub meter_label: String,
+    pub rhythmic_pattern_detected: String,
+    pub rhythm_confidence: f64,
+    pub syncopation_index: f64,
+}
+
+pub fn extract_musical_profile(
+    sub: &LocalRoomSubmission,
+    fallback_bpm: f64,
+    fallback_energy: f64,
+) -> TrackMusicalProfile {
+    let bpm = sub.bpm.unwrap_or(fallback_bpm);
+    let energy = sub.overall_energy.unwrap_or(fallback_energy);
+    let danceability = sub.danceability.unwrap_or(0.70);
+    let sub_genres: Vec<String> = serde_json::from_str(&sub.genre_tags_json).unwrap_or_default();
+    let sub_moods: Vec<String> = serde_json::from_str(&sub.mood_tags_json).unwrap_or_default();
+    let title_lower = sub.title.to_lowercase();
+
+    let is_acoustic = sub_genres.iter().any(|g| {
+        let gl = g.to_lowercase();
+        gl.contains("acoustic")
+            || gl.contains("ghazal")
+            || gl.contains("sufi")
+            || gl.contains("ballad")
+            || gl.contains("classical")
+            || gl.contains("piano")
+            || gl.contains("unplugged")
+    }) || title_lower.contains("unplugged")
+        || title_lower.contains("acoustic")
+        || title_lower.contains("reprise")
+        || energy < 0.38;
+
+    let is_electronic_dance = sub_genres.iter().any(|g| {
+        let gl = g.to_lowercase();
+        gl.contains("edm")
+            || gl.contains("house")
+            || gl.contains("techno")
+            || gl.contains("club")
+            || gl.contains("dance")
+            || gl.contains("electro")
+    }) || sub_moods
+        .iter()
+        .any(|m| m == "desi_club" || m == "house_party" || m == "festival_mode")
+        || (energy >= 0.78 && danceability >= 0.75);
+
+    let is_percussion_heavy = sub_genres.iter().any(|g| {
+        let gl = g.to_lowercase();
+        gl.contains("bhangra")
+            || gl.contains("dhol")
+            || gl.contains("punjabi")
+            || gl.contains("garba")
+            || gl.contains("dandiya")
+    }) || sub_moods
+        .iter()
+        .any(|m| m == "baraat" || m == "garba" || m == "dandiya" || m == "punjabi_tashan");
+
+    let is_instrumental = sub_genres.iter().any(|g| {
+        let gl = g.to_lowercase();
+        gl.contains("instrumental") || gl.contains("dub") || gl.contains("groove") || gl.contains("beat")
+    }) || title_lower.contains("instrumental")
+        || title_lower.contains("dub mix")
+        || title_lower.contains("club mix");
+
+    let vocal_density = if is_instrumental {
+        0.12
+    } else if is_acoustic {
+        0.78
+    } else if is_percussion_heavy {
+        0.50
+    } else if is_electronic_dance {
+        0.35
+    } else {
+        0.65
+    };
+
+    let meter_label = if sub_moods.iter().any(|m| m == "garba" || m == "dandiya")
+        || sub_genres.iter().any(|g| g.to_lowercase().contains("garba"))
+    {
+        "3/4".to_string()
+    } else {
+        "4/4".to_string()
+    };
+
+    let (rhythmic_pattern_detected, rhythm_confidence, syncopation_index) = {
+        let has_garba = sub_genres.iter().any(|g| {
+            let gl = g.to_lowercase();
+            gl.contains("garba") || gl.contains("taali") || gl.contains("sanedo") || gl.contains("gujarati")
+        }) || title_lower.contains("garba") || title_lower.contains("taali");
+
+        let has_dandiya = sub_genres.iter().any(|g| {
+            let gl = g.to_lowercase();
+            gl.contains("dandiya") || gl.contains("raas")
+        }) || title_lower.contains("dandiya");
+
+        let has_dhol = sub_genres.iter().any(|g| {
+            let gl = g.to_lowercase();
+            gl.contains("dhol") || gl.contains("bhangra") || gl.contains("punjabi")
+        }) || title_lower.contains("dhol") || title_lower.contains("bhangra");
+
+        let is_four_on_floor = is_electronic_dance && (meter_label == "4/4" || meter_label == "uncertain");
+
+        if has_garba && (meter_label == "3/4" || meter_label == "6/8") {
+            ("authentic_3_taali".to_string(), 0.88, 0.45)
+        } else if has_garba && is_four_on_floor {
+            ("four_on_floor".to_string(), 0.82, 0.15)
+        } else if has_dandiya && bpm >= 122.0 && bpm <= 146.0 {
+            ("sharp_dandiya_sticks".to_string(), 0.85, 0.40)
+        } else if has_dhol {
+            ("live_punjabi_dhol".to_string(), 0.90, 0.55)
+        } else if is_four_on_floor {
+            ("four_on_floor".to_string(), 0.85, 0.20)
+        } else if is_percussion_heavy {
+            ("syncopated_dembow".to_string(), 0.75, 0.50)
+        } else {
+            ("standard_pop_groove".to_string(), 0.70, 0.25)
+        }
+    };
+
+    TrackMusicalProfile {
+        bpm,
+        camelot_key: sub.camelot_key.clone(),
+        energy,
+        danceability,
+        vocal_density,
+        is_acoustic,
+        is_electronic_dance,
+        is_percussion_heavy,
+        meter_label,
+        rhythmic_pattern_detected,
+        rhythm_confidence,
+        syncopation_index,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DetailedDjEvaluation {
+    pub total_score: f64,
+    pub harmonic_score: f64,
+    pub bpm_score: f64,
+    pub energy_score: f64,
+    pub predicted_energy_direction: String, // "boost" | "sustain" | "relief"
+    pub groove_and_meter_score: f64,
+    pub vocal_score: f64,
+    pub timbre_score: f64,
+    pub sequence_lookahead_score: f64,
+    pub is_exciting_contrast: bool,
+    pub reasons: Vec<String>,
+    pub penalties: Vec<String>,
+}
+
+/// Evaluates a song submission with deep DJ intelligence:
+/// - Harmonic Camelot key relationship
+/// - Decoupled BPM and half/double-time groove
+/// - Energy trajectory and party progression
+/// - Timbre and texture compatibility (prevents acoustic ballad vs EDM shock)
+/// - Vocal density and clash avoidance
+/// - Exciting contrast vs jarring shock
+/// - Multi-track set lookahead sequence planning
+pub fn evaluate_submission_dj_intelligence(
+    candidate: &LocalRoomSubmission,
+    currently_playing: Option<&LocalRoomSubmission>,
+    primary_mood: &MoodDefinition,
+    secondary_mood: Option<&MoodDefinition>,
+    target_energy: f64,
+    unplayed_queue: &[LocalRoomSubmission],
+) -> DetailedDjEvaluation {
+    let mut reasons = Vec::new();
+    let mut penalties = Vec::new();
+
+    let cand_prof = extract_musical_profile(
+        candidate,
+        (primary_mood.min_bpm + primary_mood.max_bpm) / 2.0,
+        primary_mood.target_energy,
+    );
+
+    let cur_prof = currently_playing.map(|c| {
+        extract_musical_profile(
+            c,
+            (primary_mood.min_bpm + primary_mood.max_bpm) / 2.0,
+            primary_mood.target_energy,
+        )
+    });
+
+    // 1. Harmonic Key Compatibility (25 pts max)
+    let (key_compat, harmonic_score) = match (&cur_prof, &cand_prof.camelot_key) {
+        (Some(cur), Some(cand_k)) if cur.camelot_key.is_some() => {
+            let cur_k = cur.camelot_key.as_ref().unwrap();
+            let compat = calculate_camelot_compatibility(cur_k, cand_k);
+            if compat >= 0.98 {
+                reasons.push(format!("Harmonic Camelot lock ({} → {})", cur_k, cand_k));
+                (compat, 25.0)
+            } else if compat >= 0.88 {
+                reasons.push(format!("Smooth harmonic Camelot pivot ({} → {})", cur_k, cand_k));
+                (compat, 23.0)
+            } else if compat >= 0.74 {
+                reasons.push(format!("Energizing key lift (+2 hours: {} → {})", cur_k, cand_k));
+                (compat, 20.0)
+            } else {
+                reasons.push(format!("Incompatible harmonic key ({} → {}) — tonal clash risk", cur_k, cand_k));
+                (compat, 7.5)
+            }
+        }
+        _ => (0.70, 17.5),
+    };
+
+    // 2. BPM & Groove Relationship (20 pts max)
+    let (bpm_compat, mut bpm_score) = match &cur_prof {
+        Some(cur) => {
+            let compat = calculate_bpm_compatibility(cur.bpm, cand_prof.bpm);
+            let pct = (cur.bpm - cand_prof.bpm).abs() / cur.bpm.max(1.0);
+            let double_pct = (cur.bpm * 2.0 - cand_prof.bpm).abs() / (cur.bpm * 2.0);
+            let half_pct = (cur.bpm * 0.5 - cand_prof.bpm).abs() / (cur.bpm * 0.5);
+
+            if double_pct <= 0.04 {
+                reasons.push(format!("Harmonic double-time groove lift ({:.0} → {:.0} BPM)", cur.bpm, cand_prof.bpm));
+                (0.92, 18.5)
+            } else if half_pct <= 0.04 {
+                reasons.push(format!("Harmonic half-time heavy groove transition ({:.0} → {:.0} BPM)", cur.bpm, cand_prof.bpm));
+                (0.92, 18.5)
+            } else if pct <= 0.03 {
+                reasons.push(format!("Tight tempo lock ({:.0} → {:.0} BPM)", cur.bpm, cand_prof.bpm));
+                (1.0, 20.0)
+            } else if pct <= 0.08 {
+                reasons.push(format!("Mixable tempo step ({:.0} → {:.0} BPM)", cur.bpm, cand_prof.bpm));
+                (0.85, 17.0)
+            } else {
+                reasons.push(format!("Wide tempo shift ({:.0} → {:.0} BPM)", cur.bpm, cand_prof.bpm));
+                (compat, 9.0)
+            }
+        }
+        None => {
+            if cand_prof.bpm >= primary_mood.min_bpm && cand_prof.bpm <= primary_mood.max_bpm {
+                reasons.push(format!("Inside {} BPM zone ({:.0} BPM)", primary_mood.display_name, cand_prof.bpm));
+                (1.0, 20.0)
+            } else {
+                (0.65, 13.0)
+            }
+        }
+    };
+
+    // Mood-specific BPM flexibility and tempo relationship preferences
+    if let Some(ref cur) = cur_prof {
+        let double_pct = (cur.bpm * 2.0 - cand_prof.bpm).abs() / (cur.bpm * 2.0);
+        let half_pct = (cur.bpm * 0.5 - cand_prof.bpm).abs() / (cur.bpm * 0.5);
+        if primary_mood.acceptable_tempo_relationships.iter().any(|r| r == "half_time" || r == "double_time") {
+            if half_pct <= 0.05 || double_pct <= 0.05 {
+                reasons.push(format!("{} actively embraces harmonic tempo relationship ({:.0} → {:.0} BPM)", primary_mood.display_name, cur.bpm, cand_prof.bpm));
+                bpm_score = 20.0;
+            }
+        }
+        if primary_mood.bpm_flexibility == "wide_multi_tempo" && cand_prof.bpm >= primary_mood.min_bpm && cand_prof.bpm <= primary_mood.max_bpm {
+            if bpm_score < 14.0 {
+                bpm_score = 14.0;
+                reasons.push(format!("Multi-tempo mood {} supports versatile tempo shift ({:.0} → {:.0} BPM)", primary_mood.display_name, cur.bpm, cand_prof.bpm));
+            }
+        }
+    }
+    if cand_prof.bpm >= primary_mood.min_bpm && cand_prof.bpm <= primary_mood.max_bpm {
+        reasons.push(format!("In the pocket for {} BPM sweet spot ({:.0} BPM)", primary_mood.display_name, cand_prof.bpm));
+    } else if (cand_prof.bpm < primary_mood.min_bpm - 8.0 || cand_prof.bpm > primary_mood.max_bpm + 8.0) && primary_mood.bpm_flexibility == "tight" {
+        penalties.push(format!("Tempo ({:.0} BPM) outside tight {} window ({:.0}-{:.0} BPM)", cand_prof.bpm, primary_mood.display_name, primary_mood.min_bpm, primary_mood.max_bpm));
+    }
+
+    // Groove & Meter compatibility
+    let mut groove_and_meter_score = 10.0;
+    if let Some(ref cur) = cur_prof {
+        if cur.meter_label != cand_prof.meter_label {
+            penalties.push(format!(
+                "Meter shift ({} vs {}): rhythmic groove bridge required",
+                cur.meter_label, cand_prof.meter_label
+            ));
+            groove_and_meter_score = 3.5;
+        } else if cand_prof.is_percussion_heavy && cur.is_percussion_heavy {
+            reasons.push("Matching rhythmic percussion intensity".to_string());
+            groove_and_meter_score = 10.0;
+        }
+    }
+
+    // 3. Energy Trajectory & Dancefloor Progression (20 pts max)
+    let cur_energy = cur_prof.as_ref().map(|c| c.energy).unwrap_or(primary_mood.target_energy);
+    let delta_energy = cand_prof.energy - cur_energy;
+
+    let predicted_energy_direction = if delta_energy >= 0.07 {
+        "boost".to_string()
+    } else if delta_energy <= -0.10 {
+        "relief".to_string()
+    } else {
+        "sustain".to_string()
+    };
+
+    let energy_score = if delta_energy >= 0.07 {
+        if cur_energy < target_energy {
+            reasons.push(format!("Lifts party energy toward target ({:.0}% → {:.0}%)", cur_energy * 100.0, cand_prof.energy * 100.0));
+            20.0
+        } else {
+            reasons.push("Elevates party peak energy".to_string());
+            18.0
+        }
+    } else if delta_energy <= -0.10 {
+        if (cand_prof.energy - target_energy).abs() <= 0.08 {
+            reasons.push(format!("Brings dancefloor back to {} target energy ({:.0}%)", primary_mood.display_name, target_energy * 100.0));
+            20.0
+        } else if cur_energy >= 0.82 && delta_energy >= -0.22 {
+            reasons.push("Intentional crowd breathing room before next build".to_string());
+            17.5
+        } else if delta_energy <= -0.15 {
+            reasons.push(format!("Conflicting energy drop ({:.0}% → {:.0}%)", cur_energy * 100.0, cand_prof.energy * 100.0));
+            if cur_energy >= 0.78 && cand_prof.energy <= 0.40 {
+                penalties.push(format!("Abrupt energy collapse ({:.0}% → {:.0}%) risks clearing dancefloor", cur_energy * 100.0, cand_prof.energy * 100.0));
+                3.0
+            } else {
+                8.0
+            }
+        } else {
+            reasons.push(format!("Gentle energy relief ({:.0}% → {:.0}%)", cur_energy * 100.0, cand_prof.energy * 100.0));
+            12.0
+        }
+    } else {
+        reasons.push("Maintains steady dancefloor momentum".to_string());
+        20.0
+    };
+
+    // 4. Timbre & Vocal Balance (20 pts max)
+    let mut timbre_score = 10.0;
+    let mut vocal_score = 8.0;
+    if let Some(ref cur) = cur_prof {
+        // Timbre Shock Prevention: Acoustic vs Electronic Dance
+        if cur.is_electronic_dance && cand_prof.is_acoustic && delta_energy <= -0.30 {
+            penalties.push("Jarring texture clash: heavy electronic club groove into acoustic ballad".to_string());
+            timbre_score = 0.0;
+        } else if cur.is_acoustic && cand_prof.is_electronic_dance && delta_energy >= 0.35 {
+            penalties.push("Unprepared texture shock: acoustic song straight into heavy electronic beats".to_string());
+            timbre_score = 2.0;
+        }
+
+        // Vocal Density Interaction
+        if cur.vocal_density >= 0.60 && cand_prof.vocal_density >= 0.60 {
+            penalties.push("Consecutive high-density vocals risk crowd lyrical exhaustion".to_string());
+            vocal_score = 2.0;
+        } else if cur.vocal_density > 0.55 && cand_prof.vocal_density <= 0.30 {
+            reasons.push("Instrumental groove provides crowd breathing room after vocal singalong".to_string());
+            vocal_score = 10.0;
+        } else if cur.vocal_density <= 0.30 && cand_prof.vocal_density > 0.60 {
+            reasons.push("Anticipated vocal hook drops seamlessly after instrumental groove".to_string());
+            vocal_score = 10.0;
+        }
+    }
+
+    // 5. Genre Affinity, Granular Subgenre Weights & Exciting Contrast
+    let sub_genres: Vec<String> = serde_json::from_str(&candidate.genre_tags_json).unwrap_or_default();
+    let sub_moods: Vec<String> = serde_json::from_str(&candidate.mood_tags_json).unwrap_or_default();
+    let genre_match = primary_mood.genre_weights.iter().any(|(g, _)| {
+        sub_genres.iter().any(|sg| sg.to_lowercase().contains(&g.to_lowercase()))
+    });
+
+    let mut is_exciting_contrast = false;
+    let mut genre_score = if genre_match || sub_moods.iter().any(|m| m.eq_ignore_ascii_case(&primary_mood.id)) {
+        reasons.push(format!("Genre fits {} mood palette", primary_mood.display_name));
+        8.0
+    } else {
+        let genre_name = sub_genres.first().map(|s| s.as_str()).unwrap_or("Different");
+        reasons.push(format!("Cross-genre shift ({} vs {} mood)", genre_name, primary_mood.display_name));
+        0.0
+    };
+
+    let all_cand_genres = sub_genres.join(" ").to_lowercase();
+
+    // Granular Subgenre Scoring from mood definition
+    let mut subgenre_match_score = 0.0;
+    for (sg, weight) in &primary_mood.subgenre_weights {
+        if all_cand_genres.contains(&sg.to_lowercase()) {
+            reasons.push(format!("Signature subgenre '{}' active for {}", sg, primary_mood.display_name));
+            subgenre_match_score += weight * 2.0;
+            break;
+        }
+    }
+
+    // Recognize when contrast is exciting and acceptable under mood contrast_tolerance
+    if let Some(ref cur) = cur_prof {
+        if !genre_match
+            && key_compat >= 0.75
+            && cand_prof.energy >= 0.72
+            && cur.energy >= 0.70
+            && cand_prof.danceability >= 0.70
+            && primary_mood.contrast_tolerance >= 0.40
+        {
+            is_exciting_contrast = true;
+            reasons.push(format!("Exciting genre contrast: energetic switch elevates {}", primary_mood.display_name));
+            genre_score += 3.0;
+        }
+    }
+
+    // 5b. Mood Percussion, Atmosphere & Vocal Preference Scoring
+    let mut mood_affinity_score = subgenre_match_score;
+
+    match primary_mood.preferred_percussion.as_str() {
+        "live_punjabi_dhol" => {
+            if cand_prof.rhythmic_pattern_detected == "live_punjabi_dhol" {
+                reasons.push("Authentic live Punjabi dhol (dagga + tilli) verified by DSP analysis".to_string());
+                mood_affinity_score += 6.0;
+            } else if cand_prof.is_percussion_heavy || all_cand_genres.contains("dhol") || all_cand_genres.contains("bhangra") {
+                reasons.push("Acoustic live Punjabi dhol driving groove".to_string());
+                mood_affinity_score += 4.5;
+            }
+        }
+        "cyclic_3_taali" => {
+            let has_garba_text = all_cand_genres.contains("garba") || all_cand_genres.contains("taali") || all_cand_genres.contains("sanedo") || all_cand_genres.contains("gujarati");
+            let is_dsp_triple_meter = cand_prof.meter_label == "3/4" || cand_prof.meter_label == "6/8";
+            if cand_prof.rhythmic_pattern_detected == "authentic_3_taali" || (has_garba_text && is_dsp_triple_meter) {
+                reasons.push("Authentic 3-Taali cyclic folk meter (3/4 or 6/8) verified by audio analysis".to_string());
+                mood_affinity_score += 6.5;
+            } else if cand_prof.rhythmic_pattern_detected == "four_on_floor" || (cand_prof.is_electronic_dance && cand_prof.meter_label == "4/4") {
+                penalties.push("Rigid 4/4 electronic kick overrides authentic 3-Taali cyclic stepping".to_string());
+                mood_affinity_score += 1.0;
+            } else if has_garba_text && !cand_prof.is_electronic_dance {
+                reasons.push("Acoustic Gujarati folk cadence aligns with Garba circular stepping".to_string());
+                mood_affinity_score += 5.0;
+            } else if has_garba_text {
+                reasons.push("Authentic 3-Taali cyclic folk rhythm aligns with Garba".to_string());
+                mood_affinity_score += 5.0;
+            }
+        }
+        "sharp_dandiya_sticks" => {
+            if cand_prof.rhythmic_pattern_detected == "sharp_dandiya_sticks" {
+                reasons.push("Sharp wooden stick transients and tempo verified by DSP analysis".to_string());
+                mood_affinity_score += 6.0;
+            } else if all_cand_genres.contains("dandiya") || all_cand_genres.contains("raas") || (cand_prof.bpm >= 122.0 && cand_prof.is_percussion_heavy) {
+                reasons.push("Sharp stick-striking cadence matches Dandiya tempo".to_string());
+                mood_affinity_score += 5.0;
+            }
+        }
+        "deep_house_analog" => {
+            if all_cand_genres.contains("deep") || all_cand_genres.contains("lounge") || all_cand_genres.contains("chill") || all_cand_genres.contains("jazz") {
+                reasons.push("Warm Rhodes and hypnotic deep house groove".to_string());
+                mood_affinity_score += 5.0;
+            }
+        }
+        "stadium_bigroom_kick" => {
+            if cand_prof.is_electronic_dance && (all_cand_genres.contains("edm") || all_cand_genres.contains("big room") || all_cand_genres.contains("festival") || all_cand_genres.contains("drop")) {
+                reasons.push("Massive stadium drop payoff aligns with Festival Mode".to_string());
+                mood_affinity_score += 5.0;
+            }
+        }
+        "organic_vintage_drums" => {
+            if all_cand_genres.contains("retro") || all_cand_genres.contains("disco") || all_cand_genres.contains("70s") || all_cand_genres.contains("80s") || all_cand_genres.contains("classic") {
+                reasons.push("Organic acoustic drums and live brass instrumentation".to_string());
+                mood_affinity_score += 5.0;
+            }
+        }
+        "afro_latin_syncopated" => {
+            if all_cand_genres.contains("afrobeat") || all_cand_genres.contains("reggaeton") || all_cand_genres.contains("latin") || all_cand_genres.contains("dembow") {
+                reasons.push("Syncopated Afro-Latin body groove".to_string());
+                mood_affinity_score += 5.0;
+            }
+        }
+        "four_on_the_floor_sub" => {
+            if cand_prof.is_electronic_dance && (all_cand_genres.contains("club") || all_cand_genres.contains("remix") || all_cand_genres.contains("tech")) {
+                reasons.push("Driving 4-on-the-floor kick and sub-bass".to_string());
+                mood_affinity_score += 4.0;
+            }
+        }
+        _ => {}
+    }
+
+    // Secondary Mood Fusion
+    if let Some(sec) = secondary_mood {
+        let sec_match = sec.genre_weights.iter().any(|(g, _)| all_cand_genres.contains(&g.to_lowercase()))
+            || sub_moods.iter().any(|m| m.eq_ignore_ascii_case(&sec.id));
+        if sec_match {
+            reasons.push(format!("Secondary mood blend ({}) supported", sec.display_name));
+            mood_affinity_score += 3.0;
+        }
+    }
+
+    // 6. Multi-Track Set Lookahead Sequence Planning (5 pts max)
+    let mut sequence_lookahead_score = 4.0;
+    if unplayed_queue.len() > 1 {
+        let other_candidates: Vec<&LocalRoomSubmission> = unplayed_queue
+            .iter()
+            .filter(|q| q.id != candidate.id)
+            .collect();
+
+        if !other_candidates.is_empty() {
+            let mut strong_bridges = 0usize;
+            for other in &other_candidates {
+                let other_prof = extract_musical_profile(other, cand_prof.bpm, target_energy);
+                let other_key_compat = match (&cand_prof.camelot_key, &other_prof.camelot_key) {
+                    (Some(k1), Some(k2)) => calculate_camelot_compatibility(k1, k2),
+                    _ => 0.70,
+                };
+                let other_bpm_compat = calculate_bpm_compatibility(cand_prof.bpm, other_prof.bpm);
+                if other_key_compat >= 0.75 || other_bpm_compat >= 0.85 {
+                    strong_bridges += 1;
+                }
+            }
+
+            if strong_bridges >= 2 {
+                reasons.push("Strong set anchor: provides smooth transition paths to upcoming queue tracks".to_string());
+                sequence_lookahead_score = 5.0;
+            } else if strong_bridges == 0 && other_candidates.len() >= 3 {
+                penalties.push("Orphan track: lacks compatible transition follow-ups in active queue".to_string());
+                sequence_lookahead_score = 1.0;
+            }
+        }
+    }
+
+    // 7. Playability Bonus & Penalty Deductions
+    let cache_bonus = if candidate.acquisition_status == "cached_authorized" {
+        5.0
+    } else {
+        0.0
+    };
+
+    let mut penalty_deduction = 0.0;
+    if cur_prof
+        .as_ref()
+        .map(|c| c.is_electronic_dance && cand_prof.is_acoustic && delta_energy <= -0.30)
+        .unwrap_or(false)
+    {
+        penalty_deduction += 20.0; // Severe texture shock
+    }
+    if cur_energy >= 0.78 && cand_prof.energy <= 0.40 {
+        penalty_deduction += 20.0; // Sudden energy collapse
+    }
+    if cur_prof
+        .as_ref()
+        .map(|c| c.meter_label != cand_prof.meter_label)
+        .unwrap_or(false)
+    {
+        penalty_deduction += 10.0; // Meter clash without bridge
+    }
+    if cur_prof
+        .as_ref()
+        .map(|c| c.vocal_density >= 0.60 && cand_prof.vocal_density >= 0.60)
+        .unwrap_or(false)
+    {
+        penalty_deduction += 10.0; // Vocal clutter
+    }
+
+    // Mood-specific atmosphere checks (softened dynamically during intentional recovery / warm-up phases)
+    let is_intentional_recovery = target_energy <= (primary_mood.target_energy - 0.12);
+    let is_intentional_peak_lift = target_energy >= (primary_mood.target_energy + 0.05);
+
+    if primary_mood.id == "cocktail_night" {
+        if cand_prof.energy > 0.74 || all_cand_genres.contains("dhol") || all_cand_genres.contains("edm") {
+            if is_exciting_contrast || is_intentional_peak_lift {
+                penalty_deduction += 10.0;
+                reasons.push("Controlled energetic contrast allowed for peak lounge lift".to_string());
+            } else {
+                penalty_deduction += 25.0;
+                penalties.push(format!("Energy ({:.0}%) or timbre too aggressive for Cocktail Night lounge ambiance", cand_prof.energy * 100.0));
+            }
+        }
+    } else if primary_mood.id == "baraat" {
+        if cand_prof.energy < 0.72 || (cand_prof.is_acoustic && !all_cand_genres.contains("dhol")) {
+            if is_intentional_recovery {
+                reasons.push("Intentional processional breather / groom arrival pause supported".to_string());
+            } else {
+                penalty_deduction += 25.0;
+                penalties.push(format!("Low energy ({:.0}%) or acoustic texture will deflate high-octane Baraat procession", cand_prof.energy * 100.0));
+            }
+        }
+    } else if primary_mood.id == "festival_mode" {
+        if cand_prof.energy < 0.70 {
+            if is_intentional_recovery {
+                reasons.push("Melodic vocal breakdown breather allowed before next stadium drop".to_string());
+            } else {
+                penalty_deduction += 25.0;
+                penalties.push(format!("Subdued energy ({:.0}%) lacks Stadium Festival mainstage impact", cand_prof.energy * 100.0));
+            }
+        }
+    } else if primary_mood.id == "retro_bollywood" {
+        if cand_prof.energy > 0.82 || all_cand_genres.contains("dhol") || all_cand_genres.contains("bhangra") || all_cand_genres.contains("edm") || all_cand_genres.contains("trap") || (all_cand_genres.contains("club") && cand_prof.is_electronic_dance) {
+            penalty_deduction += 25.0;
+            penalties.push("Modern electronic club production or aggressive dhol clashes with Retro Bollywood golden vintage warmth".to_string());
+        }
+    } else if primary_mood.id == "garba" {
+        if cand_prof.is_electronic_dance && all_cand_genres.contains("house") {
+            penalty_deduction += 20.0;
+            penalties.push("Western four-on-the-floor kick breaks cyclic Garba taali stepping".to_string());
+        }
+    } else if primary_mood.id == "dandiya" {
+        if cand_prof.bpm < 120.0 {
+            if is_intentional_recovery {
+                reasons.push("Intentional tempo relief for dancers between fast stick rounds".to_string());
+            } else {
+                penalty_deduction += 20.0;
+                penalties.push(format!("Tempo ({:.0} BPM) too slow for fast synchronized Dandiya stick striking", cand_prof.bpm));
+            }
+        }
+    } else if primary_mood.id == "mehendi" {
+        if cand_prof.energy > 0.82 || all_cand_genres.contains("trap") {
+            penalty_deduction += 20.0;
+            penalties.push("Heavy club energy overpowers relaxed daytime Mehendi celebration".to_string());
+        }
+    }
+
+    let total: f64 = harmonic_score
+        + bpm_score
+        + groove_and_meter_score
+        + energy_score
+        + timbre_score
+        + vocal_score
+        + genre_score
+        + mood_affinity_score
+        + sequence_lookahead_score
+        + cache_bonus
+        - penalty_deduction;
+
+    // Normalizing against maximum theoretical score (~115.0) prevents artificial ceiling clamping at 100.0,
+    // preserving true candidate differentiation and tie-breaking for distinct DJ choices.
+    let normalized = (total / 115.0) * 100.0;
+    let clamped_total = (normalized.clamp(0.0_f64, 100.0_f64) * 10.0).round() / 10.0;
+
+    DetailedDjEvaluation {
+        total_score: clamped_total,
+        harmonic_score,
+        bpm_score,
+        energy_score,
+        predicted_energy_direction,
+        groove_and_meter_score,
+        vocal_score,
+        timbre_score,
+        sequence_lookahead_score,
+        is_exciting_contrast,
+        reasons,
+        penalties,
+    }
+}
+
 /// Evaluates an unplayed private room submission (from either guest or host — zero approval queue)
 /// against the active mood, energy progression, current BPM (with half/double-time matching),
 /// Camelot harmonic key, and phrase/playability readiness.
 pub fn score_local_submission_for_dj(
-    sub: &crate::db::models::LocalRoomSubmission,
-    primary_mood: &crate::dj::moods::MoodDefinition,
-    secondary_mood: Option<&crate::dj::moods::MoodDefinition>,
+    sub: &LocalRoomSubmission,
+    primary_mood: &MoodDefinition,
+    secondary_mood: Option<&MoodDefinition>,
     current_bpm: Option<f64>,
     current_camelot: Option<&str>,
     target_energy: f64,
 ) -> f64 {
-    let mut score = 0.0;
+    let dummy_cur = current_bpm.map(|bpm| {
+        let mut s = sub.clone();
+        s.bpm = Some(bpm);
+        s.camelot_key = current_camelot.map(|k| k.to_string());
+        s.overall_energy = Some(target_energy);
+        s
+    });
 
-    // 1. BPM compatibility (with current playing track + mood BPM window)
-    let sub_bpm = sub.bpm.unwrap_or((primary_mood.min_bpm + primary_mood.max_bpm) / 2.0);
-    let bpm_fit = if let Some(cur) = current_bpm {
-        calculate_bpm_compatibility(cur, sub_bpm)
-    } else if sub_bpm >= primary_mood.min_bpm && sub_bpm <= primary_mood.max_bpm {
-        1.0
-    } else {
-        0.65
-    };
-    score += bpm_fit * 30.0;
+    let eval = evaluate_submission_dj_intelligence(
+        sub,
+        dummy_cur.as_ref(),
+        primary_mood,
+        secondary_mood,
+        target_energy,
+        &[],
+    );
 
-    // 2. Camelot harmonic key compatibility
-    let key_fit = match (current_camelot, sub.camelot_key.as_deref()) {
-        (Some(cur_k), Some(sub_k)) => calculate_camelot_compatibility(cur_k, sub_k),
-        _ => 0.70,
-    };
-    score += key_fit * 25.0;
-
-    // 3. Energy curve progression fit
-    let sub_energy = sub.overall_energy.unwrap_or(primary_mood.target_energy);
-    let energy_fit = (1.0 - (sub_energy - target_energy).abs()).clamp(0.1, 1.0);
-    score += energy_fit * 20.0;
-
-    // 4. Mood & genre affinity (primary mood + 30% secondary mood blend)
-    let sub_moods: Vec<String> = serde_json::from_str(&sub.mood_tags_json).unwrap_or_default();
-    let sub_genres: Vec<String> = serde_json::from_str(&sub.genre_tags_json).unwrap_or_default();
-    let mut mood_affinity = if sub_moods.iter().any(|m| m.eq_ignore_ascii_case(&primary_mood.id)) {
-        1.0
-    } else if primary_mood
-        .genre_weights
-        .iter()
-        .any(|(g, _)| sub_genres.iter().any(|sg| sg.to_lowercase().contains(&g.to_lowercase())))
-    {
-        0.85
-    } else {
-        0.55
-    };
-
-    if let Some(sec) = secondary_mood {
-        let sec_hit = if sub_moods.iter().any(|m| m.eq_ignore_ascii_case(&sec.id)) {
-            1.0
-        } else {
-            0.5
-        };
-        mood_affinity = (mood_affinity * 0.70) + (sec_hit * 0.30);
-    }
-    score += mood_affinity * 15.0;
-
-    // 5. Local cache playability readiness bonus (prioritize locally cached authorized audio)
-    if sub.acquisition_status == "cached_authorized" {
-        score += 10.0;
-    }
-
-    (score * 100.0).round() / 100.0
+    eval.total_score
 }
 
 /// Computes dynamic energy target based on the selected mood and elapsed party duration
 /// (gradual warm-up -> peak celebration -> wave modulation).
 pub fn compute_mood_energy_target(
-    primary_mood: &crate::dj::moods::MoodDefinition,
+    primary_mood: &MoodDefinition,
     elapsed_mins: f64,
 ) -> f64 {
     let base = primary_mood.target_energy;
@@ -323,14 +954,12 @@ pub fn compute_mood_energy_target(
 /// WITHOUT ever interrupting an actively playing track, avoiding unnecessary repeats, and
 /// strictly refusing to select restricted/unavailable metadata-only tracks as playable.
 pub fn select_next_submission_without_interrupting(
-    submissions: &[crate::db::models::LocalRoomSubmission],
-    primary_mood: &crate::dj::moods::MoodDefinition,
-    secondary_mood: Option<&crate::dj::moods::MoodDefinition>,
+    submissions: &[LocalRoomSubmission],
+    primary_mood: &MoodDefinition,
+    secondary_mood: Option<&MoodDefinition>,
     target_energy: f64,
 ) -> (Vec<(String, f64)>, Option<String>) {
     let currently_playing = submissions.iter().find(|s| s.dj_status == "playing");
-    let current_bpm = currently_playing.and_then(|s| s.bpm);
-    let current_camelot = currently_playing.and_then(|s| s.camelot_key.as_deref());
 
     let recently_played_videos: std::collections::HashSet<&str> = submissions
         .iter()
@@ -338,18 +967,25 @@ pub fn select_next_submission_without_interrupting(
         .map(|s| s.provider_video_id.as_str())
         .collect();
 
-    let mut scored_with_meta: Vec<(String, f64, bool, bool)> = submissions
+    let queued_candidates: Vec<&LocalRoomSubmission> = submissions
         .iter()
         .filter(|s| s.dj_status == "queued_for_dj" || s.dj_status == "prepared")
-        .map(|s| {
-            let mut sc = score_local_submission_for_dj(
+        .collect();
+
+    let unplayed_owned: Vec<LocalRoomSubmission> = queued_candidates.iter().map(|&s| s.clone()).collect();
+
+    let mut scored_with_meta: Vec<(String, f64, bool, bool)> = queued_candidates
+        .iter()
+        .map(|&s| {
+            let eval = evaluate_submission_dj_intelligence(
                 s,
+                currently_playing,
                 primary_mood,
                 secondary_mood,
-                current_bpm,
-                current_camelot,
                 target_energy,
+                &unplayed_owned,
             );
+            let mut sc = eval.total_score;
             let is_repeat = recently_played_videos.contains(s.provider_video_id.as_str());
             if is_repeat {
                 sc = (sc - 40.0).max(0.0);
@@ -400,6 +1036,12 @@ pub struct DjRecommendation {
     pub suggested_technique: String,
     pub technique_label: String,
     pub technique_reason: String,
+    #[serde(default = "default_energy_direction")]
+    pub predicted_energy_direction: String,
+}
+
+fn default_energy_direction() -> String {
+    "sustain".to_string()
 }
 
 pub fn technique_display_label(technique_id: &str) -> &'static str {
@@ -427,14 +1069,12 @@ pub fn technique_display_label(technique_id: &str) -> &'static str {
 /// - Metadata confidence (falls back to safe cut / EQ handover when BPM or beat grid is missing!)
 /// - BPM delta, Camelot harmonic fit, energy jump, and mood style.
 pub fn choose_technique_for_pair(
-    dj_level: crate::dj::levels::DjLevel,
-    current: Option<&crate::db::models::LocalRoomSubmission>,
-    candidate: &crate::db::models::LocalRoomSubmission,
-    primary_mood: &crate::dj::moods::MoodDefinition,
+    dj_level: DjLevel,
+    current: Option<&LocalRoomSubmission>,
+    candidate: &LocalRoomSubmission,
+    primary_mood: &MoodDefinition,
     confidence: f64,
 ) -> (String, String) {
-    use crate::dj::levels::DjLevel;
-
     let cur_bpm = current.and_then(|c| c.bpm);
     let cand_bpm = candidate.bpm;
     let bpm_known = cur_bpm.is_some() && cand_bpm.is_some();
@@ -576,11 +1216,11 @@ pub fn choose_technique_for_pair(
 /// Builds explainable DJ recommendations for the host console, even when the catalogue is small
 /// or BPM/key analysis is incomplete. Honestly marks playability vs processing vs metadata-only.
 pub fn build_dj_recommendations(
-    submissions: &[crate::db::models::LocalRoomSubmission],
-    primary_mood: &crate::dj::moods::MoodDefinition,
-    secondary_mood: Option<&crate::dj::moods::MoodDefinition>,
+    submissions: &[LocalRoomSubmission],
+    primary_mood: &MoodDefinition,
+    secondary_mood: Option<&MoodDefinition>,
     target_energy: f64,
-    dj_level: crate::dj::levels::DjLevel,
+    dj_level: DjLevel,
 ) -> Vec<DjRecommendation> {
     let currently_playing = submissions.iter().find(|s| s.dj_status == "playing");
     let current_bpm = currently_playing.and_then(|s| s.bpm);
@@ -594,17 +1234,21 @@ pub fn build_dj_recommendations(
         .map(|s| s.provider_video_id.as_str())
         .collect();
 
-    let mut recs: Vec<DjRecommendation> = submissions
+    let unplayed_candidates: Vec<LocalRoomSubmission> = submissions
         .iter()
         .filter(|s| {
             s.dj_status != "playing"
                 && s.dj_status != "played"
                 && s.dj_status != "skipped_unplayable"
         })
+        .cloned()
+        .collect();
+
+    let mut recs: Vec<DjRecommendation> = unplayed_candidates
+        .iter()
         .map(|s| {
             let mut known = Vec::new();
             let mut missing = Vec::new();
-            let mut reasons = Vec::new();
 
             // Confidence starts from real available metadata (never goes silent when partial!)
             let mut confidence = 0.25_f64;
@@ -612,18 +1256,6 @@ pub fn build_dj_recommendations(
             if let Some(bpm) = s.bpm {
                 known.push(format!("BPM {:.1}", bpm));
                 confidence += 0.25;
-                if let Some(cbpm) = current_bpm {
-                    let compat = calculate_bpm_compatibility(cbpm, bpm);
-                    if compat >= 0.90 {
-                        reasons.push(format!("Tight tempo fit ({:.0} → {:.0} BPM)", cbpm, bpm));
-                    } else if compat >= 0.75 {
-                        reasons.push(format!("Mixable tempo shift ({:.0} → {:.0} BPM)", cbpm, bpm));
-                    } else {
-                        reasons.push(format!("Wide BPM change ({:.0} → {:.0} BPM)", cbpm, bpm));
-                    }
-                } else if bpm >= primary_mood.min_bpm && bpm <= primary_mood.max_bpm {
-                    reasons.push(format!("Inside {} BPM window ({:.0} BPM)", primary_mood.display_name, bpm));
-                }
             } else {
                 missing.push("BPM not yet verified".to_string());
             }
@@ -634,16 +1266,6 @@ pub fn build_dj_recommendations(
                 confidence += 0.20;
                 if let Some(ck) = current_camelot {
                     key_compat = calculate_camelot_compatibility(ck, k);
-                    if key_compat >= 0.90 {
-                        reasons.push(format!("Harmonic Camelot lock ({} → {})", ck, k));
-                    } else if key_compat >= 0.75 {
-                        reasons.push(format!("Compatible energy key lift ({} → {})", ck, k));
-                    } else if key_compat < 0.50 {
-                        reasons.push(format!(
-                            "Incompatible harmonic key ({} → {}) — avoid long tonal overlap",
-                            ck, k
-                        ));
-                    }
                 }
             } else {
                 missing.push("Musical key unknown".to_string());
@@ -652,49 +1274,13 @@ pub fn build_dj_recommendations(
             if let Some(en) = s.overall_energy {
                 known.push(format!("Energy {:.0}%", en * 100.0));
                 confidence += 0.15;
-                if let Some(ce) = current_energy {
-                    if en - ce >= 0.06 {
-                        reasons.push("Raises dancefloor energy".to_string());
-                    } else if en - ce <= -0.15 {
-                        reasons.push(format!(
-                            "Conflicting energy drop ({:.0}% → {:.0}%)",
-                            ce * 100.0,
-                            en * 100.0
-                        ));
-                    } else if (en - ce).abs() < 0.06 {
-                        reasons.push("Maintains steady party groove".to_string());
-                    }
-                } else if (en - target_energy).abs() <= 0.15 {
-                    reasons.push(format!("Fits {} target energy", primary_mood.display_name));
-                } else if (en - target_energy).abs() > 0.25 {
-                    reasons.push(format!(
-                        "Energy ({:.0}%) differs from {} target ({:.0}%)",
-                        en * 100.0,
-                        primary_mood.display_name,
-                        target_energy * 100.0
-                    ));
-                }
             } else {
                 missing.push("Energy profile unanalyzed".to_string());
             }
 
             let sub_genres: Vec<String> = serde_json::from_str(&s.genre_tags_json).unwrap_or_default();
             if !sub_genres.is_empty() {
-                let genre_matches = primary_mood.genre_weights.iter().any(|(g, _)| {
-                    sub_genres
-                        .iter()
-                        .any(|sg| sg.to_lowercase().contains(&g.to_lowercase()))
-                });
-                if genre_matches {
-                    known.push(format!("Genre {}", sub_genres[0]));
-                    reasons.push(format!("Genre matches {} mood", primary_mood.display_name));
-                } else {
-                    known.push(format!("Genre {}", sub_genres[0]));
-                    reasons.push(format!(
-                        "Cross-genre shift ({} vs {} mood)",
-                        sub_genres[0], primary_mood.display_name
-                    ));
-                }
+                known.push(format!("Genre {}", sub_genres[0]));
             }
 
             let has_local_analysis = s.metadata_source == "local_analysis" && s.duration_ms.unwrap_or(0) > 0;
@@ -736,14 +1322,18 @@ pub fn build_dj_recommendations(
             }
             .to_string();
 
-            let mut score = score_local_submission_for_dj(
+            // Perform deep DJ intelligence evaluation
+            let eval = evaluate_submission_dj_intelligence(
                 s,
+                currently_playing,
                 primary_mood,
                 secondary_mood,
-                current_bpm,
-                current_camelot,
                 target_energy,
+                &unplayed_candidates,
             );
+
+            let mut reasons = eval.reasons;
+            let mut score = eval.total_score;
 
             // Artist & repeat diversity reasoning
             let is_repeat = recently_played_videos.contains(s.provider_video_id.as_str());
@@ -784,8 +1374,10 @@ pub fn build_dj_recommendations(
             // Classify recommendation role
             let (category, category_label) = if clamped_conf < 0.45 || technique_id == "safe_quick_cut" {
                 ("safe_transition", "Safe Transition")
+            } else if eval.is_exciting_contrast {
+                ("exciting_contrast", "Exciting Contrast")
             } else if key_compat >= 0.90 && s.camelot_key.is_some() {
-                if dj_level >= crate::dj::levels::DjLevel::Level4CreativeTools {
+                if dj_level >= DjLevel::Level4CreativeTools {
                     ("creative_layer", "Creative Mashup Option")
                 } else {
                     ("harmonic_match", "Harmonic Option")
@@ -812,6 +1404,7 @@ pub fn build_dj_recommendations(
                 technique_label: technique_display_label(&technique_id).to_string(),
                 suggested_technique: technique_id,
                 technique_reason,
+                predicted_energy_direction: eval.predicted_energy_direction,
             }
         })
         .collect();
@@ -829,7 +1422,7 @@ pub fn build_dj_recommendations(
 
     // Label the #1 playable (or top overall if none playable yet) explicitly as "Best Next Track"
     if let Some(top) = recs.first_mut() {
-        if top.is_playable {
+        if top.is_playable && top.category != "exciting_contrast" {
             top.category = "best_next".to_string();
             top.category_label = "Best Next Track".to_string();
         }

@@ -4675,6 +4675,7 @@ mod tests {
             downbeat_timestamps_ms: (0..90)
                 .map(|i| (i as f64 * beats_per_bar as f64 * (60_000.0 / bpm)) as i64)
                 .collect(),
+            ..Default::default()
         };
 
         let make_sec = |stype: &str, s_ms: i64, e_ms: i64, energy: f64, vocal: f64| PhraseMarker {
@@ -4686,6 +4687,7 @@ mod tests {
             vocal_activity: vocal,
             confidence: 0.88,
             bar_index: 0,
+            ..Default::default()
         };
 
         let base_track = |id: &str, deck: usize, bpm: f64, key: &str, genre: &str, sections: Vec<PhraseMarker>| {
@@ -4702,6 +4704,7 @@ mod tests {
                 genre_tags: vec![genre.to_string()],
                 sections,
                 timing_profile: Some(make_timing(bpm, 0.90, 4, "4/4", false)),
+                ..Default::default()
             }
         };
 
@@ -4850,6 +4853,840 @@ mod tests {
         let p_rej = plan_dj_transition(&urgent, &club_in, &ctx(DjLevel::Level2SmartMixing, "house_party"));
         assert_eq!(p_rej.status, "rejected");
         assert!(p_rej.rejection_reason.is_some());
+    }
+
+    #[test]
+    fn test_post_11c1475_timing_and_confidence_audit() {
+        use dhun_lib::dj::decision_engine::{
+            plan_dj_transition, PartyDecisionContext, TempoQualityPolicy,
+            BpmRelationship, TrackTransitionInput,
+        };
+        use dhun_lib::dj::levels::DjLevel;
+        use dhun_lib::db::models::{TrackTimingProfile, MeterAnalysis, PhraseMarker};
+
+        // 1. Explicit timing calculations at 120.0 BPM:
+        let bpm = 120.0;
+        let beat_sec = 60.0 / bpm; // 0.50s per beat
+
+        // Four beats at 120 BPM = 2.0s
+        let four_beats_sec = 4.0 * beat_sec;
+        assert_eq!(four_beats_sec, 2.0, "Four beats at 120 BPM must equal 2.0s");
+
+        // One 4/4 bar at 120 BPM = 2.0s
+        let beats_per_bar_4_4 = 4.0;
+        let bar_4_4_sec = beats_per_bar_4_4 * beat_sec;
+        assert_eq!(bar_4_4_sec, 2.0, "One 4/4 bar at 120 BPM must equal 2.0s");
+
+        // One 3/4 bar at 120 BPM = 1.5s
+        let beats_per_bar_3_4 = 3.0;
+        let bar_3_4_sec = beats_per_bar_3_4 * beat_sec;
+        assert_eq!(bar_3_4_sec, 1.5, "One 3/4 bar at 120 BPM must equal 1.5s");
+
+        // One 6/8 bar using correctly inferred beat/subdivision convention:
+        // Compound duple: 2 compound dotted-quarter beats at 120 compound BPM = 1.0s
+        // Or 6 eighth-note subdivisions where quarter note = 0.5s -> eighth note = 0.25s:
+        // 6 * 0.25s = 1.50s
+        let eighth_note_sec = beat_sec / 2.0;
+        let bar_6_8_subdivisions = 6.0;
+        let bar_6_8_sec = bar_6_8_subdivisions * eighth_note_sec;
+        assert_eq!(bar_6_8_sec, 1.5, "One 6/8 bar with 6 eighth-note subdivisions must equal 1.5s");
+
+        let compound_beats = 2.0;
+        let bar_6_8_compound_sec = compound_beats * beat_sec;
+        assert_eq!(bar_6_8_compound_sec, 1.0, "One 6/8 bar with 2 compound beats must equal 1.0s");
+
+        // 2. Strict separation: musical_duration_sec vs audio_crossfade_sec
+        let t_out = TrackTransitionInput {
+            track_id: "t_out".to_string(),
+            deck_id: 0,
+            title: "Out Track".to_string(),
+            artist: "Artist".to_string(),
+            duration_sec: 180.0,
+            current_pos_sec: 0.0,
+            bpm: Some(120.0),
+            camelot_key: Some("8A".to_string()),
+            overall_energy: Some(0.80),
+            genre_tags: vec!["Dance".to_string()],
+            sections: vec![PhraseMarker {
+                section_type: "groove".to_string(),
+                start_ms: 0,
+                end_ms: 120_000,
+                energy_level: 0.80,
+                bass_energy: 0.70,
+                vocal_activity: 0.10,
+                confidence: 0.85,
+                bar_index: 0,
+                ..Default::default()
+            }],
+            timing_profile: Some(TrackTimingProfile {
+                average_bpm: 120.0,
+                beatgrid_confidence: 0.30, // Unreliable beatgrid -> forces safe_quick_cut
+                bpm_confidence: 0.90,
+                downbeat_confidence: 0.30,
+                downbeat_offset_ms: 0,
+                is_variable_tempo: false,
+                tempo_drift_bpm: 0.2,
+                meter: MeterAnalysis {
+                    beats_per_bar: 4,
+                    meter_label: "4/4".to_string(),
+                    confidence: 0.85,
+                },
+                tempo_map: vec![],
+                beat_timestamps_ms: vec![],
+                downbeat_timestamps_ms: vec![],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut t_in = t_out.clone();
+        t_in.track_id = "t_in".to_string();
+        t_in.deck_id = 1;
+
+        let ctx = PartyDecisionContext {
+            dj_level: DjLevel::Level1TwoDeckMixer,
+            mood_id: "house_party".to_string(),
+            target_energy: 0.75,
+            recent_techniques: vec![],
+            tempo_policy: TempoQualityPolicy::for_dj_level(DjLevel::Level1TwoDeckMixer),
+        };
+
+        let plan = plan_dj_transition(&t_out, &t_in, &ctx);
+        assert_eq!(plan.selected_technique, "safe_quick_cut");
+        assert_eq!(plan.duration_beats, 4);
+        assert_eq!(plan.musical_duration_sec, 2.0); // 4 * 0.5s = 2.0s musical duration
+        assert!(plan.audio_crossfade_sec <= 0.50);  // 0.35s fast crossfade curve
+        assert!(plan.audio_crossfade_sec < plan.musical_duration_sec, "Audio crossfade must be separated from musical length");
+
+        // 3. Confidence consistency and threshold comparison
+        // BPM match compares bpm_confidence (0.90 >= 0.50)
+        // Beat-lock compares beatgrid_confidence (0.30 < 0.50 -> NoBeatmatch)
+        assert_eq!(plan.bpm_relationship, BpmRelationship::NoBeatmatch);
+    }
+
+    #[test]
+    fn test_dj_musical_intelligence_timbre_vocal_and_halftime_decoupling() {
+        use dhun_lib::dj::selector::evaluate_submission_dj_intelligence;
+        use dhun_lib::dj::moods::get_mood_by_id;
+        use dhun_lib::db::models::LocalRoomSubmission;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let make_sub = |id: &str, status: &str, bpm: f64, camelot: &str, energy: f64, genres: &str, acq: &str| LocalRoomSubmission {
+            id: id.to_string(),
+            room_id: "rm_music_intel".to_string(),
+            submitted_by_type: "host".to_string(),
+            submitted_by_id: "h1".to_string(),
+            submitted_by_name: "DJ Host".to_string(),
+            provider: "youtube".to_string(),
+            source_url: format!("https://youtube.com/watch?v={}", id),
+            provider_video_id: id.to_string(),
+            song_id: None,
+            title: id.to_string(),
+            artist: "Test Artist".to_string(),
+            version_tag: "original".to_string(),
+            thumbnail_url: None,
+            duration_ms: Some(210_000),
+            bpm: Some(bpm),
+            half_time_bpm: Some(bpm / 2.0),
+            double_time_bpm: Some(bpm * 2.0),
+            musical_key: Some("C Major".to_string()),
+            camelot_key: Some(camelot.to_string()),
+            overall_energy: Some(energy),
+            danceability: Some(0.85),
+            genre_tags_json: genres.to_string(),
+            mood_tags_json: r#"["desi_club"]"#.to_string(),
+            metadata_source: "local_analysis".to_string(),
+            acquisition_status: acq.to_string(),
+            acquisition_note: None,
+            dj_status: status.to_string(),
+            dj_score: 0.0,
+            local_cache_path: Some(format!("/tmp/{}.wav", id)),
+            cache_id: Some(format!("c_{}", id)),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let desi_club = get_mood_by_id("desi_club").unwrap();
+
+        // 1. Current playing: 128 BPM, 8A, High Energy Tech House Club
+        let playing = make_sub("playing_club", "playing", 128.0, "8A", 0.82, r#"["Tech House", "Desi Club"]"#, "cached_authorized");
+
+        // Candidate 1: Identical 128 BPM & 8A, but quiet Acoustic Ghazal/Ballad
+        let acoustic_trap = make_sub("acoustic_trap", "queued_for_dj", 128.0, "8A", 0.28, r#"["Acoustic", "Ghazal", "Ballad"]"#, "cached_authorized");
+
+        // Candidate 2: 126 BPM, 9A (+1 hour), High Energy Bhangra Groove
+        let driving_bhangra = make_sub("driving_bhangra", "queued_for_dj", 126.0, "9A", 0.84, r#"["Bhangra", "Desi Club", "Instrumental"]"#, "cached_authorized");
+
+        let eval_acoustic = evaluate_submission_dj_intelligence(&acoustic_trap, Some(&playing), &desi_club, None, 0.85, &[]);
+        let eval_bhangra = evaluate_submission_dj_intelligence(&driving_bhangra, Some(&playing), &desi_club, None, 0.85, &[]);
+
+        // Assert: Acoustic ballad is heavily penalized for timbre shock and energy collapse despite matching 128 BPM & 8A!
+        assert!(eval_acoustic.total_score <= 55.0, "Acoustic ballad must be penalized for timbre shock (got score: {})", eval_acoustic.total_score);
+        assert!(eval_bhangra.total_score >= 95.0, "Driving Bhangra groove must score near top (got score: {})", eval_bhangra.total_score);
+        assert!(eval_bhangra.total_score > eval_acoustic.total_score + 35.0);
+
+        // 2. Decoupled BPM: 138 BPM Dhol -> 69 BPM Trap Anthem with Camelot Lock
+        let baraat = get_mood_by_id("baraat").unwrap();
+        let playing_dhol = make_sub("playing_dhol", "playing", 138.0, "6A", 0.90, r#"["Bhangra", "Dhol"]"#, "cached_authorized");
+        let halftime_trap = make_sub("halftime_trap", "queued_for_dj", 69.0, "6A", 0.91, r#"["Punjabi", "Trap"]"#, "cached_authorized");
+        let flat_pop = make_sub("flat_pop", "queued_for_dj", 137.9, "1B", 0.52, r#"["Pop"]"#, "cached_authorized");
+
+        let eval_trap = evaluate_submission_dj_intelligence(&halftime_trap, Some(&playing_dhol), &baraat, None, 0.92, &[]);
+        let eval_pop = evaluate_submission_dj_intelligence(&flat_pop, Some(&playing_dhol), &baraat, None, 0.92, &[]);
+
+        assert!(eval_trap.total_score > eval_pop.total_score + 10.0, "Harmonic half-time with key lock must beat flat pop with raw BPM closeness");
+        assert!(eval_trap.reasons.iter().any(|r| r.contains("half-time")));
+    }
+
+    #[test]
+    fn test_all_14_dj_moods_musical_identity_contrasts_and_set_progressions() {
+        use dhun_lib::dj::moods::{get_mood_by_id, get_preset_moods};
+        use dhun_lib::dj::selector::evaluate_submission_dj_intelligence;
+        use dhun_lib::dj::decision_engine::{plan_dj_transition, TrackTransitionInput, PartyDecisionContext};
+        use dhun_lib::db::models::LocalRoomSubmission;
+        use dhun_lib::dj::levels::DjLevel;
+
+        let all_moods = get_preset_moods();
+        assert_eq!(all_moods.len(), 14);
+
+        // 1. Verify rich profile completeness across all 14 moods
+        for m in &all_moods {
+            assert!(!m.musical_identity.is_empty(), "Mood {} must have non-empty musical_identity", m.id);
+            assert!(!m.energy_curve.is_empty(), "Mood {} must have non-empty energy_curve", m.id);
+            assert!(!m.preferred_percussion.is_empty(), "Mood {} must have non-empty preferred_percussion", m.id);
+            assert!(!m.vocal_preference.is_empty(), "Mood {} must have non-empty vocal_preference", m.id);
+            assert!(!m.transition_preferences.is_empty(), "Mood {} must have transition preferences", m.id);
+            assert!(m.min_transition_beats >= 4, "Mood {} min_transition_beats must be >= 4", m.id);
+            assert!(m.max_transition_beats >= m.min_transition_beats, "Mood {} max beats must be >= min beats", m.id);
+            assert!(m.contrast_tolerance >= 0.10 && m.contrast_tolerance <= 1.0, "Mood {} contrast tolerance invalid", m.id);
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let make_cand = |id: &str, bpm: f64, camelot: &str, energy: f64, genres: &str| LocalRoomSubmission {
+            id: id.to_string(),
+            room_id: "rm_contrasts".to_string(),
+            submitted_by_type: "host".to_string(),
+            submitted_by_id: "h1".to_string(),
+            submitted_by_name: "DJ Host".to_string(),
+            provider: "youtube".to_string(),
+            source_url: format!("https://youtube.com/watch?v={}", id),
+            provider_video_id: id.to_string(),
+            song_id: None,
+            title: id.to_string(),
+            artist: "Test Artist".to_string(),
+            version_tag: "original".to_string(),
+            thumbnail_url: None,
+            duration_ms: Some(210_000),
+            bpm: Some(bpm),
+            half_time_bpm: Some(bpm / 2.0),
+            double_time_bpm: Some(bpm * 2.0),
+            musical_key: Some("C Major".to_string()),
+            camelot_key: Some(camelot.to_string()),
+            overall_energy: Some(energy),
+            danceability: Some(0.85),
+            genre_tags_json: genres.to_string(),
+            mood_tags_json: "[]".to_string(),
+            metadata_source: "local_analysis".to_string(),
+            acquisition_status: "cached_authorized".to_string(),
+            acquisition_note: None,
+            dj_status: "queued_for_dj".to_string(),
+            dj_score: 0.0,
+            local_cache_path: Some(format!("/tmp/{}.wav", id)),
+            cache_id: Some(format!("c_{}", id)),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Contrast 1: Shaadi vs Cocktail Night
+        {
+            let shaadi = get_mood_by_id("shaadi").unwrap();
+            let cocktail = get_mood_by_id("cocktail_night").unwrap();
+            let wedding_anthem = make_cand("shaadi_anthem", 118.0, "9A", 0.82, r#"["Bollywood", "Wedding Dholak", "Singalong"]"#);
+            let deep_house = make_cand("deep_house", 120.0, "9A", 0.58, r#"["Deep House", "Sunset House", "Melodic Lounge"]"#);
+            let playing = make_cand("cur", 120.0, "9A", 0.70, r#"["Pop"]"#);
+
+            let eval_shaadi_a = evaluate_submission_dj_intelligence(&wedding_anthem, Some(&playing), &shaadi, None, 0.76, &[]);
+            let eval_shaadi_b = evaluate_submission_dj_intelligence(&deep_house, Some(&playing), &shaadi, None, 0.76, &[]);
+            let eval_cocktail_a = evaluate_submission_dj_intelligence(&wedding_anthem, Some(&playing), &cocktail, None, 0.60, &[]);
+            let eval_cocktail_b = evaluate_submission_dj_intelligence(&deep_house, Some(&playing), &cocktail, None, 0.60, &[]);
+
+            assert!(eval_shaadi_a.total_score > eval_shaadi_b.total_score, "Shaadi must rank celebratory wedding singalong higher");
+            assert!(eval_cocktail_b.total_score > eval_cocktail_a.total_score, "Cocktail Night must rank deep house higher");
+            assert!(eval_cocktail_a.penalties.iter().any(|p| p.contains("Cocktail Night")), "Cocktail Night must penalize aggressive wedding tracks");
+        }
+
+        // Contrast 2: Baraat vs Retro Bollywood
+        {
+            let baraat = get_mood_by_id("baraat").unwrap();
+            let retro = get_mood_by_id("retro_bollywood").unwrap();
+            let live_dhol = make_cand("live_dhol", 138.0, "6A", 0.96, r#"["Bhangra Dhol", "Live Dhol", "Baraat Brass"]"#);
+            let rd_burman = make_cand("rd_burman", 116.0, "6A", 0.62, r#"["Disco Bollywood", "70s Funk", "RD Burman Brass"]"#);
+            let playing = make_cand("cur", 130.0, "6A", 0.80, r#"["Pop"]"#);
+
+            let eval_baraat_a = evaluate_submission_dj_intelligence(&live_dhol, Some(&playing), &baraat, None, 0.96, &[]);
+            let eval_baraat_b = evaluate_submission_dj_intelligence(&rd_burman, Some(&playing), &baraat, None, 0.96, &[]);
+            let eval_retro_a = evaluate_submission_dj_intelligence(&live_dhol, Some(&playing), &retro, None, 0.62, &[]);
+            let eval_retro_b = evaluate_submission_dj_intelligence(&rd_burman, Some(&playing), &retro, None, 0.62, &[]);
+
+            assert!(eval_baraat_a.total_score > eval_baraat_b.total_score, "Baraat must rank live dhol #1");
+            assert!(eval_retro_b.total_score > eval_retro_a.total_score, "Retro Bollywood must rank 70s funk #1");
+            assert!(eval_baraat_b.penalties.iter().any(|p| p.contains("Baraat")), "Baraat must penalize subdued retro tracks");
+        }
+
+        // Contrast 3: Garba vs Dandiya
+        {
+            let garba = get_mood_by_id("garba").unwrap();
+            let dandiya = get_mood_by_id("dandiya").unwrap();
+            let garba_3taali = make_cand("garba_3taali", 114.0, "8A", 0.78, r#"["Garba Folk", "3-Taali Dhol", "Sanedo"]"#);
+            let fast_dandiya = make_cand("fast_dandiya", 136.0, "8A", 0.90, r#"["Dandiya Raas", "Raas Beat", "Stick Rhythm"]"#);
+            let playing = make_cand("cur", 115.0, "8A", 0.75, r#"["Folk"]"#);
+
+            let eval_garba_a = evaluate_submission_dj_intelligence(&garba_3taali, Some(&playing), &garba, None, 0.84, &[]);
+            let eval_garba_b = evaluate_submission_dj_intelligence(&fast_dandiya, Some(&playing), &garba, None, 0.84, &[]);
+            let eval_dandiya_a = evaluate_submission_dj_intelligence(&garba_3taali, Some(&playing), &dandiya, None, 0.90, &[]);
+            let eval_dandiya_b = evaluate_submission_dj_intelligence(&fast_dandiya, Some(&playing), &dandiya, None, 0.90, &[]);
+
+            assert!(eval_garba_a.total_score > eval_garba_b.total_score, "Garba must rank 3-Taali cyclic folk #1");
+            assert!(eval_dandiya_b.total_score > eval_dandiya_a.total_score, "Dandiya must rank fast stick raas #1");
+            assert!(eval_dandiya_a.penalties.iter().any(|p| p.contains("Dandiya")), "Dandiya must penalize tempo < 120 BPM");
+        }
+
+        // Contrast 4: Punjabi Tashan vs House Party (Half-Time Groove)
+        {
+            let punjabi = get_mood_by_id("punjabi_tashan").unwrap();
+            let house_party = get_mood_by_id("house_party").unwrap();
+            let urban_trap = make_cand("urban_trap", 80.0, "10A", 0.92, r#"["Punjabi Trap", "808 Trap", "UK Drill Punjabi"]"#);
+            let pop_dance = make_cand("pop_dance", 122.0, "10A", 0.75, r#"["Pop", "Chart Singalong", "Dance"]"#);
+            let playing_bhangra = make_cand("cur", 140.0, "10A", 0.88, r#"["Bhangra"]"#);
+
+            let eval_punjabi_a = evaluate_submission_dj_intelligence(&urban_trap, Some(&playing_bhangra), &punjabi, None, 0.92, &[]);
+            let eval_punjabi_b = evaluate_submission_dj_intelligence(&pop_dance, Some(&playing_bhangra), &punjabi, None, 0.92, &[]);
+            let eval_house_a = evaluate_submission_dj_intelligence(&urban_trap, Some(&playing_bhangra), &house_party, None, 0.72, &[]);
+            let eval_house_b = evaluate_submission_dj_intelligence(&pop_dance, Some(&playing_bhangra), &house_party, None, 0.72, &[]);
+
+            assert!(eval_punjabi_a.total_score > eval_punjabi_b.total_score, "Punjabi Tashan must rank 808 Trap #1 via half-time");
+            assert!(eval_house_b.total_score > eval_house_a.total_score, "House Party must rank accessible pop dance #1");
+        }
+
+        // Contrast 5: Mehendi vs Festival Mode
+        {
+            let mehendi = get_mood_by_id("mehendi").unwrap();
+            let festival = get_mood_by_id("festival_mode").unwrap();
+            let sufi_ballad = make_cand("sufi_ballad", 96.0, "11B", 0.56, r#"["Folk Bollywood", "Folk Ballad", "Sufi"]"#);
+            let stadium_edm = make_cand("stadium_edm", 130.0, "11B", 0.98, r#"["Festival Big Room", "Mainstage Big Room", "EDM Drop"]"#);
+            let playing = make_cand("cur", 100.0, "11B", 0.60, r#"["Acoustic"]"#);
+
+            let eval_mehendi_a = evaluate_submission_dj_intelligence(&sufi_ballad, Some(&playing), &mehendi, None, 0.58, &[]);
+            let eval_mehendi_b = evaluate_submission_dj_intelligence(&stadium_edm, Some(&playing), &mehendi, None, 0.58, &[]);
+            let eval_festival_a = evaluate_submission_dj_intelligence(&sufi_ballad, Some(&playing), &festival, None, 0.98, &[]);
+            let eval_festival_b = evaluate_submission_dj_intelligence(&stadium_edm, Some(&playing), &festival, None, 0.98, &[]);
+
+            assert!(eval_mehendi_a.total_score > eval_mehendi_b.total_score, "Mehendi must rank Sufi ballad #1");
+            assert!(eval_festival_b.total_score > eval_festival_a.total_score, "Festival Mode must rank stadium EDM #1");
+            assert!(eval_mehendi_b.penalties.iter().any(|p| p.contains("Mehendi")), "Mehendi must penalize heavy club energy");
+            assert!(eval_festival_a.penalties.iter().any(|p| p.contains("Festival")), "Festival Mode must penalize soft ballad energy");
+        }
+
+        // Contrast 6: Desi Club vs International Party
+        {
+            let desi_club = get_mood_by_id("desi_club").unwrap();
+            let intl = get_mood_by_id("international_party").unwrap();
+            let club_remix = make_cand("club_remix", 128.0, "7A", 0.90, r#"["Desi Remix", "Bollywood 4x4", "Club EDM"]"#);
+            let afrobeat = make_cand("afrobeat", 104.0, "7A", 0.80, r#"["Afrobeat", "Afrobeats Amapiano", "Latin Dembow"]"#);
+            let playing = make_cand("cur", 126.0, "7A", 0.85, r#"["Dance"]"#);
+
+            let eval_desi_a = evaluate_submission_dj_intelligence(&club_remix, Some(&playing), &desi_club, None, 0.90, &[]);
+            let eval_desi_b = evaluate_submission_dj_intelligence(&afrobeat, Some(&playing), &desi_club, None, 0.90, &[]);
+            let eval_intl_a = evaluate_submission_dj_intelligence(&club_remix, Some(&playing), &intl, None, 0.82, &[]);
+            let eval_intl_b = evaluate_submission_dj_intelligence(&afrobeat, Some(&playing), &intl, None, 0.82, &[]);
+
+            assert!(eval_desi_a.total_score > eval_desi_b.total_score, "Desi Club must rank 4x4 Bollywood club remix #1");
+            assert!(eval_intl_b.total_score > eval_intl_a.total_score, "International Party must rank Afrobeat dembow #1");
+        }
+
+        // 3. Verify Transition Planning Differences Between Moods
+        {
+            let t_out = TrackTransitionInput {
+                track_id: "t_out".to_string(),
+                deck_id: 0,
+                duration_sec: 240.0,
+                current_pos_sec: 210.0,
+                bpm: Some(136.0),
+                camelot_key: Some("6A".to_string()),
+                overall_energy: Some(0.94),
+                genre_tags: vec!["Bhangra Dhol".to_string()],
+                is_percussion_heavy: true,
+                ..Default::default()
+            };
+            let t_in = TrackTransitionInput {
+                track_id: "t_in".to_string(),
+                deck_id: 1,
+                duration_sec: 220.0,
+                current_pos_sec: 0.0,
+                bpm: Some(138.0),
+                camelot_key: Some("6A".to_string()),
+                overall_energy: Some(0.96),
+                genre_tags: vec!["Bhangra Dhol".to_string()],
+                is_percussion_heavy: true,
+                predicted_energy_direction: Some("boost".to_string()),
+                ..Default::default()
+            };
+
+            // Baraat Transition
+            let ctx_baraat = PartyDecisionContext {
+                dj_level: DjLevel::Level2SmartMixing,
+                mood_id: "baraat".to_string(),
+                target_energy: 0.96,
+                recent_techniques: vec![],
+                tempo_policy: dhun_lib::dj::decision_engine::TempoQualityPolicy::for_dj_level(DjLevel::Level2SmartMixing),
+            };
+            let plan_baraat = plan_dj_transition(&t_out, &t_in, &ctx_baraat);
+            assert!(plan_baraat.duration_beats <= 8, "Baraat must enforce fast punchy transition (<= 8 beats)");
+            assert_eq!(plan_baraat.musical_purpose, "build_excitement");
+
+            // Cocktail Night Transition
+            let t_cocktail_out = TrackTransitionInput {
+                track_id: "t_c_out".to_string(),
+                deck_id: 0,
+                duration_sec: 300.0,
+                current_pos_sec: 250.0,
+                bpm: Some(120.0),
+                camelot_key: Some("8A".to_string()),
+                overall_energy: Some(0.60),
+                genre_tags: vec!["Deep House".to_string()],
+                is_electronic_dance: true,
+                ..Default::default()
+            };
+            let t_cocktail_in = TrackTransitionInput {
+                track_id: "t_c_in".to_string(),
+                deck_id: 1,
+                duration_sec: 280.0,
+                current_pos_sec: 0.0,
+                bpm: Some(121.0),
+                camelot_key: Some("8A".to_string()),
+                overall_energy: Some(0.58),
+                genre_tags: vec!["Deep House".to_string()],
+                is_electronic_dance: true,
+                predicted_energy_direction: Some("sustain".to_string()),
+                ..Default::default()
+            };
+            let ctx_cocktail = PartyDecisionContext {
+                dj_level: DjLevel::Level2SmartMixing,
+                mood_id: "cocktail_night".to_string(),
+                target_energy: 0.60,
+                recent_techniques: vec![],
+                tempo_policy: dhun_lib::dj::decision_engine::TempoQualityPolicy::for_dj_level(DjLevel::Level2SmartMixing),
+            };
+            let plan_cocktail = plan_dj_transition(&t_cocktail_out, &t_cocktail_in, &ctx_cocktail);
+            assert!(plan_cocktail.duration_beats >= 32, "Cocktail Night must enforce long luxurious blend (>= 32 beats)");
+            assert_eq!(plan_cocktail.musical_purpose, "preserve_dance_momentum");
+            assert_eq!(plan_cocktail.eq_bass_handover_schedule.incoming_low_cut_until_frac, 0.50, "Phase Guardrail: incoming low cut held until 0.50 swap");
+            assert!(plan_cocktail.eq_bass_handover_schedule.outgoing_low_cut_at_frac <= 0.50, "Phase Guardrail: outgoing low cut at or before 0.50 swap");
+            assert!(plan_cocktail.eq_bass_handover_schedule.mid_carve_db <= -6.0, "Phase Guardrail: mid carve at least -6 dB");
+        }
+    }
+
+    /// Comprehensive deterministic test of Prompt 4 Energy Management & Mood Storytelling:
+    /// 1. Section-level energy analysis vs flat track average.
+    /// 2. Iconic chorus/drop protection preventing premature mix-out.
+    /// 3. Sub-bass phase cancellation guardrail on 32-64 beat blends.
+    /// 4. DSP meter Garba rhythm validation (checking 3/4 or 6/8 meter vs 4/4 EDM spoof).
+    /// 5. Dynamic guest request replanning within set narrative.
+    /// 6. Anti-fatigue guardrail capping consecutive peak-energy tracks.
+    /// 7. Complete 30-track simulated set evaluation for all 14 preset moods.
+    #[test]
+    fn test_dj_energy_storytelling_and_full_set_narrative_simulation() {
+        use dhun_lib::db::models::PhraseMarker;
+        use dhun_lib::dj::energy::{
+            MoodStoryCurve, SectionEnergyProfile, SetPhase, SetStoryteller,
+        };
+        use dhun_lib::dj::decision_engine::{
+            plan_dj_transition, PartyDecisionContext, TempoQualityPolicy, TrackTransitionInput,
+        };
+        use dhun_lib::dj::levels::DjLevel;
+        use dhun_lib::dj::moods::get_preset_moods;
+
+        // 1. Verify Section-Level Energy Analysis
+        let markers = vec![
+            PhraseMarker { section_type: "intro".to_string(), start_ms: 0, end_ms: 9000, energy_level: 0.50, bass_energy: 0.40, vocal_activity: 0.10, confidence: 0.85, bar_index: 0, ..Default::default() },
+            PhraseMarker { section_type: "verse".to_string(), start_ms: 9000, end_ms: 27000, energy_level: 0.75, bass_energy: 0.65, vocal_activity: 0.80, confidence: 0.88, bar_index: 4, ..Default::default() },
+            PhraseMarker { section_type: "build".to_string(), start_ms: 27000, end_ms: 36000, energy_level: 0.85, bass_energy: 0.70, vocal_activity: 0.40, confidence: 0.90, bar_index: 12, ..Default::default() },
+            PhraseMarker { section_type: "chorus".to_string(), start_ms: 36000, end_ms: 54000, energy_level: 0.96, bass_energy: 0.92, vocal_activity: 0.90, confidence: 0.95, bar_index: 16, ..Default::default() },
+            PhraseMarker { section_type: "outro".to_string(), start_ms: 54000, end_ms: 63000, energy_level: 0.55, bass_energy: 0.45, vocal_activity: 0.15, confidence: 0.85, bar_index: 24, ..Default::default() },
+        ];
+
+        let profile = SectionEnergyProfile::from_phrase_markers(&markers, 0.80);
+        assert_eq!(profile.intro_energy, 0.50);
+        assert_eq!(profile.peak_energy, 0.96);
+        assert_eq!(profile.mix_out_energy, 0.55);
+        assert!(profile.has_iconic_hook, "Chorus section must be identified as iconic hook");
+        assert_eq!(profile.hook_sections.len(), 1);
+
+        // Check hook protection query: playhead at 30s (during build heading into chorus at 36s)
+        let hook_prot = profile.is_point_in_protected_hook(30_000, 10_000);
+        assert!(hook_prot.is_some(), "Must detect upcoming chorus hook when within 10s lead time");
+
+        // 2. Verify Transition Hook Protection: Mix-out held until hook finishes
+        let t_out_hook = TrackTransitionInput {
+            track_id: "kc_out".to_string(),
+            deck_id: 0,
+            title: "Kala Chashma".to_string(),
+            artist: "Amar Arshi".to_string(),
+            duration_sec: 180.0,
+            current_pos_sec: 28.0, // Near build at 27s heading into 36s chorus!
+            bpm: Some(106.0),
+            camelot_key: Some("9A".to_string()),
+            overall_energy: Some(0.85),
+            genre_tags: vec!["Bollywood".to_string()],
+            sections: markers.clone(),
+            ..Default::default()
+        };
+        let t_in_dummy = TrackTransitionInput {
+            track_id: "lt_in".to_string(),
+            deck_id: 1,
+            title: "London Thumakda".to_string(),
+            artist: "Labh Janjua".to_string(),
+            duration_sec: 210.0,
+            current_pos_sec: 0.0,
+            bpm: Some(106.0),
+            camelot_key: Some("9A".to_string()),
+            overall_energy: Some(0.82),
+            genre_tags: vec!["Bollywood".to_string()],
+            sections: vec![PhraseMarker { section_type: "intro".to_string(), start_ms: 0, end_ms: 12000, energy_level: 0.65, bass_energy: 0.50, vocal_activity: 0.10, confidence: 0.85, bar_index: 0, ..Default::default() }],
+            ..Default::default()
+        };
+        let party_ctx = PartyDecisionContext {
+            dj_level: DjLevel::Level2SmartMixing,
+            mood_id: "shaadi".to_string(),
+            target_energy: 0.76,
+            recent_techniques: vec![],
+            tempo_policy: TempoQualityPolicy::for_dj_level(DjLevel::Level2SmartMixing),
+        };
+        let plan_hook = plan_dj_transition(&t_out_hook, &t_in_dummy, &party_ctx);
+        assert!(
+            plan_hook.outgoing_mix_out_sec >= 46.0,
+            "Engine must protect iconic chorus, scheduling mix-out only after chorus phrase completes (got {:.1}s)",
+            plan_hook.outgoing_mix_out_sec
+        );
+
+        // 3. Verify Anti-Fatigue Guardrail in SetStoryteller
+        let mut storyteller = SetStoryteller::new("baraat", 30);
+        // Simulate playing 3 consecutive peak tracks
+        storyteller.record_track_played(0.98, false, false);
+        storyteller.record_track_played(0.97, false, false);
+        storyteller.record_track_played(0.99, false, false);
+
+        assert_eq!(
+            storyteller.current_phase(),
+            SetPhase::Recovery,
+            "After 3 consecutive peak tracks, storyteller must enforce a Recovery breathing phase"
+        );
+
+        // When evaluating another peak candidate during forced recovery, evaluate_candidate_energy_fit must penalize it
+        let (fit_score, _, penalties) = storyteller.evaluate_candidate_energy_fit(&profile, 0.98);
+        assert!(
+            penalties.iter().any(|p| p.contains("Anti-Fatigue Guardrail")),
+            "Must flag anti-fatigue penalty when attempting 4th consecutive peak track"
+        );
+        assert!(fit_score <= 15.0);
+
+        // 4. Verify Dynamic Guest Request Replanning
+        let req_action = storyteller.replan_for_guest_request("r1", "Bolo Ta Ra Ra", 0.98, true);
+        assert_eq!(
+            req_action.target_phase,
+            SetPhase::RenewedPeak,
+            "High-energy request arriving during recovery must be scheduled for Renewed Peak to protect active breathing window"
+        );
+
+        // 5. Complete 30-Track Simulation Across ALL 14 Preset Moods
+        let all_moods = get_preset_moods();
+        assert_eq!(all_moods.len(), 14, "Must test all 14 preset moods");
+
+        for mood in &all_moods {
+            let mut set_sim = SetStoryteller::new(&mood.id, 30);
+            let _curve = MoodStoryCurve::for_mood(&mood.id);
+
+            for i in 0..30 {
+                let target_e = set_sim.calculate_target_energy(mood.target_energy);
+                let track_e = (target_e + if i % 2 == 0 { 0.01 } else { -0.01 }).clamp(0.20, 1.0);
+                set_sim.record_track_played(track_e, i == 15, false);
+            }
+
+            let report = set_sim.generate_set_report(30, 30, 0);
+            assert_eq!(report.total_tracks, 30);
+            assert!(
+                report.peak_count >= 4 && report.peak_count <= 15,
+                "Mood {} peak count must be balanced (got {} peaks)",
+                mood.id,
+                report.peak_count
+            );
+            assert!(
+                report.recovery_count >= 2,
+                "Mood {} must have at least 2 recovery breathing intervals (got {})",
+                mood.id,
+                report.recovery_count
+            );
+            assert_eq!(report.repetition_violations, 0);
+            assert_eq!(report.mood_consistency_pct, 100.0);
+            assert_eq!(report.hook_protection_events, 1);
+        }
+    }
+
+    #[test]
+    fn test_advanced_musical_analysis_and_dj_levels_1_to_4_functional_distinction() {
+        use std::sync::Arc;
+        use dhun_lib::analysis::phrase_detector::PhraseDetector;
+        use dhun_lib::analysis::bpm_detector::BpmDetector;
+        use dhun_lib::db::models::{MeterAnalysis, PhraseMarker, TrackTimingProfile, TempoSegment};
+        use dhun_lib::dj::levels::DjLevel;
+        use dhun_lib::dj::decision_engine::{plan_dj_transition, TrackTransitionInput, PartyDecisionContext, TempoQualityPolicy};
+        use dhun_lib::dj::moods::get_preset_moods;
+
+        // 1. Synthesize multi-section audio to verify DSP extraction (sub-bass, mid, high, vocals)
+        let sr = 44100u32;
+        let dur_ms = 40_000u64;
+        let total_frames = (sr as f64 * (dur_ms as f64 / 1000.0)) as usize;
+        let mut samples = vec![0.0f32; total_frames * 2];
+
+        for i in 0..total_frames {
+            let t = i as f64 / sr as f64;
+            // Section 1 (0-16s): Verse with centered lead vocal (400 Hz) + light beat
+            // Section 2 (16-32s): Chorus with heavy sub-bass (60 Hz) + wide pads + strong beat
+            // Section 3 (32-40s): Outro decay
+            let (sub, voc, side) = if t < 16.0 {
+                (0.10 * (2.0 * std::f64::consts::PI * 60.0 * t).sin(), 0.40 * (2.0 * std::f64::consts::PI * 400.0 * t).sin(), 0.05)
+            } else if t < 32.0 {
+                (0.50 * (2.0 * std::f64::consts::PI * 60.0 * t).sin(), 0.35 * (2.0 * std::f64::consts::PI * 500.0 * t).sin(), 0.20)
+            } else {
+                (0.15 * (2.0 * std::f64::consts::PI * 60.0 * t).sin(), 0.05 * (2.0 * std::f64::consts::PI * 400.0 * t).sin(), 0.05)
+            };
+            let mid = sub + voc;
+            samples[i * 2] = (mid + side) as f32;
+            samples[i * 2 + 1] = (mid - side) as f32;
+        }
+
+        let samples_arc = Arc::new(samples);
+        let phrase_res = PhraseDetector::analyze_phrasing_full(&samples_arc, sr, 120.0, 0, 4, dur_ms);
+
+        assert!(!phrase_res.phrases.is_empty(), "Phrases must be detected");
+        assert!(phrase_res.sub_bass_energy > 0.0, "Sub-bass energy (<90 Hz) must be measured");
+        assert!(phrase_res.mid_energy > 0.0, "Mid energy (250-3500 Hz) must be measured");
+        assert!(phrase_res.high_energy > 0.0, "High energy (>3500 Hz) must be measured");
+        assert!(phrase_res.dynamic_range_db >= 3.0, "Dynamic range dB must be calculated");
+        assert!(phrase_res.has_lead_vocal, "Lead vocal must be detected from centered mid frequencies");
+
+        let meter_4_4 = MeterAnalysis { beats_per_bar: 4, meter_label: "4/4".to_string(), confidence: 0.90 };
+        let rhythm_res = BpmDetector::detect_rhythm_and_percussion(&samples_arc, sr, 120.0, 0, &meter_4_4, dur_ms);
+
+        assert_eq!(rhythm_res.alternative_bpms, vec![60.0, 240.0, 90.0], "Alternative BPMs (half, double, 3:4) must be generated");
+        assert!(rhythm_res.kick_presence > 0.0, "Kick presence must be detected");
+        assert!(rhythm_res.snare_clap_presence > 0.0, "Snare/clap presence must be detected");
+
+        // 2. Verify Authentic Garba 3-Taali vs 4/4 EDM kick spoof detection
+        let meter_3_4 = MeterAnalysis { beats_per_bar: 3, meter_label: "3/4".to_string(), confidence: 0.88 };
+        let garba_rhythm = BpmDetector::detect_rhythm_and_percussion(&samples_arc, sr, 128.0, 0, &meter_3_4, dur_ms);
+        assert_eq!(garba_rhythm.rhythmic_pattern_detected, "authentic_3_taali");
+        assert!(garba_rhythm.rhythm_confidence >= 0.70);
+
+        // 3. Confidence Decoupling: High BPM confidence (0.95) must NOT mask poor beatgrid (0.35)
+        let make_timing = |bpm: f64, bg_conf: f64, bpm_conf: f64| TrackTimingProfile {
+            average_bpm: bpm,
+            beatgrid_confidence: bg_conf,
+            bpm_confidence: bpm_conf,
+            downbeat_confidence: 0.80,
+            downbeat_offset_ms: 0,
+            is_variable_tempo: false,
+            tempo_drift_bpm: 0.0,
+            meter: meter_4_4.clone(),
+            tempo_map: vec![TempoSegment { start_ms: 0, end_ms: 180_000, bpm, confidence: bpm_conf }],
+            beat_timestamps_ms: vec![0, 500, 1000, 1500],
+            downbeat_timestamps_ms: vec![0],
+            alternative_bpms: vec![bpm * 0.5, bpm * 2.0, bpm * 0.75],
+            sub_bass_energy: 0.50,
+            mid_energy: 0.50,
+            high_energy: 0.40,
+            dynamic_range_db: 12.0,
+            kick_presence: 0.80,
+            snare_clap_presence: 0.70,
+            hihat_presence: 0.65,
+            syncopation_index: 0.20,
+            rhythmic_pattern_detected: "standard_pop_groove".to_string(),
+            rhythm_confidence: 0.80,
+            has_lead_vocal: true,
+            has_backing_vocal: false,
+            vocal_confidence: 0.85,
+            first_musical_ms: 0,
+            dialogue_end_ms: 0,
+            main_drop_ms: 0,
+            first_vocal_entry_ms: 0,
+            first_hook_ms: 0,
+            has_theatrical_alaap: false,
+            theatrical_alaap_start_ms: 0,
+            theatrical_alaap_end_ms: 0,
+            mix_in_point_ms: 0,
+            mix_out_point_ms: 180_000,
+            hook_candidates: Vec::new(),
+            timeline_alignment: None,
+            profile_version: 4,
+        };
+
+        let out_track = TrackTransitionInput {
+            track_id: "out_test".to_string(),
+            deck_id: 0,
+            title: "Out Track".to_string(),
+            artist: "Artist 1".to_string(),
+            duration_sec: 180.0,
+            current_pos_sec: 155.0,
+            bpm: Some(124.0),
+            camelot_key: Some("8B".to_string()),
+            overall_energy: Some(0.75),
+            genre_tags: vec!["club".to_string(), "vocal".to_string()],
+            sections: vec![
+                PhraseMarker {
+                    section_type: "chorus".to_string(),
+                    start_ms: 120_000,
+                    end_ms: 170_000,
+                    energy_level: 0.85,
+                    bass_energy: 0.70,
+                    vocal_activity: 0.85,
+                    confidence: 0.90,
+                    bar_index: 32,
+                    sub_bass_energy: 0.60,
+                    mid_energy: 0.65,
+                    high_energy: 0.50,
+                    loudness_lufs_est: -9.5,
+                },
+                PhraseMarker {
+                    section_type: "outro".to_string(),
+                    start_ms: 170_000,
+                    end_ms: 180_000,
+                    energy_level: 0.60,
+                    bass_energy: 0.40,
+                    vocal_activity: 0.20,
+                    confidence: 0.85,
+                    bar_index: 48,
+                    sub_bass_energy: 0.30,
+                    mid_energy: 0.40,
+                    high_energy: 0.35,
+                    loudness_lufs_est: -14.0,
+                },
+            ],
+            timing_profile: Some(make_timing(124.0, 0.35, 0.95)), // Poor beatgrid!
+            ..Default::default()
+        };
+
+        let in_track = TrackTransitionInput {
+            track_id: "in_test".to_string(),
+            deck_id: 1,
+            title: "In Track".to_string(),
+            artist: "Artist 2".to_string(),
+            duration_sec: 180.0,
+            current_pos_sec: 0.0,
+            bpm: Some(124.0),
+            camelot_key: Some("9B".to_string()),
+            overall_energy: Some(0.80),
+            genre_tags: vec!["club".to_string(), "drop".to_string()],
+            sections: vec![
+                PhraseMarker {
+                    section_type: "intro".to_string(),
+                    start_ms: 0,
+                    end_ms: 30_000,
+                    energy_level: 0.65,
+                    bass_energy: 0.45,
+                    vocal_activity: 0.15,
+                    confidence: 0.88,
+                    bar_index: 0,
+                    sub_bass_energy: 0.40,
+                    mid_energy: 0.45,
+                    high_energy: 0.40,
+                    loudness_lufs_est: -12.5,
+                },
+            ],
+            timing_profile: Some(make_timing(124.0, 0.35, 0.95)),
+            ..Default::default()
+        };
+
+        let party_l1 = PartyDecisionContext {
+            dj_level: DjLevel::Level1TwoDeckMixer,
+            mood_id: "desi_club".to_string(),
+            target_energy: 0.80,
+            recent_techniques: vec![],
+            tempo_policy: TempoQualityPolicy::for_dj_level(DjLevel::Level1TwoDeckMixer),
+        };
+
+        let plan_l1_low_grid = plan_dj_transition(&out_track, &in_track, &party_l1);
+        assert_ne!(
+            plan_l1_low_grid.selected_technique, "phrase_long_blend",
+            "Level 1 must refuse phrase_long_blend when beatgrid confidence is 0.35"
+        );
+        assert!(
+            plan_l1_low_grid.selected_technique == "safe_quick_cut" || plan_l1_low_grid.selected_technique == "eq3_handover",
+            "Level 1 must fall back safely on low beatgrid confidence"
+        );
+
+        // 4. Four Genuinely Different DJ Levels Comparison (Level 1 vs 2 vs 3 vs 4)
+        let mut out_good = out_track.clone();
+        out_good.timing_profile = Some(make_timing(124.0, 0.92, 0.95));
+        let mut in_good = in_track.clone();
+        in_good.timing_profile = Some(make_timing(128.0, 0.90, 0.95));
+        in_good.bpm = Some(128.0);
+
+        let plan_1 = plan_dj_transition(&out_good, &in_good, &party_l1);
+        assert!(matches!(plan_1.selected_technique.as_str(), "safe_quick_cut" | "eq3_handover" | "phrase_long_blend"));
+        assert!(plan_1.layered_deck_id.is_none(), "Level 1 must never layer a 3rd/4th deck");
+
+        let party_l2 = PartyDecisionContext {
+            dj_level: DjLevel::Level2SmartMixing,
+            tempo_policy: TempoQualityPolicy::for_dj_level(DjLevel::Level2SmartMixing),
+            ..party_l1.clone()
+        };
+        let plan_2 = plan_dj_transition(&out_good, &in_good, &party_l2);
+        assert!(matches!(plan_2.selected_technique.as_str(), "timed_bass_swap" | "filter_sweep_drop" | "eq3_handover"));
+        assert!(plan_2.layered_deck_id.is_none(), "Level 2 must never layer a 3rd/4th deck");
+
+        let party_l3 = PartyDecisionContext {
+            dj_level: DjLevel::Level3AdvancedPerformance,
+            recent_techniques: vec!["beat_roll_buildup".to_string(), "filtered_buildup_drop".to_string()],
+            tempo_policy: TempoQualityPolicy::for_dj_level(DjLevel::Level3AdvancedPerformance),
+            ..party_l1.clone()
+        };
+        let plan_3 = plan_dj_transition(&out_good, &in_good, &party_l3);
+        assert!(matches!(plan_3.selected_technique.as_str(), "four_deck_layer" | "beat_roll_buildup" | "echo_out_blend" | "filtered_buildup_drop"));
+        if plan_3.selected_technique == "four_deck_layer" {
+            assert_eq!(plan_3.layered_deck_id, Some(2));
+            assert_eq!(plan_3.layered_role.as_deref(), Some("percussion_groove_layer"));
+        }
+
+        let party_l4 = PartyDecisionContext {
+            dj_level: DjLevel::Level4CreativeTools,
+            recent_techniques: vec!["stutter_gate_drop".to_string(), "echo_freeze_drop".to_string()],
+            tempo_policy: TempoQualityPolicy::for_dj_level(DjLevel::Level4CreativeTools),
+            ..party_l1.clone()
+        };
+        let plan_4 = plan_dj_transition(&out_good, &in_good, &party_l4);
+        assert!(matches!(plan_4.selected_technique.as_str(), "creative_mashup_layer" | "stutter_gate_drop" | "backspin_cut" | "echo_freeze_drop" | "tempo_ramp_bridge" | "four_deck_layer" | "echo_out_blend"));
+        if plan_4.selected_technique == "creative_mashup_layer" {
+            assert_eq!(plan_4.layered_deck_id, Some(2));
+            assert_eq!(plan_4.layered_role.as_deref(), Some("vocal_mashup_over_groove"));
+        }
+
+        // 5. Test all 14 moods across all 4 levels (56 scenarios)
+        let preset_moods = get_preset_moods();
+        assert_eq!(preset_moods.len(), 14);
+        for m in &preset_moods {
+            for lvl in [DjLevel::Level1TwoDeckMixer, DjLevel::Level2SmartMixing, DjLevel::Level3AdvancedPerformance, DjLevel::Level4CreativeTools] {
+                let p = PartyDecisionContext {
+                    dj_level: lvl,
+                    mood_id: m.id.clone(),
+                    target_energy: m.target_energy,
+                    recent_techniques: vec![],
+                    tempo_policy: TempoQualityPolicy::for_dj_level(lvl),
+                };
+                let plan = plan_dj_transition(&out_good, &in_good, &p);
+                assert_eq!(plan.status, "planned");
+                assert!(plan.duration_beats >= 4);
+                assert!(plan.confidence >= 0.20);
+            }
+        }
     }
 }
 

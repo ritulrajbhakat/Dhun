@@ -118,7 +118,7 @@ export interface AutoDjEngineCallbacks {
   onSnapshot?: (snapshots: WebAudioDeckStatus[]) => void;
 }
 
-const TECHNIQUE_LABELS: Record<string, string> = {
+export const TECHNIQUE_LABELS: Record<string, string> = {
   safe_quick_cut: 'Safe Quick Cut',
   eq3_handover: '3-Band EQ Handover',
   phrase_long_blend: 'Phrase-Aligned Long Blend',
@@ -656,6 +656,14 @@ export class FourDeckWebAudioEngine {
     if (!deck.buffer || !deck.meta) return null;
     const now = this.ctx?.currentTime ?? 0;
     const currentPosSec = deck.isPlaying ? Math.max(0, now - deck.startedAtCtxTime) : deck.offsetSec;
+    const genres = (deck.meta.genreTags || []).map((g) => g.toLowerCase()).join(' ');
+    const isElectronicDance = genres.includes('dance') || genres.includes('club') || genres.includes('house') || genres.includes('edm') || genres.includes('techno');
+    const isAcousticBallad = genres.includes('acoustic') || genres.includes('ballad') || genres.includes('ghazal') || genres.includes('sufi');
+    const isPercussionHeavy = genres.includes('dhol') || genres.includes('bhangra') || genres.includes('punjabi') || genres.includes('garba');
+    const avgVocal = deck.meta.sections && deck.meta.sections.length > 0
+      ? deck.meta.sections.reduce((acc, s) => acc + (s.vocal_activity ?? 0.5), 0) / deck.meta.sections.length
+      : isAcousticBallad ? 0.75 : isElectronicDance ? 0.35 : 0.50;
+
     return {
       trackId: deck.meta.submissionId,
       deckId: deck.deckId,
@@ -669,6 +677,10 @@ export class FourDeckWebAudioEngine {
       genreTags: deck.meta.genreTags || [],
       sections: deck.meta.sections || [],
       timingProfile: deck.meta.timingProfile ?? null,
+      vocalDensity: avgVocal,
+      isElectronicDance,
+      isAcousticBallad,
+      isPercussionHeavy,
     };
   }
 
@@ -1122,6 +1134,7 @@ export class FourDeckWebAudioEngine {
 
       case 'eq3_handover': {
         // Level 1: progressive High -> Mid -> Low 3-band EQ handover
+        const midCarve = plan?.eq_bass_handover_schedule?.mid_carve_db ?? -14;
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);
         toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, now + dur * 0.6);
 
@@ -1129,9 +1142,25 @@ export class FourDeckWebAudioEngine {
         toDeck.eqHigh.gain.linearRampToValueAtTime(0, now + dur * 0.35);
         fromDeck.eqHigh.gain.linearRampToValueAtTime(-16, now + dur * 0.45);
 
-        toDeck.eqMid.gain.setValueAtTime(-14, now);
-        toDeck.eqMid.gain.linearRampToValueAtTime(0, now + dur * 0.65);
-        fromDeck.eqMid.gain.linearRampToValueAtTime(-14, now + dur * 0.75);
+        // Vocal interaction aware mid carve:
+        if (plan?.vocal_handover_type === 'competing_lead_vocals') {
+          // Deep mid carve on both decks during overlap to eliminate vocal clash
+          toDeck.eqMid.gain.setValueAtTime(-18, now);
+          toDeck.eqMid.gain.linearRampToValueAtTime(midCarve, now + dur * 0.4);
+          toDeck.eqMid.gain.linearRampToValueAtTime(0, now + dur * 0.85);
+          fromDeck.eqMid.gain.linearRampToValueAtTime(midCarve, now + dur * 0.35);
+          fromDeck.eqMid.gain.linearRampToValueAtTime(-24, now + dur * 0.75);
+        } else if (plan?.vocal_handover_type === 'vocal_over_instrumental') {
+          // Outgoing vocal floats undisturbed while incoming instrumental builds underneath
+          toDeck.eqMid.gain.setValueAtTime(-16, now);
+          toDeck.eqMid.gain.linearRampToValueAtTime(-4, now + dur * 0.6);
+          toDeck.eqMid.gain.linearRampToValueAtTime(0, now + dur * 0.9);
+          fromDeck.eqMid.gain.linearRampToValueAtTime(-6, now + dur * 0.75);
+        } else {
+          toDeck.eqMid.gain.setValueAtTime(-14, now);
+          toDeck.eqMid.gain.linearRampToValueAtTime(0, now + dur * 0.65);
+          fromDeck.eqMid.gain.linearRampToValueAtTime(-14, now + dur * 0.75);
+        }
 
         toDeck.eqLow.gain.setValueAtTime(-24, now);
         toDeck.eqLow.gain.linearRampToValueAtTime(0, now + dur * 0.9);
@@ -1159,26 +1188,48 @@ export class FourDeckWebAudioEngine {
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);
         toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, now + dur * 0.65);
 
+        const swapAt = mid;
         toDeck.eqLow.gain.setValueAtTime(-28, now);
-        toDeck.eqLow.gain.setValueAtTime(-28, mid - 0.04);
-        toDeck.eqLow.gain.linearRampToValueAtTime(0, mid + 0.08);
+        toDeck.eqLow.gain.setValueAtTime(-28, swapAt - 0.04);
+        toDeck.eqLow.gain.linearRampToValueAtTime(0, swapAt + 0.08);
 
         fromDeck.eqLow.gain.setValueAtTime(0, now);
-        fromDeck.eqLow.gain.setValueAtTime(0, mid - 0.04);
-        fromDeck.eqLow.gain.linearRampToValueAtTime(-28, mid + 0.08);
+        fromDeck.eqLow.gain.setValueAtTime(0, swapAt - 0.04);
+        fromDeck.eqLow.gain.linearRampToValueAtTime(-28, swapAt + 0.08);
+
+        if (plan?.musical_purpose === 'dramatic_drop') {
+          // Instantaneous 1/16th beat silence micro-gap right before the drop hits
+          fromDeck.crossfadeGain.gain.setValueAtTime(1.0, swapAt - 0.06);
+          fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.05, swapAt - 0.01);
+          toDeck.crossfadeGain.gain.setValueAtTime(0.0, swapAt - 0.01);
+          toDeck.crossfadeGain.gain.linearRampToValueAtTime(1.0, swapAt + 0.02);
+        }
         break;
       }
 
       case 'filter_sweep_drop':
       case 'filtered_buildup_drop': {
         // Level 2/3: resonant HPF tension sweep on outgoing -> full-bass drop on incoming
-        const peakQ = technique === 'filtered_buildup_drop' ? 6.2 : 3.2;
-        fromDeck.filter.type = 'highpass';
-        fromDeck.filter.Q.cancelScheduledValues(now);
-        fromDeck.filter.Q.setValueAtTime(peakQ, now);
-        fromDeck.filter.frequency.cancelScheduledValues(now);
-        fromDeck.filter.frequency.setValueAtTime(75, now);
-        fromDeck.filter.frequency.exponentialRampToValueAtTime(5200, now + dur * 0.88);
+        const isExcitement = plan?.musical_purpose === 'build_excitement';
+        const isBreathingRoom = plan?.musical_purpose === 'create_breathing_room';
+        const peakQ = technique === 'filtered_buildup_drop' ? 6.2 : isExcitement ? 4.8 : 3.2;
+
+        if (isBreathingRoom) {
+          // Low-pass warm softening into peaceful/calm incoming track
+          fromDeck.filter.type = 'lowpass';
+          fromDeck.filter.Q.cancelScheduledValues(now);
+          fromDeck.filter.Q.setValueAtTime(1.8, now);
+          fromDeck.filter.frequency.cancelScheduledValues(now);
+          fromDeck.filter.frequency.setValueAtTime(12000, now);
+          fromDeck.filter.frequency.exponentialRampToValueAtTime(800, now + dur * 0.85);
+        } else {
+          fromDeck.filter.type = 'highpass';
+          fromDeck.filter.Q.cancelScheduledValues(now);
+          fromDeck.filter.Q.setValueAtTime(peakQ, now);
+          fromDeck.filter.frequency.cancelScheduledValues(now);
+          fromDeck.filter.frequency.setValueAtTime(75, now);
+          fromDeck.filter.frequency.exponentialRampToValueAtTime(isExcitement ? 6400 : 5200, now + dur * 0.88);
+        }
 
         fromDeck.crossfadeGain.gain.setValueAtTime(1.0, now + dur * 0.85);
         fromDeck.crossfadeGain.gain.linearRampToValueAtTime(0.0, now + dur);

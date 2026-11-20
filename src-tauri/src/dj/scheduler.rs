@@ -6,6 +6,7 @@ use crate::audio::decoder::decode_audio_file;
 use crate::audio::dsp::crossfader::CrossfaderCurve;
 use crate::db::Database;
 use crate::db::models::{PlayableTrackCandidate, PlaybackHistoryItem, PartySession};
+use crate::dj::energy::SetStoryteller;
 use crate::dj::levels::DjLevel;
 use crate::dj::moods::{get_preset_moods, MoodDefinition};
 use crate::dj::selector::TrackSelector;
@@ -26,6 +27,7 @@ pub struct DjScheduler {
     pub outgoing_deck: usize,
     pub playback_history: Vec<PlaybackHistoryItem>,
     pub current_track_started_at_ms: i64,
+    pub storyteller: SetStoryteller,
 }
 
 impl DjScheduler {
@@ -42,6 +44,7 @@ impl DjScheduler {
         });
 
         let level = DjLevel::from_i32(session.dj_level);
+        let storyteller = SetStoryteller::new(&mood.id, 30);
 
         Self {
             session,
@@ -58,6 +61,7 @@ impl DjScheduler {
             outgoing_deck: 0,
             playback_history: Vec::new(),
             current_track_started_at_ms: 0,
+            storyteller,
         }
     }
 
@@ -99,6 +103,8 @@ impl DjScheduler {
             .filter(|r| r.status == "approved")
             .collect();
 
+        let target_energy = self.storyteller.calculate_target_energy(self.mood.target_energy);
+
         if self.next_track.is_none() {
             let reserved = self.get_reserved_track_ids();
             if let Some(next) = TrackSelector::score_and_select(
@@ -106,7 +112,7 @@ impl DjScheduler {
                 self.current_track.as_ref(),
                 &self.mood,
                 self.secondary_mood.as_ref(),
-                self.mood.target_energy,
+                target_energy,
                 &self.playback_history,
                 &approved_requests,
                 &reserved,
@@ -122,7 +128,7 @@ impl DjScheduler {
                 self.next_track.as_ref().or(self.current_track.as_ref()),
                 &self.mood,
                 self.secondary_mood.as_ref(),
-                self.mood.target_energy,
+                target_energy,
                 &self.playback_history,
                 &approved_requests,
                 &reserved,
@@ -345,8 +351,9 @@ impl DjScheduler {
                 audio.send_command(AudioCommand::Stop { deck_id: self.outgoing_deck })?;
                 self.is_transitioning = false;
 
-                // Mark any requests matching the previous track as 'played' and persist history
+                // Mark any requests matching the previous track as 'played', update storytelling trajectory, and persist history
                 if let Some(prev) = &self.current_track {
+                    self.storyteller.record_track_played(prev.analysis.overall_energy, false, false);
                     let played_duration = now - self.current_track_started_at_ms;
                     let _ = db.log_playback(
                         &self.session.id,

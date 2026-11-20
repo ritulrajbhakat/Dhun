@@ -355,6 +355,63 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         info!("Migration v6 applied successfully.");
     }
 
+    if current_version < 7 {
+        info!("Applying DHUN schema migration v7 (Audience heatmaps & hook intelligence fusion tables)...");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS track_audience_heatmaps (
+                id TEXT PRIMARY KEY NOT NULL,
+                track_id TEXT NOT NULL,
+                provider_video_id TEXT NOT NULL,
+                retrieval_status TEXT NOT NULL, -- 'available', 'unavailable', 'failed', 'blocked'
+                raw_markers_json TEXT NOT NULL DEFAULT '[]',
+                labelled_regions_json TEXT NOT NULL DEFAULT '[]',
+                extracted_regions_json TEXT NOT NULL DEFAULT '[]',
+                parser_version INTEGER NOT NULL DEFAULT 1,
+                retrieved_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_heatmaps_track ON track_audience_heatmaps(track_id);
+            CREATE INDEX IF NOT EXISTS idx_heatmaps_video ON track_audience_heatmaps(provider_video_id);
+
+            CREATE TABLE IF NOT EXISTS track_hook_candidates (
+                id TEXT PRIMARY KEY NOT NULL,
+                track_id TEXT NOT NULL,
+                video_id TEXT,
+                video_start_ms INTEGER,
+                video_end_ms INTEGER,
+                audio_start_ms INTEGER NOT NULL,
+                audio_end_ms INTEGER NOT NULL,
+                dhun_musical_score REAL NOT NULL,
+                audience_replay_score REAL,
+                combined_hook_score REAL NOT NULL,
+                alignment_status TEXT NOT NULL,
+                alignment_offset_ms INTEGER NOT NULL DEFAULT 0,
+                alignment_confidence REAL NOT NULL DEFAULT 0.0,
+                dj_usability_score REAL NOT NULL DEFAULT 0.0,
+                is_audience_popular INTEGER NOT NULL DEFAULT 0,
+                is_musical_hook INTEGER NOT NULL DEFAULT 0,
+                is_aligned_hook INTEGER NOT NULL DEFAULT 0,
+                is_usable_entry INTEGER NOT NULL DEFAULT 0,
+                is_usable_exit INTEGER NOT NULL DEFAULT 0,
+                candidate_type TEXT NOT NULL,
+                entry_cue_ms INTEGER NOT NULL,
+                exit_cue_ms INTEGER NOT NULL,
+                usability_reasons_json TEXT NOT NULL DEFAULT '[]',
+                rejection_reasons_json TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_hook_cand_track ON track_hook_candidates(track_id);
+            CREATE INDEX IF NOT EXISTS idx_hook_cand_scores ON track_hook_candidates(combined_hook_score, dj_usability_score);
+            ",
+        )?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at, description) VALUES (7, ?1, 'Audience heatmaps and hook candidates persistence')",
+            params![now],
+        )?;
+        info!("Migration v7 applied successfully.");
+    }
+
     Ok(())
 }
 

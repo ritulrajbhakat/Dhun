@@ -560,6 +560,11 @@ fn build_track_transition_input(
         .and_then(|sid| db.get_timing_profile_for_song(sid).ok())
         .flatten();
     let genre_tags: Vec<String> = serde_json::from_str(&sub.genre_tags_json).unwrap_or_default();
+    let profile = crate::dj::selector::extract_musical_profile(
+        sub,
+        sub.bpm.unwrap_or(124.0),
+        sub.overall_energy.unwrap_or(0.70),
+    );
     TrackTransitionInput {
         track_id: sub.id.clone(),
         deck_id,
@@ -573,6 +578,18 @@ fn build_track_transition_input(
         genre_tags,
         sections,
         timing_profile,
+        vocal_density: Some(profile.vocal_density),
+        is_electronic_dance: profile.is_electronic_dance,
+        is_acoustic_ballad: profile.is_acoustic,
+        is_percussion_heavy: profile.is_percussion_heavy,
+        predicted_energy_direction: None,
+        vocal_style: if profile.vocal_density >= 0.70 {
+            Some("dense_vocal".to_string())
+        } else if profile.vocal_density <= 0.25 {
+            Some("instrumental".to_string())
+        } else {
+            None
+        },
     }
 }
 
@@ -1174,12 +1191,20 @@ pub async fn get_host_room_dashboard(
                     .unwrap_or(0.0);
                 let target_energy = compute_mood_energy_target(&primary_mood, elapsed_mins);
                 let out_in = build_track_transition_input(c, 0, &state.db);
-                let inc_in = build_track_transition_input(n, 1, &state.db);
+                let mut inc_in = build_track_transition_input(n, 1, &state.db);
+                if let Some(r) = recommendations.iter().find(|r| r.submission_id == n.id) {
+                    inc_in.predicted_energy_direction = Some(r.predicted_energy_direction.clone());
+                }
+                let recent_techniques: Vec<String> = state
+                    .db
+                    .get_session_playback_history(&room_id)
+                    .map(|h| h.into_iter().rev().take(6).map(|item| item.transition_type).collect())
+                    .unwrap_or_default();
                 let party_ctx = PartyDecisionContext {
                     dj_level: lvl,
                     mood_id: room.primary_mood_id.clone(),
                     target_energy,
-                    recent_techniques: Vec::new(),
+                    recent_techniques,
                     tempo_policy: TempoQualityPolicy::for_dj_level(lvl),
                 };
                 Some(plan_dj_transition(&out_in, &inc_in, &party_ctx))

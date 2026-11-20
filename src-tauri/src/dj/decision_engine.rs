@@ -106,6 +106,43 @@ pub struct TrackTransitionInput {
     pub genre_tags: Vec<String>,
     pub sections: Vec<PhraseMarker>,
     pub timing_profile: Option<TrackTimingProfile>,
+    #[serde(default)]
+    pub vocal_density: Option<f64>,
+    #[serde(default)]
+    pub is_electronic_dance: bool,
+    #[serde(default)]
+    pub is_acoustic_ballad: bool,
+    #[serde(default)]
+    pub is_percussion_heavy: bool,
+    #[serde(default)]
+    pub predicted_energy_direction: Option<String>,
+    #[serde(default)]
+    pub vocal_style: Option<String>,
+}
+
+impl Default for TrackTransitionInput {
+    fn default() -> Self {
+        Self {
+            track_id: String::new(),
+            deck_id: 0,
+            title: String::new(),
+            artist: String::new(),
+            duration_sec: 180.0,
+            current_pos_sec: 0.0,
+            bpm: None,
+            camelot_key: None,
+            overall_energy: None,
+            genre_tags: Vec::new(),
+            sections: Vec::new(),
+            timing_profile: None,
+            vocal_density: None,
+            is_electronic_dance: false,
+            is_acoustic_ballad: false,
+            is_percussion_heavy: false,
+            predicted_energy_direction: None,
+            vocal_style: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,13 +195,29 @@ pub struct TransitionDecisionPlan {
     pub musical_duration_sec: f64,
     pub vocal_overlap_policy: String,
     pub energy_progression: String,
+    #[serde(default = "default_musical_purpose")]
+    pub musical_purpose: String,
+    #[serde(default = "default_vocal_handover_type")]
+    pub vocal_handover_type: String,
     pub eq_bass_handover_schedule: EqBassHandoverSchedule,
     pub selected_technique: String,
     pub scheduled_execution_sec: f64,
     pub confidence: f64,
+    #[serde(default)]
+    pub layered_deck_id: Option<usize>,
+    #[serde(default)]
+    pub layered_role: Option<String>,
     pub reasons: Vec<String>,
     pub rejected_alternatives: Vec<RejectedTechniqueAlternative>,
     pub rejection_reason: Option<String>,
+}
+
+fn default_musical_purpose() -> String {
+    "preserve_dance_momentum".to_string()
+}
+
+fn default_vocal_handover_type() -> String {
+    "clean_instrumental".to_string()
 }
 
 fn default_crossfade_sec() -> f64 {
@@ -182,6 +235,22 @@ struct MoodRhythmProfile {
     is_cyclic_folk_garba: bool,
     is_electronic_club: bool,
     prefer_short_clean_mix: bool,
+
+    // Specific 14-Mood Personality Flags
+    is_shaadi_regal: bool,
+    is_baraat_dhol_procession: bool,
+    is_mehendi_warmth: bool,
+    is_haldi_folk: bool,
+    is_sangeet_choreography: bool,
+    is_desi_club: bool,
+    is_punjabi_tashan: bool,
+    is_garba_cyclic: bool,
+    is_dandiya_sticks: bool,
+    is_retro_bollywood: bool,
+    is_house_party: bool,
+    is_cocktail_lounge: bool,
+    is_festival_mainstage: bool,
+    is_international_global: bool,
 }
 
 fn classify_mood_rhythm(mood_id: &str, out_genres: &[String], in_genres: &[String]) -> MoodRhythmProfile {
@@ -193,24 +262,40 @@ fn classify_mood_rhythm(mood_id: &str, out_genres: &[String], in_genres: &[Strin
         .collect::<Vec<_>>()
         .join(" ");
 
-    let is_cyclic_folk_garba = m.contains("garba")
-        || m.contains("dandiya")
+    let is_shaadi_regal = m.contains("shaadi");
+    let is_baraat_dhol_procession = m.contains("baraat");
+    let is_mehendi_warmth = m.contains("mehendi");
+    let is_haldi_folk = m.contains("haldi");
+    let is_sangeet_choreography = m.contains("sangeet");
+    let is_desi_club = m.contains("desi_club");
+    let is_punjabi_tashan = m.contains("punjabi_tashan");
+    let is_garba_cyclic = m.contains("garba") && !m.contains("dandiya");
+    let is_dandiya_sticks = m.contains("dandiya");
+    let is_retro_bollywood = m.contains("retro");
+    let is_house_party = m.contains("house_party");
+    let is_cocktail_lounge = m.contains("cocktail");
+    let is_festival_mainstage = m.contains("festival");
+    let is_international_global = m.contains("international");
+
+    let is_cyclic_folk_garba = is_garba_cyclic
+        || is_dandiya_sticks
         || all_genres.contains("garba")
         || all_genres.contains("dandiya");
-    let is_percussion_heavy_dhol = m.contains("baraat")
+    let is_percussion_heavy_dhol = is_baraat_dhol_procession
+        || is_punjabi_tashan
         || all_genres.contains("dhol")
         || all_genres.contains("bhangra");
-    let is_indian_vocal_centric = m.contains("shaadi")
-        || m.contains("bollywood")
-        || m.contains("mehendi")
-        || m.contains("haldi")
-        || m.contains("sangeet")
-        || m.contains("retro_bollywood")
-        || m.contains("punjabi")
+    let is_indian_vocal_centric = is_shaadi_regal
+        || is_mehendi_warmth
+        || is_haldi_folk
+        || is_sangeet_choreography
+        || is_retro_bollywood
         || all_genres.contains("bollywood")
         || all_genres.contains("punjabi")
         || all_genres.contains("sufi");
-    let is_electronic_club = m.contains("desi_club")
+    let is_electronic_club = is_desi_club
+        || is_festival_mainstage
+        || is_cocktail_lounge
         || m.contains("house")
         || m.contains("club")
         || all_genres.contains("edm")
@@ -223,7 +308,21 @@ fn classify_mood_rhythm(mood_id: &str, out_genres: &[String], in_genres: &[Strin
         is_percussion_heavy_dhol,
         is_cyclic_folk_garba,
         is_electronic_club,
-        prefer_short_clean_mix: is_percussion_heavy_dhol || is_cyclic_folk_garba,
+        prefer_short_clean_mix: is_baraat_dhol_procession || (is_percussion_heavy_dhol && !is_shaadi_regal && !is_mehendi_warmth),
+        is_shaadi_regal,
+        is_baraat_dhol_procession,
+        is_mehendi_warmth,
+        is_haldi_folk,
+        is_sangeet_choreography,
+        is_desi_club,
+        is_punjabi_tashan,
+        is_garba_cyclic,
+        is_dandiya_sticks,
+        is_retro_bollywood,
+        is_house_party,
+        is_cocktail_lounge,
+        is_festival_mainstage,
+        is_international_global,
     }
 }
 
@@ -569,6 +668,8 @@ pub fn plan_dj_transition(
             musical_duration_sec: 0.50,
             vocal_overlap_policy: "clean_cut_handover".to_string(),
             energy_progression: "reset".to_string(),
+            musical_purpose: "create_breathing_room".to_string(),
+            vocal_handover_type: "clean_instrumental".to_string(),
             eq_bass_handover_schedule: EqBassHandoverSchedule {
                 incoming_low_cut_until_frac: 0.0,
                 bass_swap_at_frac: 0.5,
@@ -579,6 +680,8 @@ pub fn plan_dj_transition(
             selected_technique: "safe_quick_cut".to_string(),
             scheduled_execution_sec: outgoing.current_pos_sec,
             confidence: 0.2,
+            layered_deck_id: None,
+            layered_role: None,
             reasons: vec!["Insufficient remaining playback time (< 1.2s) for a musical transition.".to_string()],
             rejected_alternatives: vec![],
             rejection_reason: Some("Insufficient remaining playback time (< 1.2s).".to_string()),
@@ -692,7 +795,28 @@ pub fn plan_dj_transition(
     };
 
     // Choose best incoming entry point given outgoing exit context (avoiding vocal clash & competing drops!)
-    let (in_mix_in_sec, in_section_type, in_vocal_act, in_energy) = if !incoming.sections.is_empty() {
+    let in_dialogue_end_sec = incoming
+        .timing_profile
+        .as_ref()
+        .map(|tp| tp.dialogue_end_ms as f64 / 1000.0)
+        .unwrap_or(0.0);
+    let in_main_drop_sec = incoming
+        .timing_profile
+        .as_ref()
+        .map(|tp| tp.main_drop_ms as f64 / 1000.0)
+        .unwrap_or(0.0);
+    let in_has_theatrical_alaap = incoming
+        .timing_profile
+        .as_ref()
+        .map(|tp| tp.has_theatrical_alaap)
+        .unwrap_or(false);
+    let in_first_hook_sec = incoming
+        .timing_profile
+        .as_ref()
+        .map(|tp| tp.first_hook_ms as f64 / 1000.0)
+        .unwrap_or(0.0);
+
+    let (mut in_mix_in_sec, mut in_section_type, in_vocal_act, in_energy) = if !incoming.sections.is_empty() {
         let mut best_in: Option<(&PhraseMarker, f64)> = None;
         for sec in &incoming.sections {
             let st_sec = (sec.start_ms as f64 / 1000.0).max(0.0);
@@ -703,6 +827,11 @@ pub fn plan_dj_transition(
             if stype == "outro" {
                 continue;
             }
+            // CRITICAL: Never cue inside spoken dialogue / comedy skits!
+            if in_dialogue_end_sec > 0.0 && st_sec < in_dialogue_end_sec {
+                continue;
+            }
+
             let mut sc = 0.0f64;
 
             // Preferred musical pairings (Section 4)
@@ -722,6 +851,34 @@ pub fn plan_dj_transition(
                 sc += 3.5;
             } else if stype == "chorus" {
                 sc += 2.4;
+            }
+
+            // High energy preference: favor main drops and hooks over beatless intros
+            if party.target_energy >= 0.65 || out_energy >= 0.70 {
+                if (st_sec - in_main_drop_sec).abs() < 1.5 || (st_sec - in_first_hook_sec).abs() < 1.5 || stype == "drop" {
+                    sc += 4.0;
+                } else if stype == "intro" && sec.energy_level < 0.50 {
+                    sc -= 3.5;
+                }
+            }
+
+            // Stage 4 Hook Candidate Intelligence Fusion:
+            // Check if this incoming section matches an evaluated hook candidate
+            if let Some(tp) = &incoming.timing_profile {
+                if let Some(cand) = tp.hook_candidates.iter().find(|c| {
+                    let cand_st = c.entry_cue_ms as f64 / 1000.0;
+                    (cand_st - st_sec).abs() < 1.5
+                }) {
+                    if cand.is_usable_entry {
+                        let pop_bonus = if cand.is_audience_popular { 2.5 } else { 0.0 };
+                        let mus_bonus = if cand.is_musical_hook { 1.5 } else { 0.0 };
+                        let combined_boost = cand.combined_hook_score * 3.0;
+                        sc += pop_bonus + mus_bonus + combined_boost;
+                    } else {
+                        // Mid-word or unverified cue: heavily penalize unusable entry
+                        sc -= 5.0;
+                    }
+                }
             }
 
             // Penalize vocal-vs-vocal clashes heavily
@@ -747,10 +904,12 @@ pub fn plan_dj_transition(
                 sec.energy_level,
             )
         } else {
-            (0.0, "intro".to_string(), 0.25, incoming.overall_energy.unwrap_or(0.7))
+            let fallback_in = in_main_drop_sec.max(in_dialogue_end_sec);
+            (fallback_in, "intro".to_string(), 0.25, incoming.overall_energy.unwrap_or(0.7))
         }
     } else {
-        (0.0, "intro".to_string(), 0.25, incoming.overall_energy.unwrap_or(0.7))
+        let fallback_in = in_main_drop_sec.max(in_dialogue_end_sec);
+        (fallback_in, "intro".to_string(), 0.25, incoming.overall_energy.unwrap_or(0.7))
     };
 
     // 3. Evaluate BPM Relationship at the ACTUAL local mix-out & mix-in positions (Tempo Map aware!)
@@ -767,14 +926,68 @@ pub fn plan_dj_transition(
     );
     reasons.push(bpm_decision.reason.clone());
 
-    // 4. Vocal overlap policy & harmonic key evaluation
+    // 4. Musical Vocal Interaction, Vocal Overlap Policy & Harmonic Key Evaluation
+    let out_has_vocal = if out_section_type == "outro" {
+        out_vocal_act >= 0.45
+    } else {
+        out_vocal_act >= 0.40 || outgoing.is_acoustic_ballad || (outgoing.vocal_density.map(|v| v >= 0.65).unwrap_or(false) && out_section_type != "instrumental" && out_section_type != "groove" && out_section_type != "breakdown")
+    };
+    let in_has_vocal = if in_section_type == "intro" {
+        in_vocal_act >= 0.45
+    } else {
+        in_vocal_act >= 0.40 || (incoming.vocal_density.map(|v| v >= 0.65).unwrap_or(false) && in_section_type != "instrumental" && in_section_type != "groove")
+    };
+    let out_is_chorus = out_section_type == "chorus" || out_section_type == "peak";
+    let in_is_chorus = in_section_type == "chorus" || in_section_type == "peak";
+    let out_is_rap = outgoing.genre_tags.iter().any(|g| {
+        let gl = g.to_lowercase();
+        gl.contains("rap") || gl.contains("hip") || gl.contains("trap")
+    });
+    let in_is_rap = incoming.genre_tags.iter().any(|g| {
+        let gl = g.to_lowercase();
+        gl.contains("rap") || gl.contains("hip") || gl.contains("trap")
+    });
+
+    let is_rap_melodic = (out_is_rap && !in_is_rap && (out_has_vocal || in_has_vocal)) ||
+                         (!out_is_rap && in_is_rap && (out_has_vocal || outgoing.is_acoustic_ballad)) ||
+                         (outgoing.is_acoustic_ballad && in_is_rap);
+
     let vocal_clash = out_vocal_act >= 0.55 && in_vocal_act >= 0.55;
+    let vocal_handover_type = if is_rap_melodic {
+        reasons.push("Rap-to-melodic transition: carving low-mids on melodic/vocal range while cleanly catching rhyme scheme/groove entrance.".to_string());
+        "rap_to_melodic".to_string()
+    } else if out_has_vocal && in_has_vocal {
+        if out_is_chorus && in_is_chorus {
+            reasons.push("Chorus-to-chorus handover: delaying mix-out until outgoing hook phrase completes, then launching incoming hook on downbeat.".to_string());
+            "chorus_to_chorus".to_string()
+        } else if mood_rhythm.is_indian_vocal_centric && (out_section_type == "verse" || in_section_type == "verse") {
+            reasons.push("Call-and-response vocal handover: slotting incoming verse response into the outgoing vocal phrase gap.".to_string());
+            "call_and_response".to_string()
+        } else {
+            reasons.push("Detected competing lead vocals — enforcing strict vocal avoidance (deep mid carve & prompt handover).".to_string());
+            "competing_lead_vocals".to_string()
+        }
+    } else if out_has_vocal && !in_has_vocal {
+        reasons.push("Vocal over instrumental: incoming instrumental groove cleanly beds beneath outgoing vocal phrase.".to_string());
+        "vocal_over_instrumental".to_string()
+    } else if !out_has_vocal && in_has_vocal {
+        reasons.push("Instrumental to vocal entrance: outgoing instrumental builds tension into incoming vocal drop.".to_string());
+        "instrumental_to_vocal".to_string()
+    } else {
+        "clean_instrumental".to_string()
+    };
+
     let vocal_overlap_policy = if vocal_clash {
         reasons.push("Detected high vocal activity on both decks — enforcing vocal-clash avoidance (clean handover / mid carve).".to_string());
         "avoid_vocal_clash".to_string()
-    } else if out_vocal_act >= 0.50 && in_vocal_act <= 0.35 {
-        reasons.push("Incoming instrumental/intro cleanly supports outgoing vocal phrase.".to_string());
+    } else if vocal_handover_type == "vocal_over_instrumental" {
         "instrumental_under_vocal".to_string()
+    } else if vocal_handover_type == "instrumental_to_vocal" {
+        "instrumental_lift_into_vocal".to_string()
+    } else if vocal_handover_type == "rap_to_melodic" {
+        "rap_melodic_carve".to_string()
+    } else if vocal_handover_type == "call_and_response" {
+        "call_and_response_handover".to_string()
     } else if bpm_decision.relationship == BpmRelationship::NoBeatmatch {
         "clean_cut_handover".to_string()
     } else {
@@ -798,7 +1011,26 @@ pub fn plan_dj_transition(
     }
     .to_string();
 
-    // 5. Deterministic Transition Strategy Selection across DJ Levels 1–4 (Sections 6, 8, 9)
+    let musical_purpose = if protecting_buildup_payoff || (active_out_section.map(|s| s.section_type == "chorus").unwrap_or(false) && out_section_type == "chorus") {
+        "protect_hook"
+    } else if energy_delta >= 0.10 || incoming.predicted_energy_direction.as_deref() == Some("boost") || mood_rhythm.is_baraat_dhol_procession || mood_rhythm.is_festival_mainstage {
+        "build_excitement"
+    } else if energy_delta <= -0.12 || incoming.predicted_energy_direction.as_deref() == Some("relief") || mood_rhythm.is_mehendi_warmth {
+        "create_breathing_room"
+    } else if out_section_type == "breakdown" && (in_section_type == "drop" || in_section_type == "peak") {
+        "dramatic_drop"
+    } else if bpm_decision.relationship == BpmRelationship::HalfTime || bpm_decision.relationship == BpmRelationship::DoubleTime {
+        "intentional_surprise"
+    } else if genres_conflict && party.dj_level >= DjLevel::Level3AdvancedPerformance {
+        "smooth_genre_shift"
+    } else if out_section_type != in_section_type && !outgoing.is_electronic_dance && (incoming.is_percussion_heavy || incoming.is_electronic_dance) {
+        "introduce_new_groove"
+    } else {
+        "preserve_dance_momentum"
+    }
+    .to_string();
+
+    // 5. Deterministic Transition Strategy Selection across DJ Levels 1–4 with controlled anti-repetition
     let recent_used = |name: &str| party.recent_techniques.iter().take(2).any(|t| t == name);
 
     let selected_technique = if bpm_decision.relationship == BpmRelationship::NoBeatmatch {
@@ -871,8 +1103,10 @@ pub fn plan_dj_transition(
             DjLevel::Level2SmartMixing => {
                 if mood_rhythm.is_percussion_heavy_dhol && genres_conflict {
                     "safe_quick_cut".to_string()
-                } else {
+                } else if !recent_used("timed_bass_swap") {
                     "timed_bass_swap".to_string()
+                } else {
+                    "filter_sweep_drop".to_string()
                 }
             }
             DjLevel::Level3AdvancedPerformance => "echo_out_blend".to_string(),
@@ -905,8 +1139,10 @@ pub fn plan_dj_transition(
                 });
                 if key_compat >= 0.80 && !recent_used("timed_bass_swap") {
                     "timed_bass_swap".to_string()
-                } else {
+                } else if !recent_used("filter_sweep_drop") {
                     "filter_sweep_drop".to_string()
+                } else {
+                    "eq3_handover".to_string()
                 }
             }
             DjLevel::Level3AdvancedPerformance => {
@@ -916,8 +1152,10 @@ pub fn plan_dj_transition(
                     "four_deck_layer".to_string()
                 } else if energy_delta <= -0.10 {
                     "echo_out_blend".to_string()
-                } else {
+                } else if !recent_used("filtered_buildup_drop") {
                     "filtered_buildup_drop".to_string()
+                } else {
+                    "beat_roll_buildup".to_string()
                 }
             }
             DjLevel::Level4CreativeTools => {
@@ -934,6 +1172,25 @@ pub fn plan_dj_transition(
         }
     };
 
+    // Technique-specific cue point refinement:
+    // High-impact drops/cuts/backspins MUST hit the main drop or hook directly, never a beatless intro or dialogue!
+    if matches!(selected_technique.as_str(), "safe_quick_cut" | "backspin_cut" | "filter_sweep_drop" | "stutter_gate_drop") {
+        if in_main_drop_sec > 0.0 {
+            in_mix_in_sec = in_main_drop_sec;
+            in_section_type = "drop".to_string();
+        } else if in_dialogue_end_sec > 0.0 {
+            in_mix_in_sec = in_mix_in_sec.max(in_dialogue_end_sec);
+        }
+    } else if selected_technique == "echo_out_blend" {
+        if in_has_theatrical_alaap {
+            // Echo-out blend beautifully accommodates theatrical alaap openings!
+            in_mix_in_sec = in_dialogue_end_sec;
+            in_section_type = "alaap".to_string();
+        } else if in_dialogue_end_sec > 0.0 {
+            in_mix_in_sec = in_mix_in_sec.max(in_dialogue_end_sec);
+        }
+    }
+
     // 6. Adaptive Transition Length in Beats, Bars & Seconds (Section 5)
     let ref_bpm = out_local_bpm.or(in_local_bpm).unwrap_or(124.0).clamp(60.0, 200.0);
     let beat_sec = 60.0 / ref_bpm;
@@ -945,18 +1202,24 @@ pub fn plan_dj_transition(
             if vocal_clash || mood_rhythm.prefer_short_clean_mix { 8 } else { 16 }
         }
         "eq3_handover" | "timed_bass_swap" | "filter_sweep_drop" | "filtered_buildup_drop" | "tempo_ramp_bridge" => {
-            if vocal_clash || mood_rhythm.is_indian_vocal_centric || genres_conflict {
+            if mood_rhythm.is_cocktail_lounge {
+                32
+            } else if mood_rhythm.is_baraat_dhol_procession {
                 8
-            } else if mood_rhythm.is_electronic_club && in_vocal_act < 0.35 {
+            } else if vocal_clash || (mood_rhythm.is_indian_vocal_centric && !mood_rhythm.is_shaadi_regal) || genres_conflict || musical_purpose == "build_excitement" {
+                8
+            } else if mood_rhythm.is_electronic_club && in_vocal_act < 0.35 && musical_purpose == "preserve_dance_momentum" {
                 32
             } else {
                 16
             }
         }
         "phrase_long_blend" => {
-            if mood_rhythm.is_electronic_club && out_vocal_act < 0.30 && in_vocal_act < 0.30 && key_compat >= 0.85 {
+            if mood_rhythm.is_cocktail_lounge {
                 64
-            } else if vocal_clash || mood_rhythm.is_indian_vocal_centric {
+            } else if mood_rhythm.is_electronic_club && out_vocal_act < 0.30 && in_vocal_act < 0.30 && key_compat >= 0.85 {
+                64
+            } else if vocal_clash || (mood_rhythm.is_indian_vocal_centric && !mood_rhythm.is_shaadi_regal) {
                 16
             } else {
                 32
@@ -1026,21 +1289,50 @@ pub fn plan_dj_transition(
         }
     }
 
-    // 7. EQ & Bass Handover Schedule tailored to vocal policy and technique
+    // 7. EQ & Bass Handover Schedule tailored to vocal policy, timbre, and technique
+    let mid_carve: f64 = if vocal_clash || vocal_handover_type == "competing_lead_vocals" || vocal_handover_type == "rap_to_melodic" || outgoing.is_acoustic_ballad {
+        -12.0
+    } else if vocal_handover_type == "clean_instrumental" {
+        -3.0
+    } else if out_vocal_act >= 0.50 || outgoing.vocal_density.unwrap_or(0.0) >= 0.60 {
+        -8.0
+    } else {
+        -4.0
+    };
+
+    let bass_swap_frac = match selected_technique.as_str() {
+        "filter_sweep_drop" | "filtered_buildup_drop" | "beat_roll_buildup" | "stutter_gate_drop" => 0.86,
+        "echo_freeze_drop" => 0.56,
+        _ => if incoming.is_percussion_heavy { 0.48 } else { 0.50 },
+    };
+
+    // Phase-Cancellation & Bass Mud Guardrail for Extended Blends (>= 32 beats)
+    let (inc_low_cut_frac, out_low_cut_frac, final_mid_carve) = if duration_beats >= 32 {
+        // Enforce strict non-overlapping sub-bass: incoming bass stays filtered until swap,
+        // and outgoing cuts at or slightly before swap, with minimum -6 dB mid carve
+        (0.50, 0.48, mid_carve.min(-6.0))
+    } else if selected_technique == "safe_quick_cut" {
+        (0.0, 0.50, mid_carve)
+    } else {
+        (
+            if incoming.is_percussion_heavy { 0.44 } else { 0.48 },
+            if vocal_clash { 0.40 } else if incoming.is_electronic_dance { 0.46 } else { 0.50 },
+            mid_carve,
+        )
+    };
+
     let eq_bass_handover_schedule = EqBassHandoverSchedule {
-        incoming_low_cut_until_frac: if selected_technique == "safe_quick_cut" { 0.0 } else { 0.48 },
-        bass_swap_at_frac: match selected_technique.as_str() {
-            "filter_sweep_drop" | "filtered_buildup_drop" | "beat_roll_buildup" | "stutter_gate_drop" => 0.86,
-            "echo_freeze_drop" => 0.56,
-            _ => 0.50,
-        },
-        outgoing_low_cut_at_frac: if vocal_clash { 0.40 } else { 0.50 },
-        mid_carve_db: if vocal_clash { -10.0 } else if out_vocal_act >= 0.50 { -6.0 } else { -3.0 },
-        high_handover_frac: 0.35,
+        incoming_low_cut_until_frac: inc_low_cut_frac,
+        bass_swap_at_frac: bass_swap_frac,
+        outgoing_low_cut_at_frac: out_low_cut_frac,
+        mid_carve_db: final_mid_carve,
+        high_handover_frac: if incoming.is_percussion_heavy { 0.28 } else { 0.35 },
     };
 
     reasons.push(format!(
-        "Exit {} at {:.1}s ({}) → Enter {} at {:.1}s ({}) over {} beats ({} bars, {:.1}s) [crossfade: {:.2}s] via {}.",
+        "Purpose: {} | Vocal: {} | Exit {} at {:.1}s ({}) → Enter {} at {:.1}s ({}) over {} beats ({} bars, {:.1}s) [crossfade: {:.2}s] via {}.",
+        musical_purpose,
+        vocal_handover_type,
         outgoing.title,
         scheduled_execution_sec,
         out_section_type,
@@ -1059,6 +1351,14 @@ pub fn plan_dj_transition(
         + (if !vocal_clash { 0.15 } else { 0.05 })
         + (key_compat * 0.15))
         .clamp(0.20, 0.98);
+
+    let (layered_deck_id, layered_role) = if party.dj_level >= DjLevel::Level3AdvancedPerformance && selected_technique == "four_deck_layer" {
+        (Some(2), Some("percussion_groove_layer".to_string()))
+    } else if party.dj_level >= DjLevel::Level4CreativeTools && selected_technique == "creative_mashup_layer" {
+        (Some(2), Some("vocal_mashup_over_groove".to_string()))
+    } else {
+        (None, None)
+    };
 
     TransitionDecisionPlan {
         status: "planned".to_string(),
@@ -1094,10 +1394,14 @@ pub fn plan_dj_transition(
         musical_duration_sec: (musical_duration_sec * 100.0).round() / 100.0,
         vocal_overlap_policy,
         energy_progression,
+        musical_purpose,
+        vocal_handover_type,
         eq_bass_handover_schedule,
         selected_technique,
         scheduled_execution_sec: (scheduled_execution_sec * 100.0).round() / 100.0,
         confidence: (plan_confidence * 100.0).round() / 100.0,
+        layered_deck_id,
+        layered_role,
         reasons,
         rejected_alternatives,
         rejection_reason: None,

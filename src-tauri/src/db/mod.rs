@@ -1474,6 +1474,8 @@ impl Database {
                     let bpm = bpm_opt.unwrap_or(120.0);
                     let conf = conf_opt.unwrap_or(0.6);
                     let beats: Vec<i64> = legacy_grid.iter().map(|b| b.time_offset_ms).collect();
+                    let first_beat = beats.first().copied().unwrap_or(0);
+                    let last_beat = beats.last().copied().unwrap_or(0);
                     let downbeats: Vec<i64> = legacy_grid
                         .iter()
                         .filter(|b| b.is_downbeat)
@@ -1484,7 +1486,7 @@ impl Database {
                         beatgrid_confidence: conf,
                         bpm_confidence: conf,
                         downbeat_confidence: 0.80,
-                        downbeat_offset_ms: beats.first().copied().unwrap_or(0),
+                        downbeat_offset_ms: first_beat,
                         is_variable_tempo: false,
                         tempo_drift_bpm: 0.0,
                         meter: MeterAnalysis {
@@ -1494,12 +1496,39 @@ impl Database {
                         },
                         tempo_map: vec![TempoSegment {
                             start_ms: 0,
-                            end_ms: beats.last().copied().unwrap_or(0),
+                            end_ms: last_beat,
                             bpm,
                             confidence: conf,
                         }],
                         beat_timestamps_ms: beats,
                         downbeat_timestamps_ms: downbeats,
+                        alternative_bpms: vec![bpm * 0.5, bpm * 2.0, bpm * 0.75],
+                        sub_bass_energy: 0.40,
+                        mid_energy: 0.50,
+                        high_energy: 0.45,
+                        dynamic_range_db: 12.0,
+                        kick_presence: 0.70,
+                        snare_clap_presence: 0.65,
+                        hihat_presence: 0.60,
+                        syncopation_index: 0.25,
+                        rhythmic_pattern_detected: "standard_pop_groove".to_string(),
+                        rhythm_confidence: 0.60,
+                        has_lead_vocal: true,
+                        has_backing_vocal: false,
+                        vocal_confidence: 0.70,
+                        first_musical_ms: first_beat,
+                        dialogue_end_ms: 0,
+                        main_drop_ms: first_beat,
+                        first_vocal_entry_ms: 0,
+                        first_hook_ms: 0,
+                        has_theatrical_alaap: false,
+                        theatrical_alaap_start_ms: 0,
+                        theatrical_alaap_end_ms: 0,
+                        mix_in_point_ms: first_beat,
+                        mix_out_point_ms: last_beat,
+                        hook_candidates: Vec::new(),
+                        timeline_alignment: None,
+                        profile_version: 4,
                     }));
                 }
             }
@@ -2160,6 +2189,253 @@ impl Database {
 
         tx.commit()?;
         Ok(Self::load_global_song_with_urls(&conn, &target_song_id)?.unwrap())
+    }
+
+    // ========================================================================
+    // Audience Heatmap & Hook Intelligence Persistence
+    // ========================================================================
+
+    pub fn save_audience_heatmap(&self, heatmap: &TrackAudienceHeatmap) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let raw_markers_json = serde_json::to_string(&heatmap.raw_markers).unwrap_or_else(|_| "[]".to_string());
+        let labelled_json = serde_json::to_string(&heatmap.labelled_regions).unwrap_or_else(|_| "[]".to_string());
+        let extracted_json = serde_json::to_string(&heatmap.extracted_regions).unwrap_or_else(|_| "[]".to_string());
+
+        conn.execute(
+            "INSERT INTO track_audience_heatmaps (
+                id, track_id, provider_video_id, retrieval_status,
+                raw_markers_json, labelled_regions_json, extracted_regions_json,
+                parser_version, retrieved_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(id) DO UPDATE SET
+                retrieval_status = CASE 
+                    WHEN excluded.retrieval_status = 'available' THEN excluded.retrieval_status
+                    WHEN track_audience_heatmaps.retrieval_status = 'available' THEN track_audience_heatmaps.retrieval_status
+                    ELSE excluded.retrieval_status
+                END,
+                raw_markers_json = CASE
+                    WHEN excluded.raw_markers_json != '[]' THEN excluded.raw_markers_json
+                    ELSE track_audience_heatmaps.raw_markers_json
+                END,
+                labelled_regions_json = CASE
+                    WHEN excluded.labelled_regions_json != '[]' THEN excluded.labelled_regions_json
+                    ELSE track_audience_heatmaps.labelled_regions_json
+                END,
+                extracted_regions_json = CASE
+                    WHEN excluded.extracted_regions_json != '[]' THEN excluded.extracted_regions_json
+                    ELSE track_audience_heatmaps.extracted_regions_json
+                END,
+                parser_version = CASE
+                    WHEN excluded.raw_markers_json != '[]' THEN excluded.parser_version
+                    ELSE track_audience_heatmaps.parser_version
+                END,
+                retrieved_at = excluded.retrieved_at",
+            params![
+                heatmap.id,
+                heatmap.track_id,
+                heatmap.provider_video_id,
+                heatmap.retrieval_status,
+                raw_markers_json,
+                labelled_json,
+                extracted_json,
+                heatmap.parser_version,
+                heatmap.retrieved_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_audience_heatmap_for_video(&self, provider_video_id: &str) -> Result<Option<TrackAudienceHeatmap>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, track_id, provider_video_id, retrieval_status,
+                    raw_markers_json, labelled_regions_json, extracted_regions_json,
+                    parser_version, retrieved_at
+             FROM track_audience_heatmaps
+             WHERE provider_video_id = ?1
+             ORDER BY retrieved_at DESC LIMIT 1"
+        )?;
+
+        let mut rows = stmt.query(params![provider_video_id])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let track_id: String = row.get(1)?;
+            let provider_video_id: String = row.get(2)?;
+            let retrieval_status: String = row.get(3)?;
+            let raw_markers_json: String = row.get(4)?;
+            let labelled_json: String = row.get(5)?;
+            let extracted_json: String = row.get(6)?;
+            let parser_version: i32 = row.get(7)?;
+            let retrieved_at: i64 = row.get(8)?;
+
+            let raw_markers: Vec<HeatmapMarker> = serde_json::from_str(&raw_markers_json).unwrap_or_default();
+            let labelled_regions: Vec<ReplayRegion> = serde_json::from_str(&labelled_json).unwrap_or_default();
+            let extracted_regions: Vec<ReplayRegion> = serde_json::from_str(&extracted_json).unwrap_or_default();
+
+            Ok(Some(TrackAudienceHeatmap {
+                id,
+                track_id,
+                provider_video_id,
+                retrieval_status,
+                raw_markers,
+                labelled_regions,
+                extracted_regions,
+                parser_version,
+                retrieved_at,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_audience_heatmap_for_track(&self, track_id: &str) -> Result<Option<TrackAudienceHeatmap>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, track_id, provider_video_id, retrieval_status,
+                    raw_markers_json, labelled_regions_json, extracted_regions_json,
+                    parser_version, retrieved_at
+             FROM track_audience_heatmaps
+             WHERE track_id = ?1
+             ORDER BY retrieved_at DESC LIMIT 1"
+        )?;
+
+        let mut rows = stmt.query(params![track_id])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let track_id: String = row.get(1)?;
+            let provider_video_id: String = row.get(2)?;
+            let retrieval_status: String = row.get(3)?;
+            let raw_markers_json: String = row.get(4)?;
+            let labelled_json: String = row.get(5)?;
+            let extracted_json: String = row.get(6)?;
+            let parser_version: i32 = row.get(7)?;
+            let retrieved_at: i64 = row.get(8)?;
+
+            let raw_markers: Vec<HeatmapMarker> = serde_json::from_str(&raw_markers_json).unwrap_or_default();
+            let labelled_regions: Vec<ReplayRegion> = serde_json::from_str(&labelled_json).unwrap_or_default();
+            let extracted_regions: Vec<ReplayRegion> = serde_json::from_str(&extracted_json).unwrap_or_default();
+
+            Ok(Some(TrackAudienceHeatmap {
+                id,
+                track_id,
+                provider_video_id,
+                retrieval_status,
+                raw_markers,
+                labelled_regions,
+                extracted_regions,
+                parser_version,
+                retrieved_at,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn save_hook_candidates(&self, track_id: &str, candidates: &[HookCandidate]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute("DELETE FROM track_hook_candidates WHERE track_id = ?1", params![track_id])?;
+
+        for c in candidates {
+            let alignment_status_str = c.alignment_status.as_str();
+            let usability_reasons_json = serde_json::to_string(&c.usability_reasons).unwrap_or_else(|_| "[]".to_string());
+            let rejection_reasons_json = serde_json::to_string(&c.rejection_reasons).unwrap_or_else(|_| "[]".to_string());
+            let now = chrono::Utc::now().timestamp_millis();
+            let conf_val = if c.alignment_status == TimelineAlignmentStatus::Verified { 1.0 } else if c.alignment_status == TimelineAlignmentStatus::PartiallyVerified { 0.75 } else { 0.0 };
+
+            tx.execute(
+                "INSERT INTO track_hook_candidates (
+                    id, track_id, video_id, video_start_ms, video_end_ms,
+                    audio_start_ms, audio_end_ms, dhun_musical_score,
+                    audience_replay_score, combined_hook_score,
+                    alignment_status, alignment_offset_ms, alignment_confidence,
+                    dj_usability_score, is_audience_popular, is_musical_hook,
+                    is_aligned_hook, is_usable_entry, is_usable_exit,
+                    candidate_type, entry_cue_ms, exit_cue_ms,
+                    usability_reasons_json, rejection_reasons_json, created_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                    ?20, ?21, ?22, ?23, ?24, ?25
+                )",
+                params![
+                    c.id, c.track_id, c.video_id, c.video_start_ms, c.video_end_ms,
+                    c.audio_start_ms, c.audio_end_ms, c.dhun_musical_score,
+                    c.audience_replay_score, c.combined_hook_score,
+                    alignment_status_str, c.alignment_offset_ms, conf_val,
+                    c.dj_usability_score, c.is_audience_popular as i32, c.is_musical_hook as i32,
+                    c.is_aligned_hook as i32, c.is_usable_entry as i32, c.is_usable_exit as i32,
+                    c.candidate_type, c.entry_cue_ms, c.exit_cue_ms,
+                    usability_reasons_json, rejection_reasons_json, now
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_hook_candidates_for_track(&self, track_id: &str) -> Result<Vec<HookCandidate>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, track_id, video_id, video_start_ms, video_end_ms,
+                    audio_start_ms, audio_end_ms, dhun_musical_score,
+                    audience_replay_score, combined_hook_score,
+                    alignment_status, alignment_offset_ms,
+                    dj_usability_score, is_audience_popular, is_musical_hook,
+                    is_aligned_hook, is_usable_entry, is_usable_exit,
+                    candidate_type, entry_cue_ms, exit_cue_ms,
+                    usability_reasons_json, rejection_reasons_json
+             FROM track_hook_candidates
+             WHERE track_id = ?1
+             ORDER BY combined_hook_score DESC"
+        )?;
+
+        let rows = stmt.query_map(params![track_id], |row| {
+            let status_str: String = row.get(10)?;
+            let status = match status_str.as_str() {
+                "verified" => TimelineAlignmentStatus::Verified,
+                "partially_verified" => TimelineAlignmentStatus::PartiallyVerified,
+                "unverified" => TimelineAlignmentStatus::Unverified,
+                "incompatible" => TimelineAlignmentStatus::Incompatible,
+                _ => TimelineAlignmentStatus::Unavailable,
+            };
+            let u_json: String = row.get(21)?;
+            let r_json: String = row.get(22)?;
+
+            Ok(HookCandidate {
+                id: row.get(0)?,
+                track_id: row.get(1)?,
+                video_id: row.get(2)?,
+                video_start_ms: row.get(3)?,
+                video_end_ms: row.get(4)?,
+                audio_start_ms: row.get(5)?,
+                audio_end_ms: row.get(6)?,
+                dhun_musical_score: row.get(7)?,
+                audience_replay_score: row.get(8)?,
+                combined_hook_score: row.get(9)?,
+                alignment_status: status,
+                alignment_offset_ms: row.get(11)?,
+                dj_usability_score: row.get(12)?,
+                is_audience_popular: row.get::<_, i32>(13)? != 0,
+                is_musical_hook: row.get::<_, i32>(14)? != 0,
+                is_aligned_hook: row.get::<_, i32>(15)? != 0,
+                is_usable_entry: row.get::<_, i32>(16)? != 0,
+                is_usable_exit: row.get::<_, i32>(17)? != 0,
+                candidate_type: row.get(18)?,
+                entry_cue_ms: row.get(19)?,
+                exit_cue_ms: row.get(20)?,
+                usability_reasons: serde_json::from_str(&u_json).unwrap_or_default(),
+                rejection_reasons: serde_json::from_str(&r_json).unwrap_or_default(),
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 }
 

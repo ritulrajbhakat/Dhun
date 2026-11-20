@@ -20,13 +20,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-const INSTALLED_HELPER = path.join(
-  process.env.LOCALAPPDATA || '',
-  'DHUN',
-  'bin',
-  'dhun-local-helper.exe'
-);
-assert(fs.existsSync(INSTALLED_HELPER), `Installed helper not found at ${INSTALLED_HELPER}`);
+const localReleaseExe = path.resolve(process.cwd(), 'target', 'release', 'dhun-local-helper.exe');
+const appDataExe = path.join(process.env.LOCALAPPDATA || '', 'DHUN', 'bin', 'dhun-local-helper.exe');
+const INSTALLED_HELPER = fs.existsSync(appDataExe) ? appDataExe : localReleaseExe;
+assert(fs.existsSync(INSTALLED_HELPER), `Helper binary not found at ${INSTALLED_HELPER}`);
 
 function makeSyntheticWavBuffer(durationSec, freqHz, bpmPulse = true) {
   const sr = 44100;

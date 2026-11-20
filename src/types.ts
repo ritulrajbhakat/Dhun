@@ -59,18 +59,21 @@ export interface DjRecommendation {
   suggested_technique: string;
   technique_label: string;
   technique_reason: string;
+  predicted_energy_direction?: 'boost' | 'sustain' | 'relief' | string;
 }
 
 export interface TrackSectionMarker {
   section_type:
     | 'intro'
     | 'verse'
+    | 'pre_chorus'
     | 'chorus'
     | 'instrumental'
     | 'groove'
     | 'breakdown'
     | 'build'
     | 'drop'
+    | 'bridge'
     | 'peak'
     | 'outro'
     | 'phrase'
@@ -82,6 +85,10 @@ export interface TrackSectionMarker {
   vocal_activity?: number;
   confidence?: number;
   bar_index?: number;
+  sub_bass_energy?: number;
+  mid_energy?: number;
+  high_energy?: number;
+  loudness_lufs_est?: number;
 }
 
 export interface TempoSegment {
@@ -109,6 +116,95 @@ export interface TrackTimingProfile {
   tempo_map: TempoSegment[];
   beat_timestamps_ms: number[];
   downbeat_timestamps_ms: number[];
+  // Version 3 enriched musical analysis:
+  alternative_bpms?: number[];
+  sub_bass_energy?: number;
+  mid_energy?: number;
+  high_energy?: number;
+  dynamic_range_db?: number;
+  kick_presence?: number;
+  snare_clap_presence?: number;
+  hihat_presence?: number;
+  syncopation_index?: number;
+  rhythmic_pattern_detected?: string;
+  rhythm_confidence?: number;
+  has_lead_vocal?: boolean;
+  has_backing_vocal?: boolean;
+  vocal_confidence?: number;
+  // Version 4 multi-cue & non-musical structural classification:
+  first_musical_ms?: number;
+  dialogue_end_ms?: number;
+  main_drop_ms?: number;
+  first_vocal_entry_ms?: number;
+  first_hook_ms?: number;
+  has_theatrical_alaap?: boolean;
+  theatrical_alaap_start_ms?: number;
+  theatrical_alaap_end_ms?: number;
+  mix_in_point_ms?: number;
+  mix_out_point_ms?: number;
+  // Version 5 Hook Intelligence & Audience Heatmap Fusion:
+  hook_candidates?: HookCandidate[];
+  timeline_alignment?: TimelineAlignment | null;
+  profile_version?: number;
+}
+
+export type TimelineAlignmentStatus =
+  | 'verified'
+  | 'partially_verified'
+  | 'unverified'
+  | 'incompatible'
+  | 'unavailable';
+
+export interface TimelineAlignment {
+  video_to_audio_offset_ms: number;
+  alignment_confidence: number;
+  matched_event_count: number;
+  duration_discrepancy_ms: number;
+  alignment_method: string;
+  status: TimelineAlignmentStatus;
+}
+
+export interface ReplayRegion {
+  id: string;
+  start_ms: number;
+  end_ms: number;
+  peak_ms: number;
+  peak_intensity: number;
+  avg_intensity: number;
+  is_youtube_labelled: boolean;
+  label?: string;
+}
+
+export interface HeatmapMarker {
+  start_ms: number;
+  duration_ms: number;
+  intensity: number;
+}
+
+export interface HookCandidate {
+  id: string;
+  track_id: string;
+  video_id?: string;
+  video_start_ms?: number;
+  video_end_ms?: number;
+  audio_start_ms: number;
+  audio_end_ms: number;
+  dhun_musical_score: number;
+  audience_replay_score?: number | null;
+  combined_hook_score: number;
+  alignment_status: TimelineAlignmentStatus;
+  alignment_offset_ms: number;
+  dj_usability_score: number;
+  is_audience_popular: boolean;
+  is_musical_hook: boolean;
+  is_aligned_hook: boolean;
+  is_usable_entry: boolean;
+  is_usable_exit: boolean;
+  candidate_type: string;
+  entry_cue_ms: number;
+  exit_cue_ms: number;
+  usability_reasons?: string[];
+  rejection_reasons?: string[];
 }
 
 export type BpmRelationshipType =
@@ -166,10 +262,14 @@ export interface TransitionDecisionPlan {
   musical_duration_sec?: number;
   vocal_overlap_policy: string;
   energy_progression: string;
+  musical_purpose?: string;
+  vocal_handover_type?: string;
   eq_bass_handover_schedule: EqBassHandoverSchedule;
   selected_technique: DjTechniqueId;
   scheduled_execution_sec: number;
   confidence: number;
+  layered_deck_id?: number | null;
+  layered_role?: string | null;
   reasons: string[];
   rejected_alternatives: RejectedTechniqueAlternative[];
   rejection_reason?: string | null;
@@ -208,6 +308,20 @@ export interface MoodProfile {
   artist_cooldown_mins: number;
   preferred_fx_index?: number;
   genre_weights?: [string, number][];
+
+  // Enriched DJ Personality & Musical Identity Attributes
+  musical_identity?: string;
+  energy_curve?: string;
+  bpm_flexibility?: string;
+  acceptable_tempo_relationships?: string[];
+  vocal_preference?: string;
+  preferred_percussion?: string;
+  transition_preferences?: string[];
+  min_transition_beats?: number;
+  max_transition_beats?: number;
+  recovery_period_bars?: number;
+  contrast_tolerance?: number;
+  subgenre_weights?: [string, number][];
 }
 
 export interface LocalPartyRoom {
@@ -374,3 +488,48 @@ export interface MasterTelemetry {
   timestamp_ms: number;
   decks: DeckTelemetry[];
 }
+
+export type SetPhase =
+  | 'warm_up'
+  | 'build_up'
+  | 'peak'
+  | 'sustain'
+  | 'recovery'
+  | 'renewed_peak'
+  | 'finale';
+
+export interface ProtectedHookInfo {
+  section_type: string;
+  start_ms: number;
+  end_ms: number;
+  energy: number;
+  vocal_activity: number;
+}
+
+export interface SectionEnergyProfile {
+  intro_energy: number;
+  mix_in_energy: number;
+  body_energy: number;
+  peak_energy: number;
+  mix_out_energy: number;
+  has_iconic_hook: boolean;
+  hook_sections: ProtectedHookInfo[];
+  dynamic_range_db: number;
+}
+
+export interface SetStoryReport {
+  total_tracks: number;
+  mood_id: string;
+  energy_progression: number[];
+  peak_count: number;
+  peak_distribution_pct: number;
+  recovery_count: number;
+  recovery_intervals: number[];
+  average_recovery_interval: number;
+  max_consecutive_peaks_observed: number;
+  hook_protection_events: number;
+  controlled_surprises: number;
+  mood_consistency_pct: number;
+  repetition_violations: number;
+}
+

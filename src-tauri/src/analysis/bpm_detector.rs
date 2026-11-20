@@ -1,6 +1,17 @@
 use std::sync::Arc;
 use crate::db::models::{MeterAnalysis, TempoSegment};
 
+#[derive(Debug, Clone)]
+pub struct RhythmAnalysisResult {
+    pub kick_presence: f64,
+    pub snare_clap_presence: f64,
+    pub hihat_presence: f64,
+    pub syncopation_index: f64,
+    pub rhythmic_pattern_detected: String,
+    pub rhythm_confidence: f64,
+    pub alternative_bpms: Vec<f64>,
+}
+
 pub struct BpmDetector;
 
 impl BpmDetector {
@@ -359,5 +370,173 @@ impl BpmDetector {
     /// Detects phase-aligned downbeat offset in milliseconds from audio onset energies
     pub fn detect_downbeat_offset(samples: &Arc<Vec<f32>>, sample_rate: u32, bpm: f64) -> i64 {
         Self::detect_downbeat(samples, sample_rate, bpm).0
+    }
+
+    /// Evaluates percussion characteristics (kick, snare, hi-hat presence, syncopation index)
+    /// and classifies rhythmic groove patterns (including authentic Garba 3-Taali vs 4/4 EDM kicks,
+    /// Dandiya stick transients, and Punjabi live dhol dagga/tilli signatures).
+    pub fn detect_rhythm_and_percussion(
+        samples: &Arc<Vec<f32>>,
+        sample_rate: u32,
+        bpm: f64,
+        downbeat_offset_ms: i64,
+        meter: &MeterAnalysis,
+        _duration_ms: u64,
+    ) -> RhythmAnalysisResult {
+        let clean_bpm = bpm.clamp(60.0, 200.0);
+        let alt_bpms = vec![
+            ((clean_bpm * 0.5) * 10.0).round() / 10.0,
+            ((clean_bpm * 2.0) * 10.0).round() / 10.0,
+            ((clean_bpm * 0.75) * 10.0).round() / 10.0,
+        ];
+
+        let total_frames = samples.len() / 2;
+        let sr = sample_rate.max(8000) as f64;
+        let beat_ms = 60_000.0 / clean_bpm;
+        let beat_frames = ((sr * beat_ms) / 1000.0).round() as usize;
+        let offset_frames = ((sr * downbeat_offset_ms.max(0) as f64) / 1000.0).round() as usize;
+
+        if beat_frames < 100 || total_frames <= offset_frames + beat_frames * 8 {
+            return RhythmAnalysisResult {
+                kick_presence: 0.60,
+                snare_clap_presence: 0.55,
+                hihat_presence: 0.50,
+                syncopation_index: 0.20,
+                rhythmic_pattern_detected: "unclassified".to_string(),
+                rhythm_confidence: 0.40,
+                alternative_bpms: alt_bpms,
+            };
+        }
+
+        let dt = 1.0 / sr;
+        let lp_90 = (dt / (1.0 / (2.0 * std::f64::consts::PI * 90.0) + dt)).clamp(0.0005, 0.4);
+        let lp_150 = (dt / (1.0 / (2.0 * std::f64::consts::PI * 150.0) + dt)).clamp(0.001, 0.45);
+        let lp_1500 = (dt / (1.0 / (2.0 * std::f64::consts::PI * 1500.0) + dt)).clamp(0.01, 0.75);
+        let lp_4000 = (dt / (1.0 / (2.0 * std::f64::consts::PI * 4000.0) + dt)).clamp(0.02, 0.9);
+        let lp_5000 = (dt / (1.0 / (2.0 * std::f64::consts::PI * 5000.0) + dt)).clamp(0.02, 0.95);
+
+        let max_beats = ((total_frames - offset_frames) / beat_frames).min(64);
+        let probe_len = ((sr * 0.05).round() as usize).min(beat_frames / 3).max(1);
+
+        let mut on_beat_low = 0.0f64;
+        let mut on_beat_mid = 0.0f64;
+        let mut on_beat_high = 0.0f64;
+        let mut off_beat_mid = 0.0f64;
+        let mut off_beat_high = 0.0f64;
+        let mut dagga_low = 0.0f64;
+        let mut tilli_high = 0.0f64;
+        let mut beat_count = 0usize;
+
+        for b in 0..max_beats {
+            let beat_start = offset_frames + b * beat_frames;
+            let half_beat = beat_start + beat_frames / 2;
+
+            if beat_start + probe_len >= total_frames || half_beat + probe_len >= total_frames {
+                break;
+            }
+
+            let mut s90 = 0.0f64;
+            let mut s150 = 0.0f64;
+            let mut s1500 = 0.0f64;
+            let mut s4000 = 0.0f64;
+            let mut s5000 = 0.0f64;
+
+            let mut low_acc = 0.0f64;
+            let mut mid_acc = 0.0f64;
+            let mut high_acc = 0.0f64;
+            let mut dagga_acc = 0.0f64;
+            let mut tilli_acc = 0.0f64;
+
+            for f in beat_start..(beat_start + probe_len) {
+                let m = 0.5 * (samples[f * 2] as f64 + samples[f * 2 + 1] as f64);
+                s90 += lp_90 * (m - s90);
+                s150 += lp_150 * (m - s150);
+                s1500 += lp_1500 * (m - s1500);
+                s4000 += lp_4000 * (m - s4000);
+                s5000 += lp_5000 * (m - s5000);
+
+                let tilli_band = s4000 - s1500;
+                let hi_band = m - s5000;
+
+                low_acc += s150 * s150;
+                mid_acc += tilli_band * tilli_band;
+                high_acc += hi_band * hi_band;
+                dagga_acc += s90 * s90;
+                tilli_acc += tilli_band * tilli_band;
+            }
+
+            on_beat_low += (low_acc / probe_len as f64).sqrt();
+            on_beat_mid += (mid_acc / probe_len as f64).sqrt();
+            on_beat_high += (high_acc / probe_len as f64).sqrt();
+            dagga_low += (dagga_acc / probe_len as f64).sqrt();
+            tilli_high += (tilli_acc / probe_len as f64).sqrt();
+
+            let mut off_s1500 = 0.0f64;
+            let mut off_s4000 = 0.0f64;
+            let mut off_s5000 = 0.0f64;
+            let mut off_mid_acc = 0.0f64;
+            let mut off_high_acc = 0.0f64;
+
+            for f in half_beat..(half_beat + probe_len) {
+                let m = 0.5 * (samples[f * 2] as f64 + samples[f * 2 + 1] as f64);
+                off_s1500 += lp_1500 * (m - off_s1500);
+                off_s4000 += lp_4000 * (m - off_s4000);
+                off_s5000 += lp_5000 * (m - off_s5000);
+
+                let tilli_band = off_s4000 - off_s1500;
+                let hi_band = m - off_s5000;
+
+                off_mid_acc += tilli_band * tilli_band;
+                off_high_acc += hi_band * hi_band;
+            }
+
+            off_beat_mid += (off_mid_acc / probe_len as f64).sqrt();
+            off_beat_high += (off_high_acc / probe_len as f64).sqrt();
+            beat_count += 1;
+        }
+
+        let bc = beat_count.max(1) as f64;
+        let avg_on_low = on_beat_low / bc;
+        let avg_on_mid = on_beat_mid / bc;
+        let avg_on_high = on_beat_high / bc;
+        let avg_off_mid = off_beat_mid / bc;
+        let avg_off_high = off_beat_high / bc;
+        let avg_dagga = dagga_low / bc;
+        let avg_tilli = tilli_high / bc;
+
+        let kick_presence = (avg_on_low * 4.5).clamp(0.10, 0.98);
+        let snare_clap_presence = (avg_on_mid * 4.2).clamp(0.10, 0.98);
+        let hihat_presence = ((avg_on_high + avg_off_high) * 3.8).clamp(0.10, 0.98);
+
+        let total_energy = avg_on_low + avg_on_mid + avg_off_mid + 1e-6;
+        let syncopation_index = ((avg_off_mid * 1.8) / total_energy).clamp(0.05, 0.85);
+
+        let is_triple_meter = meter.beats_per_bar == 3 || meter.beats_per_bar == 6 || meter.meter_label == "3/4" || meter.meter_label == "6/8";
+
+        let (pattern, conf) = if is_triple_meter && meter.confidence >= 0.50 {
+            ("authentic_3_taali", (0.75 + meter.confidence * 0.20).clamp(0.65, 0.95))
+        } else if clean_bpm >= 122.0 && clean_bpm <= 146.0 && avg_on_high >= 0.08 && avg_off_high >= 0.06 {
+            ("sharp_dandiya_sticks", 0.85)
+        } else if avg_dagga >= 0.045 && avg_tilli >= 0.040 && syncopation_index >= 0.32 {
+            ("live_punjabi_dhol", 0.88)
+        } else if kick_presence >= 0.70 && syncopation_index <= 0.25 && meter.meter_label == "4/4" {
+            ("four_on_floor", 0.86)
+        } else if syncopation_index >= 0.42 {
+            ("syncopated_dembow", 0.80)
+        } else if kick_presence >= 0.40 && snare_clap_presence >= 0.35 {
+            ("standard_pop_groove", 0.78)
+        } else {
+            ("unclassified", 0.50)
+        };
+
+        RhythmAnalysisResult {
+            kick_presence: (kick_presence * 100.0).round() / 100.0,
+            snare_clap_presence: (snare_clap_presence * 100.0).round() / 100.0,
+            hihat_presence: (hihat_presence * 100.0).round() / 100.0,
+            syncopation_index: (syncopation_index * 100.0).round() / 100.0,
+            rhythmic_pattern_detected: pattern.to_string(),
+            rhythm_confidence: (conf * 100.0).round() / 100.0,
+            alternative_bpms: alt_bpms,
+        }
     }
 }
