@@ -1,9 +1,11 @@
-//! Progression Intelligence, Adaptive Thresholds & Hysteresis Engine (Stage 2)
+//! Progression Intelligence, Adaptive Thresholds & Hysteresis Engine (Stage 2 - Corrected)
 //!
 //! Provides domain-agnostic progression state management, anti-chatter hysteresis,
 //! and meaningful region integration:
 //! - Dual-threshold hysteresis: \theta_{enter} and \theta_{exit} prevent limit-cycle chatter
-//! - Temporal persistence window: transitions require continuous duration \tau_{confirm}
+//! - Continuous-time leaky integrator baseline tracking with candidate transition protection
+//! - Cold-start initial condition policy for signals already active at observation onset
+//! - Temporal persistence debounce window with retroactive onset and mass accounting
 //! - 8-State Progression Machine:
 //!     1. BelowSignificance: Signal below entry threshold, quiescent
 //!     2. Building: Rising above significance with positive velocity
@@ -13,14 +15,12 @@
 //!     6. Subsided: Dropped below exit threshold, confirmed across persistence window
 //!     7. Recovering: Direction reversal (v > 0) during decline before resetting to baseline
 //!     8. Stable: Quiescent baseline state with minimal volatility and drift
-//! - Meaningful Region Integration:
-//!     Accumulates onset, peak, offset, duration, sustained duration, integral mass,
-//!     and statistical confidence to distinguish ephemeral spikes from sustained movements.
+//! - Meaningful Region Integration with trapezoidal mass and empirical quality heuristic.
 //!
 //! Domain-agnostic: Operates on any scalar kinematic time series.
 
 use serde::{Deserialize, Serialize};
-use super::kinematics::{Direction, KinematicMetrics};
+use super::kinematics::{Direction, KinematicError, KinematicMetrics};
 
 /// Eight discrete states of signal progression lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,18 +62,37 @@ impl ProgressionState {
     }
 }
 
+/// Policy for handling signals that are already elevated upon cold-start initial observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InitialConditionPolicy {
+    /// If initial observation magnitude is >= theta_enter, immediately evaluate and initiate active progression.
+    ColdStartActive,
+    /// Always initialize in BelowSignificance, requiring an ascending transition to enter progression.
+    StrictAscentOnly,
+}
+
+/// Errors occurring during progression analysis.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ProgressionError {
+    #[error("Kinematic error: {0}")]
+    Kinematics(#[from] KinematicError),
+    #[error("Invalid configuration: {reason}")]
+    InvalidConfig { reason: String },
+}
+
 /// Adaptive threshold parameters governing state transitions and hysteresis.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdaptiveThresholdConfig {
     /// Fixed base threshold for entry (e.g. 0.50 for normalized [0, 1] signals).
     pub base_entry_threshold: f64,
-    /// Multiplier k for statistical adaptation: \theta_{enter} = max(base, \mu + k * \sigma).
+    /// Multiplier k for statistical adaptation: \theta_{enter} = max(base, \mu_b + k * \sigma_b).
     pub k_sigma: f64,
     /// Hysteresis margin ratio: \theta_{exit} = \theta_{enter} * (1.0 - hysteresis_ratio).
     /// Typically 0.15 (15% drop below entry threshold required to exit).
     pub hysteresis_ratio: f64,
+    /// Continuous-time baseline leaky integrator time constant in milliseconds. Default: 10,000 ms.
+    pub baseline_tau_ms: f64,
     /// Minimum time in milliseconds a condition must persist before confirming state transition.
-    /// Prevents rapid toggle / chatter on noisy boundaries.
     pub min_confirmation_ms: i64,
     /// Minimum duration in milliseconds in plateau before transitioning to Sustained state.
     pub min_sustain_ms: i64,
@@ -85,6 +104,8 @@ pub struct AdaptiveThresholdConfig {
     pub sustain_drift_threshold: f64,
     /// Positive velocity required to transition from Subduing to Recovering (units / sec).
     pub recovery_velocity_threshold: f64,
+    /// Policy for initial observation state.
+    pub initial_condition_policy: InitialConditionPolicy,
 }
 
 impl Default for AdaptiveThresholdConfig {
@@ -93,13 +114,47 @@ impl Default for AdaptiveThresholdConfig {
             base_entry_threshold: 0.50,
             k_sigma: 0.5,
             hysteresis_ratio: 0.15,      // 15% hysteresis band
+            baseline_tau_ms: 10_000.0,   // 10s continuous-time baseline memory
             min_confirmation_ms: 300,    // 300ms persistence debounce
             min_sustain_ms: 1500,        // 1.5s plateau for Sustained state
             building_velocity_threshold: 0.005,
             subduing_velocity_threshold: -0.005,
             sustain_drift_threshold: 0.020,
             recovery_velocity_threshold: 0.010,
+            initial_condition_policy: InitialConditionPolicy::ColdStartActive,
         }
+    }
+}
+
+impl AdaptiveThresholdConfig {
+    /// Validate configuration invariants.
+    pub fn validate(&self) -> Result<(), ProgressionError> {
+        if !self.base_entry_threshold.is_finite() {
+            return Err(ProgressionError::InvalidConfig {
+                reason: "base_entry_threshold must be finite".to_string(),
+            });
+        }
+        if self.hysteresis_ratio <= 0.0 || self.hysteresis_ratio >= 1.0 || !self.hysteresis_ratio.is_finite() {
+            return Err(ProgressionError::InvalidConfig {
+                reason: "hysteresis_ratio must be strictly between 0.0 and 1.0".to_string(),
+            });
+        }
+        if self.baseline_tau_ms <= 0.0 || !self.baseline_tau_ms.is_finite() {
+            return Err(ProgressionError::InvalidConfig {
+                reason: "baseline_tau_ms must be positive and finite".to_string(),
+            });
+        }
+        if self.min_confirmation_ms < 0 {
+            return Err(ProgressionError::InvalidConfig {
+                reason: "min_confirmation_ms must be non-negative".to_string(),
+            });
+        }
+        if self.min_sustain_ms < 0 {
+            return Err(ProgressionError::InvalidConfig {
+                reason: "min_sustain_ms must be non-negative".to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -108,7 +163,7 @@ impl Default for AdaptiveThresholdConfig {
 pub struct MeaningfulRegion {
     /// Unique index of the region in the sequence.
     pub region_id: usize,
-    /// Timestamp (ms) where progression began (entry threshold confirmed).
+    /// Timestamp (ms) where progression began (entry threshold confirmed, retroactively exact).
     pub onset_ms: i64,
     /// Timestamp (ms) of the highest recorded magnitude in the region.
     pub peak_ms: i64,
@@ -126,10 +181,19 @@ pub struct MeaningfulRegion {
     pub integral_mass: f64,
     /// Progression state at the conclusion or current evaluation.
     pub progression_state: ProgressionState,
-    /// Confidence score [0.0, 1.0] derived from mass, duration, and SNR.
-    pub confidence: f64,
+    /// Empirical quality heuristic score [0.0, 1.0] derived from mass, duration, and SNR.
+    /// Note: This is an empirical heuristic index, not a frequentist probability.
+    pub quality_score: f64,
     /// Whether the region has finished (subsided) or is still actively evolving.
     pub is_complete: bool,
+}
+
+impl MeaningfulRegion {
+    /// Backwards-compatible alias for quality_score.
+    #[inline]
+    pub fn confidence(&self) -> f64 {
+        self.quality_score
+    }
 }
 
 /// Snapshot of progression status for a single observation point.
@@ -155,12 +219,14 @@ pub struct ProgressionStateMachine {
     state_entry_ms: i64,
     last_processed_ms: i64,
     candidate_state: Option<(ProgressionState, i64)>, // (candidate, candidate_onset_ms)
+    candidate_buffer: Vec<KinematicMetrics>,          // buffered points during confirmation debounce
     active_region: Option<ActiveRegionBuilder>,
     completed_regions: Vec<MeaningfulRegion>,
     region_counter: usize,
     baseline_mean: f64,
     baseline_volatility: f64,
-    has_baseline: bool,
+    last_baseline_update_ms: Option<i64>,
+    is_initial_point: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -179,22 +245,25 @@ struct ActiveRegionBuilder {
 }
 
 impl ProgressionStateMachine {
-    /// Create a new state machine with default or custom configuration.
-    pub fn new(config: AdaptiveThresholdConfig) -> Self {
+    /// Create a new state machine with validated configuration.
+    pub fn new(config: AdaptiveThresholdConfig) -> Result<Self, ProgressionError> {
+        config.validate()?;
         let initial_baseline = config.base_entry_threshold * 0.5;
-        Self {
+        Ok(Self {
             config,
             current_state: ProgressionState::BelowSignificance,
             state_entry_ms: 0,
             last_processed_ms: 0,
             candidate_state: None,
+            candidate_buffer: Vec::new(),
             active_region: None,
             completed_regions: Vec::new(),
             region_counter: 0,
             baseline_mean: initial_baseline,
             baseline_volatility: 0.0,
-            has_baseline: false,
-        }
+            last_baseline_update_ms: None,
+            is_initial_point: true,
+        })
     }
 
     /// Reset the state machine to initial quiescent state.
@@ -204,12 +273,14 @@ impl ProgressionStateMachine {
         self.state_entry_ms = 0;
         self.last_processed_ms = 0;
         self.candidate_state = None;
+        self.candidate_buffer.clear();
         self.active_region = None;
         self.completed_regions.clear();
         self.region_counter = 0;
         self.baseline_mean = initial_baseline;
         self.baseline_volatility = 0.0;
-        self.has_baseline = false;
+        self.last_baseline_update_ms = None;
+        self.is_initial_point = true;
     }
 
     /// Current progression state.
@@ -222,7 +293,7 @@ impl ProgressionStateMachine {
         &self.completed_regions
     }
 
-    /// Compute dynamic thresholds given kinematic metrics and local statistics.
+    /// Compute dynamic thresholds given quiescent baseline statistics.
     pub fn compute_thresholds(&self, _metrics: &KinematicMetrics) -> (f64, f64) {
         let adaptive_component = self.baseline_mean + self.config.k_sigma * self.baseline_volatility;
         let theta_enter = self
@@ -239,33 +310,83 @@ impl ProgressionStateMachine {
     /// Feed a kinematic measurement and update progression state and active regions.
     pub fn update(&mut self, metrics: &KinematicMetrics) -> ProgressionPoint {
         let t = metrics.timestamp_ms;
+        let (theta_enter, theta_exit) = self.compute_thresholds(metrics);
 
-        // Update baseline statistics only when in quiescent states
-        if matches!(
-            self.current_state,
-            ProgressionState::BelowSignificance | ProgressionState::Stable
-        ) {
-            if !self.has_baseline {
-                self.baseline_mean = metrics.magnitude;
-                self.baseline_volatility = metrics.volatility;
-                self.has_baseline = true;
-            } else {
-                let alpha = 0.05;
-                self.baseline_mean = (1.0 - alpha) * self.baseline_mean + alpha * metrics.magnitude;
-                self.baseline_volatility = (1.0 - alpha) * self.baseline_volatility + alpha * metrics.volatility;
+        // Check for cold-start initial active condition
+        if self.is_initial_point {
+            self.is_initial_point = false;
+            self.last_baseline_update_ms = Some(t);
+            self.baseline_mean = metrics.magnitude;
+            self.baseline_volatility = metrics.volatility;
+
+            if self.config.initial_condition_policy == InitialConditionPolicy::ColdStartActive
+                && metrics.magnitude >= theta_enter
+            {
+                // Cold-start active signal handling:
+                let initial_state = if metrics.velocity > self.config.building_velocity_threshold {
+                    ProgressionState::Building
+                } else if metrics.velocity < self.config.subduing_velocity_threshold {
+                    ProgressionState::Subduing
+                } else {
+                    ProgressionState::Sustained
+                };
+
+                self.current_state = initial_state;
+                self.state_entry_ms = t;
+                self.region_counter += 1;
+                self.active_region = Some(ActiveRegionBuilder {
+                    region_id: self.region_counter,
+                    onset_ms: t,
+                    peak_ms: t,
+                    peak_magnitude: metrics.magnitude,
+                    accumulated_magnitude_dt: 0.0,
+                    accumulated_mass: 0.0,
+                    sustained_duration_ms: 0,
+                    last_point: Some(*metrics),
+                    last_state: initial_state,
+                    snr_sum: metrics.snr,
+                    sample_count: 1,
+                });
+
+                self.last_processed_ms = t;
+                return ProgressionPoint {
+                    timestamp_ms: t,
+                    state: self.current_state,
+                    theta_enter,
+                    theta_exit,
+                    kinematics: *metrics,
+                };
             }
         }
 
-        let (theta_enter, theta_exit) = self.compute_thresholds(metrics);
+        // Candidate Protection: Update baseline ONLY when in quiescent state AND no active candidate transition is pending
+        let is_candidate_active = self
+            .candidate_state
+            .map(|(s, _)| s.is_active_progression())
+            .unwrap_or(false);
 
-        // Determine raw candidate state from current metrics and thresholds
+        if matches!(
+            self.current_state,
+            ProgressionState::BelowSignificance | ProgressionState::Stable
+        ) && !is_candidate_active
+        {
+            let dt_ms = (t - self.last_baseline_update_ms.unwrap_or(t)).max(0);
+            let tau_ms = self.config.baseline_tau_ms.max(100.0);
+            let alpha = 1.0 - (-(dt_ms as f64) / tau_ms).exp();
+
+            self.baseline_mean = (1.0 - alpha) * self.baseline_mean + alpha * metrics.magnitude;
+            self.baseline_volatility = (1.0 - alpha) * self.baseline_volatility + alpha * metrics.volatility;
+            self.last_baseline_update_ms = Some(t);
+        }
+
+        // Determine raw candidate state
         let raw_next = self.evaluate_next_state(metrics, theta_enter, theta_exit);
 
-        // Apply temporal debounce / confirmation persistence to prevent chatter
-        self.update_state_transition(raw_next, t);
+        // Apply temporal debounce persistence with retroactive candidate onset tracking
+        let confirmed_transition = self.update_state_transition(raw_next, metrics);
 
         // Update active meaningful region
-        self.update_meaningful_regions(metrics, theta_exit);
+        self.update_meaningful_regions(metrics, theta_exit, confirmed_transition);
 
         self.last_processed_ms = t;
 
@@ -306,10 +427,8 @@ impl ProgressionStateMachine {
                 } else if v < self.config.subduing_velocity_threshold {
                     ProgressionState::Subduing
                 } else if v.abs() <= self.config.sustain_drift_threshold && a <= 0.0 {
-                    // Velocity nearing zero at crest -> Peaking
                     ProgressionState::Peaking
                 } else {
-                    // Still ascending
                     ProgressionState::Building
                 }
             }
@@ -323,7 +442,6 @@ impl ProgressionStateMachine {
                 } else if time_in_crest >= self.config.min_sustain_ms
                     && v.abs() <= self.config.sustain_drift_threshold
                 {
-                    // Sustained high intensity
                     ProgressionState::Sustained
                 } else {
                     ProgressionState::Peaking
@@ -336,7 +454,6 @@ impl ProgressionStateMachine {
                 } else if v < self.config.subduing_velocity_threshold {
                     ProgressionState::Subduing
                 } else if v > self.config.building_velocity_threshold {
-                    // Renewed ascent from sustained plateau
                     ProgressionState::Building
                 } else {
                     ProgressionState::Sustained
@@ -347,7 +464,6 @@ impl ProgressionStateMachine {
                 if val < theta_exit {
                     ProgressionState::Subsided
                 } else if v >= self.config.recovery_velocity_threshold {
-                    // Upward reversal before reaching exit threshold -> Recovering
                     ProgressionState::Recovering
                 } else {
                     ProgressionState::Subduing
@@ -379,88 +495,93 @@ impl ProgressionStateMachine {
     }
 
     /// Process debounce confirmation window for state transition.
-    fn update_state_transition(&mut self, raw_target: ProgressionState, t: i64) {
+    /// Returns Some((new_state, original_candidate_timestamp)) when a transition commits.
+    fn update_state_transition(
+        &mut self,
+        raw_target: ProgressionState,
+        m: &KinematicMetrics,
+    ) -> Option<(ProgressionState, i64)> {
+        let t = m.timestamp_ms;
         if raw_target == self.current_state {
             self.candidate_state = None;
-            return;
+            self.candidate_buffer.clear();
+            return None;
         }
 
         match self.candidate_state {
             Some((cand, cand_t)) if cand == raw_target => {
+                self.candidate_buffer.push(*m);
                 let elapsed = t - cand_t;
                 if elapsed >= self.config.min_confirmation_ms {
                     // Commit transition
                     self.current_state = raw_target;
                     self.state_entry_ms = t;
                     self.candidate_state = None;
+                    Some((raw_target, cand_t))
+                } else {
+                    None
                 }
             }
             _ => {
-                // Initialize candidate state
+                // Initialize candidate state and buffer
                 self.candidate_state = Some((raw_target, t));
+                self.candidate_buffer.clear();
+                self.candidate_buffer.push(*m);
+                None
             }
         }
     }
 
     /// Update accumulation in active meaningful region or finalize it.
-    fn update_meaningful_regions(&mut self, m: &KinematicMetrics, theta_exit: f64) {
+    fn update_meaningful_regions(
+        &mut self,
+        m: &KinematicMetrics,
+        theta_exit: f64,
+        confirmed_transition: Option<(ProgressionState, i64)>,
+    ) {
         let is_active = self.current_state.is_active_progression();
 
         if is_active {
+            if let Some((new_state, cand_t)) = confirmed_transition {
+                if new_state == ProgressionState::Building && self.active_region.is_none() {
+                    // Start a new meaningful region with RETROACTIVE onset at candidate timestamp
+                    self.region_counter += 1;
+                    let mut builder = ActiveRegionBuilder {
+                        region_id: self.region_counter,
+                        onset_ms: cand_t,
+                        peak_ms: cand_t,
+                        peak_magnitude: m.magnitude,
+                        accumulated_magnitude_dt: 0.0,
+                        accumulated_mass: 0.0,
+                        sustained_duration_ms: 0,
+                        last_point: None,
+                        last_state: self.current_state,
+                        snr_sum: 0.0,
+                        sample_count: 0,
+                    };
+
+                    // Retroactively integrate all buffered points observed during the candidate confirmation window
+                    for pt in &self.candidate_buffer {
+                        accumulate_into_builder(&mut builder, pt, theta_exit, self.current_state);
+                    }
+                    self.candidate_buffer.clear();
+                    self.active_region = Some(builder);
+                    return;
+                }
+            }
+
             if let Some(builder) = &mut self.active_region {
-                // Accumulate into existing active region
-                let dt_sec = if let Some(last) = builder.last_point {
-                    ((m.timestamp_ms - last.timestamp_ms) as f64 / 1000.0).max(0.0)
-                } else {
-                    0.0
-                };
-
-                let dt_ms = (dt_sec * 1000.0) as i64;
-                if self.current_state.is_peak_or_sustained() {
-                    builder.sustained_duration_ms += dt_ms;
-                }
-
-                builder.accumulated_magnitude_dt += m.magnitude * dt_sec;
-
-                // Trapezoidal integral mass above exit threshold
-                if let Some(last) = builder.last_point {
-                    let h1 = (last.magnitude - theta_exit).max(0.0);
-                    let h2 = (m.magnitude - theta_exit).max(0.0);
-                    let trap_area = 0.5 * (h1 + h2) * dt_sec;
-                    builder.accumulated_mass += trap_area;
-                }
-
-                if m.magnitude > builder.peak_magnitude {
-                    builder.peak_magnitude = m.magnitude;
-                    builder.peak_ms = m.timestamp_ms;
-                }
-
-                builder.last_point = Some(*m);
-                builder.last_state = self.current_state;
-                builder.snr_sum += m.snr;
-                builder.sample_count += 1;
-            } else {
-                // Start a new meaningful region
-                self.region_counter += 1;
-                self.active_region = Some(ActiveRegionBuilder {
-                    region_id: self.region_counter,
-                    onset_ms: m.timestamp_ms,
-                    peak_ms: m.timestamp_ms,
-                    peak_magnitude: m.magnitude,
-                    accumulated_magnitude_dt: 0.0,
-                    accumulated_mass: 0.0,
-                    sustained_duration_ms: 0,
-                    last_point: Some(*m),
-                    last_state: self.current_state,
-                    snr_sum: m.snr,
-                    sample_count: 1,
-                });
+                accumulate_into_builder(builder, m, theta_exit, self.current_state);
             }
         } else {
             // Signal is not in active progression. If we had an active region, finalize it.
             if let Some(builder) = self.active_region.take() {
-                let region = finalize_region(builder, m.timestamp_ms, false);
+                let offset_t = confirmed_transition.map(|(_, ct)| ct).unwrap_or(m.timestamp_ms);
+                let region = finalize_region(builder, offset_t, false);
                 self.completed_regions.push(region);
+            }
+            if self.candidate_state.is_none() {
+                self.candidate_buffer.clear();
             }
         }
     }
@@ -473,6 +594,45 @@ impl ProgressionStateMachine {
         }
         self.completed_regions.clone()
     }
+}
+
+/// Accumulate a metric point into the active region builder.
+fn accumulate_into_builder(
+    builder: &mut ActiveRegionBuilder,
+    m: &KinematicMetrics,
+    theta_exit: f64,
+    current_state: ProgressionState,
+) {
+    let dt_sec = if let Some(last) = builder.last_point {
+        ((m.timestamp_ms - last.timestamp_ms) as f64 / 1000.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    let dt_ms = (dt_sec * 1000.0) as i64;
+    if current_state.is_peak_or_sustained() {
+        builder.sustained_duration_ms += dt_ms;
+    }
+
+    builder.accumulated_magnitude_dt += m.magnitude * dt_sec;
+
+    // Trapezoidal integral mass above exit threshold
+    if let Some(last) = builder.last_point {
+        let h1 = (last.magnitude - theta_exit).max(0.0);
+        let h2 = (m.magnitude - theta_exit).max(0.0);
+        let trap_area = 0.5 * (h1 + h2) * dt_sec;
+        builder.accumulated_mass += trap_area;
+    }
+
+    if m.magnitude > builder.peak_magnitude {
+        builder.peak_magnitude = m.magnitude;
+        builder.peak_ms = m.timestamp_ms;
+    }
+
+    builder.last_point = Some(*m);
+    builder.last_state = current_state;
+    builder.snr_sum += m.snr;
+    builder.sample_count += 1;
 }
 
 /// Helper to convert an active builder into a completed MeaningfulRegion.
@@ -492,8 +652,6 @@ fn finalize_region(builder: ActiveRegionBuilder, offset_ms: i64, is_end_of_strea
         0.0
     };
 
-    // Calculate statistical confidence bounded in [0.0, 1.0]
-    // Considers sustained duration fraction, integral mass, and SNR
     let sustain_fraction = if duration_ms > 0 {
         (builder.sustained_duration_ms as f64 / duration_ms as f64).clamp(0.0, 1.0)
     } else {
@@ -504,7 +662,7 @@ fn finalize_region(builder: ActiveRegionBuilder, offset_ms: i64, is_end_of_strea
     let snr_factor = (avg_snr / (1.0 + avg_snr)).clamp(0.0, 1.0);
     let duration_factor = (duration_sec / 5.0).clamp(0.0, 1.0); // saturates at 5 seconds
 
-    let confidence = (sustain_fraction * 0.35 + mass_factor * 0.35 + duration_factor * 0.15 + snr_factor * 0.15)
+    let quality_score = (sustain_fraction * 0.35 + mass_factor * 0.35 + duration_factor * 0.15 + snr_factor * 0.15)
         .clamp(0.0, 1.0);
 
     MeaningfulRegion {
@@ -518,7 +676,7 @@ fn finalize_region(builder: ActiveRegionBuilder, offset_ms: i64, is_end_of_strea
         mean_magnitude,
         integral_mass: builder.accumulated_mass,
         progression_state: builder.last_state,
-        confidence,
+        quality_score,
         is_complete: !is_end_of_stream,
     }
 }
@@ -527,8 +685,9 @@ fn finalize_region(builder: ActiveRegionBuilder, offset_ms: i64, is_end_of_strea
 pub fn analyze_progression(
     metrics: &[KinematicMetrics],
     config: &AdaptiveThresholdConfig,
-) -> (Vec<ProgressionPoint>, Vec<MeaningfulRegion>) {
-    let mut state_machine = ProgressionStateMachine::new(config.clone());
+) -> Result<(Vec<ProgressionPoint>, Vec<MeaningfulRegion>), ProgressionError> {
+    config.validate()?;
+    let mut state_machine = ProgressionStateMachine::new(config.clone())?;
     let mut points = Vec::with_capacity(metrics.len());
 
     for m in metrics {
@@ -537,5 +696,5 @@ pub fn analyze_progression(
     }
 
     let regions = state_machine.finalize();
-    (points, regions)
+    Ok((points, regions))
 }

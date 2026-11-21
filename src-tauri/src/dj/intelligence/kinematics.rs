@@ -1,13 +1,15 @@
-//! Kinematics & Signal Dynamics Engine (Stage 1)
+//! Kinematics & Signal Dynamics Engine (Stage 1 - Corrected)
 //!
 //! Provides mathematically rigorous, domain-agnostic time-series kinematic analysis:
-//! - Low-lag Gaussian / moving-window smoothing to suppress observation noise
+//! - Time-aware Gaussian smoothing to suppress observation noise across irregular sampling intervals
 //! - First-order derivative: Velocity (v = dx/dt, rate of change per second)
 //! - Second-order derivative: Acceleration (a = dv/dt, curvature / momentum per second^2)
 //! - Directional classification: Ascending, Descending, Stationary
-//! - Rolling volatility (standard deviation sigma)
-//! - Signal-to-Noise Ratio (SNR = |v| / (sigma_noise + epsilon))
-//! - Kinematic confidence estimation bounded in [0.0, 1.0]
+//! - Pure noise residual estimation: sigma_noise = std(raw - smoothed)
+//! - Dimensionless Signal-to-Noise Ratio: SNR = (|v| * tau_scale) / (sigma_noise + epsilon)
+//! - Empirical kinematic quality heuristic bounded in [0.0, 1.0]
+//! - Strict monotonic timestamp and finite-value input validation
+//! - Mathematical alignment between batch and streaming derivative calculations
 //!
 //! Domain-agnostic: operates exclusively on scalar numeric signals over continuous time.
 
@@ -22,6 +24,17 @@ pub enum Direction {
     Descending,
     /// Signal rate of change is within the stationary deadband.
     Stationary,
+}
+
+/// Errors occurring during kinematic analysis.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum KinematicError {
+    #[error("Non-monotonic timestamp: previous {prev_ms} ms, current {current_ms} ms")]
+    NonMonotonicTimestamp { prev_ms: i64, current_ms: i64 },
+    #[error("Non-finite value encountered at {timestamp_ms} ms: {value}")]
+    NonFiniteValue { timestamp_ms: i64, value: f64 },
+    #[error("Invalid configuration: {reason}")]
+    InvalidConfig { reason: String },
 }
 
 /// A single timestamped scalar observation.
@@ -49,7 +62,7 @@ pub struct KinematicMetrics {
     pub timestamp_ms: i64,
     /// Raw un-smoothed value.
     pub raw_magnitude: f64,
-    /// Smoothed magnitude after local noise filtering.
+    /// Smoothed magnitude after local time-aware Gaussian noise filtering.
     pub magnitude: f64,
     /// First derivative: rate of change per second (units / sec).
     pub velocity: f64,
@@ -57,39 +70,88 @@ pub struct KinematicMetrics {
     pub acceleration: f64,
     /// Directional classification based on velocity and stationary deadband.
     pub direction: Direction,
-    /// Rolling standard deviation of the signal within the local window.
+    /// Pure noise volatility: standard deviation of residuals (raw - smoothed).
     pub volatility: f64,
-    /// Signal-to-Noise Ratio: ratio of velocity magnitude to local noise volatility.
+    /// Dimensionless Signal-to-Noise Ratio: (|v| * tau_scale) / (volatility + epsilon).
     pub snr: f64,
-    /// Confidence in the kinematic assessment in range [0.0, 1.0].
-    pub confidence: f64,
+    /// Empirical kinematic quality score heuristic bounded in [0.0, 1.0].
+    /// Note: This is an empirical heuristic index, not a frequentist probability.
+    pub quality_score: f64,
+}
+
+impl KinematicMetrics {
+    /// Backwards-compatible alias for quality_score.
+    #[inline]
+    pub fn confidence(&self) -> f64 {
+        self.quality_score
+    }
 }
 
 /// Configuration parameters for the kinematic filter and derivative estimator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KinematicFilterConfig {
-    /// Smoothing window half-width (samples on each side for local smoothing).
-    /// Total window size = 2 * half_window + 1. Default: 2 (window of 5).
-    pub half_window: usize,
-    /// Standard deviation for Gaussian smoothing kernel (in units of samples). Default: 1.0.
-    pub gaussian_sigma: f64,
+    /// Standard deviation for time-aware Gaussian smoothing kernel in milliseconds. Default: 300.0 ms.
+    pub time_bandwidth_ms: f64,
+    /// Characteristic timescale in seconds for converting velocity to dynamic signal swing in dimensionless SNR.
+    /// Default: 1.0 second.
+    pub snr_timescale_seconds: f64,
     /// Velocity magnitude below which signal is considered Stationary (units / sec).
     pub stationary_deadband: f64,
     /// Minimum standard deviation floor to avoid division by zero in SNR.
     pub noise_floor: f64,
     /// Minimum time delta (seconds) between samples to calculate derivatives safely.
     pub min_dt_seconds: f64,
+    /// Maximum lookback history window duration in milliseconds for streaming tracker.
+    pub max_history_duration_ms: i64,
 }
 
 impl Default for KinematicFilterConfig {
     fn default() -> Self {
         Self {
-            half_window: 2,
-            gaussian_sigma: 1.0,
+            time_bandwidth_ms: 300.0,
+            snr_timescale_seconds: 1.0,
             stationary_deadband: 0.005,
             noise_floor: 1e-5,
             min_dt_seconds: 1e-4, // 0.1 ms floor
+            max_history_duration_ms: 3000, // 3 seconds window
         }
+    }
+}
+
+impl KinematicFilterConfig {
+    /// Validate configuration invariants.
+    pub fn validate(&self) -> Result<(), KinematicError> {
+        if self.time_bandwidth_ms <= 0.0 || !self.time_bandwidth_ms.is_finite() {
+            return Err(KinematicError::InvalidConfig {
+                reason: "time_bandwidth_ms must be positive and finite".to_string(),
+            });
+        }
+        if self.snr_timescale_seconds <= 0.0 || !self.snr_timescale_seconds.is_finite() {
+            return Err(KinematicError::InvalidConfig {
+                reason: "snr_timescale_seconds must be positive and finite".to_string(),
+            });
+        }
+        if self.stationary_deadband < 0.0 || !self.stationary_deadband.is_finite() {
+            return Err(KinematicError::InvalidConfig {
+                reason: "stationary_deadband must be non-negative and finite".to_string(),
+            });
+        }
+        if self.noise_floor <= 0.0 || !self.noise_floor.is_finite() {
+            return Err(KinematicError::InvalidConfig {
+                reason: "noise_floor must be positive and finite".to_string(),
+            });
+        }
+        if self.min_dt_seconds <= 0.0 || !self.min_dt_seconds.is_finite() {
+            return Err(KinematicError::InvalidConfig {
+                reason: "min_dt_seconds must be positive and finite".to_string(),
+            });
+        }
+        if self.max_history_duration_ms <= 0 {
+            return Err(KinematicError::InvalidConfig {
+                reason: "max_history_duration_ms must be positive".to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -97,38 +159,57 @@ impl Default for KinematicFilterConfig {
 #[derive(Debug, Clone)]
 pub struct KinematicSignalTracker {
     config: KinematicFilterConfig,
-    history: Vec<KinematicPoint>,
-    max_history: usize,
+    raw_history: Vec<KinematicPoint>,
+    smoothed_history: Vec<KinematicPoint>,
+    last_timestamp_ms: Option<i64>,
     last_metrics: Option<KinematicMetrics>,
 }
 
 impl KinematicSignalTracker {
     /// Create a new tracker with the specified configuration.
-    pub fn new(config: KinematicFilterConfig) -> Self {
-        let max_history = (config.half_window * 2 + 1).max(5);
-        Self {
+    pub fn new(config: KinematicFilterConfig) -> Result<Self, KinematicError> {
+        config.validate()?;
+        Ok(Self {
             config,
-            history: Vec::with_capacity(max_history),
-            max_history,
+            raw_history: Vec::with_capacity(32),
+            smoothed_history: Vec::with_capacity(32),
+            last_timestamp_ms: None,
             last_metrics: None,
-        }
+        })
     }
 
     /// Reset internal state.
     pub fn reset(&mut self) {
-        self.history.clear();
+        self.raw_history.clear();
+        self.smoothed_history.clear();
+        self.last_timestamp_ms = None;
         self.last_metrics = None;
     }
 
     /// Push a new timestamped observation and compute updated kinematic metrics.
-    pub fn update(&mut self, timestamp_ms: i64, value: f64) -> KinematicMetrics {
-        let point = KinematicPoint::new(timestamp_ms, value);
-        self.history.push(point);
-        if self.history.len() > self.max_history {
-            self.history.remove(0);
+    pub fn update(&mut self, timestamp_ms: i64, value: f64) -> Result<KinematicMetrics, KinematicError> {
+        // Strict input validation
+        if !value.is_finite() {
+            return Err(KinematicError::NonFiniteValue { timestamp_ms, value });
         }
+        if let Some(prev) = self.last_timestamp_ms {
+            if timestamp_ms <= prev {
+                return Err(KinematicError::NonMonotonicTimestamp {
+                    prev_ms: prev,
+                    current_ms: timestamp_ms,
+                });
+            }
+        }
+        self.last_timestamp_ms = Some(timestamp_ms);
 
-        let n = self.history.len();
+        let point = KinematicPoint::new(timestamp_ms, value);
+        self.raw_history.push(point);
+
+        // Prune raw history outside lookback duration
+        let cutoff_ms = timestamp_ms - self.config.max_history_duration_ms;
+        self.raw_history.retain(|p| p.timestamp_ms >= cutoff_ms);
+
+        let n = self.raw_history.len();
         if n == 1 {
             let m = KinematicMetrics {
                 timestamp_ms,
@@ -139,39 +220,37 @@ impl KinematicSignalTracker {
                 direction: Direction::Stationary,
                 volatility: 0.0,
                 snr: 0.0,
-                confidence: 0.2, // Low confidence with single point
+                quality_score: 0.2,
             };
+            self.smoothed_history.push(KinematicPoint::new(timestamp_ms, value));
             self.last_metrics = Some(m);
-            return m;
+            return Ok(m);
         }
 
-        // Compute local smoothed value and statistics
-        let smoothed_magnitude = compute_local_smoothed(&self.history, &self.config);
-        let volatility = compute_local_std_dev(&self.history);
+        // Time-aware Gaussian smoothing over historical observations
+        let smoothed_magnitude = compute_time_aware_smoothed(&self.raw_history, timestamp_ms, &self.config);
+        self.smoothed_history.push(KinematicPoint::new(timestamp_ms, smoothed_magnitude));
+        self.smoothed_history.retain(|p| p.timestamp_ms >= cutoff_ms);
 
-        // Derivative estimation using backward differences over available history
-        let (velocity, acceleration) = if n == 2 {
-            let dt = ((self.history[1].timestamp_ms - self.history[0].timestamp_ms) as f64 / 1000.0)
+        // Compute pure noise residual volatility
+        let noise_volatility = compute_noise_volatility_streaming(&self.raw_history, &self.smoothed_history);
+
+        // Streaming derivative estimation computed on SMOOTHED history (consistent with batch)
+        let sn = self.smoothed_history.len();
+        let (velocity, acceleration) = if sn == 2 {
+            let dt = ((self.smoothed_history[1].timestamp_ms - self.smoothed_history[0].timestamp_ms) as f64 / 1000.0)
                 .max(self.config.min_dt_seconds);
-            let v = (self.history[1].value - self.history[0].value) / dt;
+            let v = (self.smoothed_history[1].value - self.smoothed_history[0].value) / dt;
             (v, 0.0)
         } else {
-            // 3-point parabolic backward derivative
-            let p0 = self.history[n - 3];
-            let p1 = self.history[n - 2];
-            let p2 = self.history[n - 1];
+            let p0 = self.smoothed_history[sn - 3];
+            let p1 = self.smoothed_history[sn - 2];
+            let p2 = self.smoothed_history[sn - 1];
 
             let dt1 = ((p1.timestamp_ms - p0.timestamp_ms) as f64 / 1000.0).max(self.config.min_dt_seconds);
             let dt2 = ((p2.timestamp_ms - p1.timestamp_ms) as f64 / 1000.0).max(self.config.min_dt_seconds);
 
-            let v1 = (p1.value - p0.value) / dt1;
-            let v2 = (p2.value - p1.value) / dt2;
-
-            // Velocity at the newest point: linear extrapolation of velocity
-            let dt_mid = 0.5 * (dt1 + dt2);
-            let a = (v2 - v1) / dt_mid;
-            let v = v2 + a * (0.5 * dt2);
-            (v, a)
+            compute_boundary_derivatives_right(p0.value, p1.value, p2.value, dt1, dt2)
         };
 
         // Direction classification
@@ -183,14 +262,18 @@ impl KinematicSignalTracker {
             Direction::Stationary
         };
 
-        // Signal to Noise Ratio
-        let effective_noise = volatility.max(self.config.noise_floor);
-        let snr = velocity.abs() / effective_noise;
+        // Dimensionless SNR: (|v| * tau_scale) / noise_volatility
+        let effective_noise = noise_volatility.max(self.config.noise_floor);
+        let dynamic_signal_swing = velocity.abs() * self.config.snr_timescale_seconds;
+        let snr = dynamic_signal_swing / effective_noise;
 
-        // Kinematic confidence bounded in [0.0, 1.0]
-        let history_factor = (n as f64 / self.max_history as f64).clamp(0.0, 1.0);
-        let stability_factor = (1.0 / (1.0 + volatility)).clamp(0.0, 1.0);
-        let confidence = (history_factor * 0.4 + stability_factor * 0.3 + (snr / (1.0 + snr)) * 0.3)
+        // Quality heuristic score [0.0, 1.0]
+        let history_span_ms = (timestamp_ms - self.raw_history[0].timestamp_ms) as f64;
+        let history_coverage = (history_span_ms / (3.0 * self.config.time_bandwidth_ms)).clamp(0.0, 1.0);
+        let stability_factor = (1.0 / (1.0 + noise_volatility)).clamp(0.0, 1.0);
+        let snr_factor = (snr / (1.0 + snr)).clamp(0.0, 1.0);
+
+        let quality_score = (history_coverage * 0.35 + stability_factor * 0.30 + snr_factor * 0.35)
             .clamp(0.0, 1.0);
 
         let metrics = KinematicMetrics {
@@ -200,13 +283,13 @@ impl KinematicSignalTracker {
             velocity,
             acceleration,
             direction,
-            volatility,
+            volatility: noise_volatility,
             snr,
-            confidence,
+            quality_score,
         };
 
         self.last_metrics = Some(metrics);
-        metrics
+        Ok(metrics)
     }
 
     /// Get the last computed metrics, if any.
@@ -215,22 +298,36 @@ impl KinematicSignalTracker {
     }
 }
 
-/// Analyze an entire batch time series of KinematicPoints with zero-phase central difference filtering.
-///
-/// For interior points, uses symmetric Gaussian smoothing and 3-point parabolic central derivatives
-/// to eliminate artificial phase lag. Boundary points employ forward/backward difference schemes.
+/// Analyze an entire batch time series of KinematicPoints with zero-phase time-aware central filtering.
 pub fn analyze_kinematics(
     points: &[KinematicPoint],
     config: &KinematicFilterConfig,
-) -> Vec<KinematicMetrics> {
+) -> Result<Vec<KinematicMetrics>, KinematicError> {
+    config.validate()?;
     if points.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+
+    // Step 1: Strict input validation
+    for i in 0..points.len() {
+        if !points[i].value.is_finite() {
+            return Err(KinematicError::NonFiniteValue {
+                timestamp_ms: points[i].timestamp_ms,
+                value: points[i].value,
+            });
+        }
+        if i > 0 && points[i].timestamp_ms <= points[i - 1].timestamp_ms {
+            return Err(KinematicError::NonMonotonicTimestamp {
+                prev_ms: points[i - 1].timestamp_ms,
+                current_ms: points[i].timestamp_ms,
+            });
+        }
     }
 
     let n = points.len();
     if n == 1 {
         let p = points[0];
-        return vec![KinematicMetrics {
+        return Ok(vec![KinematicMetrics {
             timestamp_ms: p.timestamp_ms,
             raw_magnitude: p.value,
             magnitude: p.value,
@@ -239,14 +336,21 @@ pub fn analyze_kinematics(
             direction: Direction::Stationary,
             volatility: 0.0,
             snr: 0.0,
-            confidence: 0.2,
-        }];
+            quality_score: 0.2,
+        }]);
     }
 
-    // Step 1: Smooth the signal using Gaussian kernel
-    let smoothed_values = smooth_series(points, config);
+    // Step 2: Time-aware Gaussian smoothing
+    let smoothed_values = smooth_series_time_aware(points, config);
 
-    // Step 2: Compute derivatives (velocity & acceleration)
+    // Step 3: Compute pure noise residuals and local volatility
+    let residuals: Vec<f64> = points
+        .iter()
+        .zip(smoothed_values.iter())
+        .map(|(p, s)| p.value - s)
+        .collect();
+
+    // Step 4: Compute derivatives on smoothed values
     let mut metrics = Vec::with_capacity(n);
 
     for i in 0..n {
@@ -254,11 +358,8 @@ pub fn analyze_kinematics(
         let raw_val = points[i].value;
         let smooth_val = smoothed_values[i];
 
-        // Compute local volatility in a window around i
-        let w_start = i.saturating_sub(config.half_window);
-        let w_end = (i + config.half_window + 1).min(n);
-        let window_points = &points[w_start..w_end];
-        let volatility = compute_local_std_dev(window_points);
+        // Time-windowed noise volatility (residuals within 3 * sigma_t)
+        let noise_volatility = compute_time_windowed_volatility(points, &residuals, i, config);
 
         let (velocity, acceleration) = if n == 2 {
             let dt = ((points[1].timestamp_ms - points[0].timestamp_ms) as f64 / 1000.0)
@@ -266,7 +367,6 @@ pub fn analyze_kinematics(
             let v = (smoothed_values[1] - smoothed_values[0]) / dt;
             (v, 0.0)
         } else if i == 0 {
-            // Forward difference with 3 points: parabolic fit at left boundary
             let dt1 = ((points[1].timestamp_ms - points[0].timestamp_ms) as f64 / 1000.0)
                 .max(config.min_dt_seconds);
             let dt2 = ((points[2].timestamp_ms - points[1].timestamp_ms) as f64 / 1000.0)
@@ -279,7 +379,6 @@ pub fn analyze_kinematics(
                 dt2,
             )
         } else if i == n - 1 {
-            // Backward difference with 3 points: parabolic fit at right boundary
             let dt1 = ((points[n - 2].timestamp_ms - points[n - 3].timestamp_ms) as f64 / 1000.0)
                 .max(config.min_dt_seconds);
             let dt2 = ((points[n - 1].timestamp_ms - points[n - 2].timestamp_ms) as f64 / 1000.0)
@@ -292,7 +391,6 @@ pub fn analyze_kinematics(
                 dt2,
             )
         } else {
-            // Central 3-point parabolic derivative for interior points
             let dt1 = ((points[i].timestamp_ms - points[i - 1].timestamp_ms) as f64 / 1000.0)
                 .max(config.min_dt_seconds);
             let dt2 = ((points[i + 1].timestamp_ms - points[i].timestamp_ms) as f64 / 1000.0)
@@ -315,14 +413,20 @@ pub fn analyze_kinematics(
             Direction::Stationary
         };
 
-        // SNR
-        let effective_noise = volatility.max(config.noise_floor);
-        let snr = velocity.abs() / effective_noise;
+        // Dimensionless SNR: (|v| * tau_scale) / noise_volatility
+        let effective_noise = noise_volatility.max(config.noise_floor);
+        let dynamic_signal_swing = velocity.abs() * config.snr_timescale_seconds;
+        let snr = dynamic_signal_swing / effective_noise;
 
-        // Confidence
-        let window_coverage = (w_end - w_start) as f64 / (config.half_window * 2 + 1) as f64;
-        let stability_factor = (1.0 / (1.0 + volatility)).clamp(0.0, 1.0);
-        let confidence = (window_coverage * 0.4 + stability_factor * 0.3 + (snr / (1.0 + snr)) * 0.3)
+        // Quality heuristic score [0.0, 1.0]
+        let t_span_left = (t_i - points[0].timestamp_ms) as f64;
+        let t_span_right = (points[n - 1].timestamp_ms - t_i) as f64;
+        let min_span = t_span_left.min(t_span_right);
+        let coverage_factor = (min_span / (2.0 * config.time_bandwidth_ms)).clamp(0.1, 1.0);
+        let stability_factor = (1.0 / (1.0 + noise_volatility)).clamp(0.0, 1.0);
+        let snr_factor = (snr / (1.0 + snr)).clamp(0.0, 1.0);
+
+        let quality_score = (coverage_factor * 0.35 + stability_factor * 0.30 + snr_factor * 0.35)
             .clamp(0.0, 1.0);
 
         metrics.push(KinematicMetrics {
@@ -332,43 +436,56 @@ pub fn analyze_kinematics(
             velocity,
             acceleration,
             direction,
-            volatility,
+            volatility: noise_volatility,
             snr,
-            confidence,
+            quality_score,
         });
     }
 
-    metrics
+    Ok(metrics)
 }
 
-/// Gaussian smoothing filter over a sequence of points.
-fn smooth_series(points: &[KinematicPoint], config: &KinematicFilterConfig) -> Vec<f64> {
+/// Time-aware Local Linear Kernel Smoother over a sequence of points.
+///
+/// Locally weighted linear regression eliminates boundary bias and non-uniform sampling distortion,
+/// guaranteeing exact reproduction of linear trends with zero artificial curvature.
+fn smooth_series_time_aware(points: &[KinematicPoint], config: &KinematicFilterConfig) -> Vec<f64> {
     let n = points.len();
     if n < 3 {
         return points.iter().map(|p| p.value).collect();
     }
     let mut smoothed = Vec::with_capacity(n);
-    let hw = config.half_window;
-    let sigma2 = 2.0 * config.gaussian_sigma * config.gaussian_sigma;
+    let sigma_t = config.time_bandwidth_ms;
+    let sigma2 = 2.0 * sigma_t * sigma_t;
+    let max_dt = 3.0 * sigma_t;
 
     for i in 0..n {
-        let w_start = i.saturating_sub(hw);
-        let w_end = (i + hw + 1).min(n);
+        let t_i = points[i].timestamp_ms;
+        let mut s0 = 0.0;
+        let mut s1 = 0.0;
+        let mut s2 = 0.0;
+        let mut t0 = 0.0;
+        let mut t1 = 0.0;
 
-        let mut sum_weights = 0.0;
-        let mut weighted_val = 0.0;
-
-        for (offset, p) in points[w_start..w_end].iter().enumerate() {
-            let actual_idx = w_start + offset;
-            let dist = (actual_idx as f64 - i as f64).abs();
-            let weight = (-dist * dist / sigma2).exp();
-
-            sum_weights += weight;
-            weighted_val += weight * p.value;
+        for p in points.iter() {
+            let dt_ms = (p.timestamp_ms - t_i) as f64;
+            if dt_ms.abs() <= max_dt {
+                let weight = (-dt_ms * dt_ms / sigma2).exp();
+                let dt_sec = dt_ms / 1000.0;
+                s0 += weight;
+                s1 += weight * dt_sec;
+                s2 += weight * dt_sec * dt_sec;
+                t0 += weight * p.value;
+                t1 += weight * dt_sec * p.value;
+            }
         }
 
-        if sum_weights > 0.0 {
-            smoothed.push(weighted_val / sum_weights);
+        let det = s0 * s2 - s1 * s1;
+        if det > 1e-12 {
+            let c0 = (s2 * t0 - s1 * t1) / det;
+            smoothed.push(c0);
+        } else if s0 > 0.0 {
+            smoothed.push(t0 / s0);
         } else {
             smoothed.push(points[i].value);
         }
@@ -377,74 +494,103 @@ fn smooth_series(points: &[KinematicPoint], config: &KinematicFilterConfig) -> V
     smoothed
 }
 
-/// Smooth recent history points in streaming tracker.
-fn compute_local_smoothed(history: &[KinematicPoint], config: &KinematicFilterConfig) -> f64 {
+/// Time-aware Local Linear Kernel Smoother for streaming history.
+fn compute_time_aware_smoothed(history: &[KinematicPoint], current_t: i64, config: &KinematicFilterConfig) -> f64 {
     let n = history.len();
     if n == 0 {
         return 0.0;
     }
-    let target_idx = n - 1;
-    let sigma2 = 2.0 * config.gaussian_sigma * config.gaussian_sigma;
+    if n < 3 {
+        return history[n - 1].value;
+    }
+    let sigma_t = config.time_bandwidth_ms;
+    let sigma2 = 2.0 * sigma_t * sigma_t;
+    let max_dt = 3.0 * sigma_t;
 
-    let mut sum_weights = 0.0;
-    let mut weighted_val = 0.0;
+    let mut s0 = 0.0;
+    let mut s1 = 0.0;
+    let mut s2 = 0.0;
+    let mut t0 = 0.0;
+    let mut t1 = 0.0;
 
-    for (i, p) in history.iter().enumerate() {
-        let dist = (target_idx as f64 - i as f64).abs();
-        let weight = (-dist * dist / sigma2).exp();
-        sum_weights += weight;
-        weighted_val += weight * p.value;
+    for p in history.iter() {
+        let dt_ms = (p.timestamp_ms - current_t) as f64;
+        if dt_ms.abs() <= max_dt {
+            let weight = (-dt_ms * dt_ms / sigma2).exp();
+            let dt_sec = dt_ms / 1000.0;
+            s0 += weight;
+            s1 += weight * dt_sec;
+            s2 += weight * dt_sec * dt_sec;
+            t0 += weight * p.value;
+            t1 += weight * dt_sec * p.value;
+        }
     }
 
-    if sum_weights > 0.0 {
-        weighted_val / sum_weights
+    let det = s0 * s2 - s1 * s1;
+    if det > 1e-12 {
+        (s2 * t0 - s1 * t1) / det
+    } else if s0 > 0.0 {
+        t0 / s0
     } else {
-        history[target_idx].value
+        history[n - 1].value
     }
 }
 
-/// Compute standard deviation of scalar values in a slice.
-fn compute_local_std_dev(points: &[KinematicPoint]) -> f64 {
-    let n = points.len();
+/// Compute standard deviation of noise residuals within a time window around index i.
+fn compute_time_windowed_volatility(
+    points: &[KinematicPoint],
+    residuals: &[f64],
+    i: usize,
+    config: &KinematicFilterConfig,
+) -> f64 {
+    let t_i = points[i].timestamp_ms;
+    let max_dt = (3.0 * config.time_bandwidth_ms) as i64;
+
+    let mut sum_sq = 0.0;
+    let mut count = 0;
+
+    for (p, res) in points.iter().zip(residuals.iter()) {
+        if (p.timestamp_ms - t_i).abs() <= max_dt {
+            sum_sq += res * res;
+            count += 1;
+        }
+    }
+
+    if count > 1 {
+        (sum_sq / (count - 1) as f64).sqrt()
+    } else {
+        0.0
+    }
+}
+
+/// Compute noise volatility for streaming history.
+fn compute_noise_volatility_streaming(raw: &[KinematicPoint], smoothed: &[KinematicPoint]) -> f64 {
+    let n = raw.len().min(smoothed.len());
     if n <= 1 {
         return 0.0;
     }
-    let mean = points.iter().map(|p| p.value).sum::<f64>() / n as f64;
-    let var = points
-        .iter()
-        .map(|p| {
-            let diff = p.value - mean;
-            diff * diff
-        })
-        .sum::<f64>()
-        / (n - 1) as f64;
-    var.sqrt()
+
+    let mut sum_sq = 0.0;
+    for i in 0..n {
+        let res = raw[i].value - smoothed[i].value;
+        sum_sq += res * res;
+    }
+
+    (sum_sq / (n - 1) as f64).sqrt()
 }
 
 /// Central 3-point parabolic derivative for non-uniform spacing.
-///
-/// Given three points (x0, t0), (x1, t1), (x2, t2) where dt1 = t1 - t0 and dt2 = t2 - t1,
-/// fits an osculating quadratic polynomial P(t) and calculates P'(t1) and P''(t1).
 fn compute_central_derivatives(x0: f64, x1: f64, x2: f64, dt1: f64, dt2: f64) -> (f64, f64) {
     let denom = dt1 * dt2 * (dt1 + dt2);
     if denom <= 0.0 {
         return (0.0, 0.0);
     }
-
-    // Velocity (first derivative at t1):
-    // v = (dt1^2 * x2 + (dt2^2 - dt1^2) * x1 - dt2^2 * x0) / (dt1 * dt2 * (dt1 + dt2))
     let velocity = (dt1 * dt1 * x2 + (dt2 * dt2 - dt1 * dt1) * x1 - dt2 * dt2 * x0) / denom;
-
-    // Acceleration (second derivative at t1):
-    // a = 2 * (dt1 * x2 - (dt1 + dt2) * x1 + dt2 * x0) / denom
     let acceleration = 2.0 * (dt1 * x2 - (dt1 + dt2) * x1 + dt2 * x0) / denom;
-
     (velocity, acceleration)
 }
 
 /// Left boundary 3-point forward parabolic derivative.
-///
-/// Calculates P'(t0) and P''(t0) from (x0, t0), (x1, t1), (x2, t2).
 fn compute_boundary_derivatives_left(x0: f64, x1: f64, x2: f64, dt1: f64, dt2: f64) -> (f64, f64) {
     let total_dt = dt1 + dt2;
     let denom = dt1 * dt2 * total_dt;
@@ -452,18 +598,12 @@ fn compute_boundary_derivatives_left(x0: f64, x1: f64, x2: f64, dt1: f64, dt2: f
         let v = if dt1 > 0.0 { (x1 - x0) / dt1 } else { 0.0 };
         return (v, 0.0);
     }
-
-    // Analytical forward derivative of quadratic fit at t = 0 (t0):
-    // v0 = (- (2*dt1 + dt2)*dt2 * x0 + total_dt^2 * x1 - dt1^2 * x2) / denom
     let velocity = (-(2.0 * dt1 + dt2) * dt2 * x0 + total_dt * total_dt * x1 - dt1 * dt1 * x2) / denom;
     let acceleration = 2.0 * (dt2 * x0 - total_dt * x1 + dt1 * x2) / denom;
-
     (velocity, acceleration)
 }
 
 /// Right boundary 3-point backward parabolic derivative.
-///
-/// Calculates P'(t2) and P''(t2) from (x0, t0), (x1, t1), (x2, t2).
 fn compute_boundary_derivatives_right(x0: f64, x1: f64, x2: f64, dt1: f64, dt2: f64) -> (f64, f64) {
     let total_dt = dt1 + dt2;
     let denom = dt1 * dt2 * total_dt;
@@ -471,11 +611,7 @@ fn compute_boundary_derivatives_right(x0: f64, x1: f64, x2: f64, dt1: f64, dt2: 
         let v = if dt2 > 0.0 { (x2 - x1) / dt2 } else { 0.0 };
         return (v, 0.0);
     }
-
-    // Analytical backward derivative of quadratic fit at t = total_dt (t2):
-    // v2 = (dt2^2 * x0 - total_dt^2 * x1 + (dt1 + 2*dt2)*dt1 * x2) / denom
     let velocity = (dt2 * dt2 * x0 - total_dt * total_dt * x1 + (dt1 + 2.0 * dt2) * dt1 * x2) / denom;
     let acceleration = 2.0 * (dt2 * x0 - total_dt * x1 + dt1 * x2) / denom;
-
     (velocity, acceleration)
 }
