@@ -533,11 +533,37 @@ pub struct SetStoryteller {
     pub hook_protection_count: usize,
     pub controlled_surprise_count: usize,
     pub recovery_interval_history: Vec<usize>,
+    pub kinematic_tracker: crate::dj::intelligence::KinematicSignalTracker,
+    pub progression_machine: crate::dj::intelligence::ProgressionStateMachine,
+    pub current_archetype: crate::dj::intelligence::ProgressionArchetype,
+    pub last_kinematic_metrics: Option<crate::dj::intelligence::KinematicMetrics>,
 }
 
 impl SetStoryteller {
     pub fn new(mood_id: &str, total_planned_tracks: usize) -> Self {
         let curve = MoodStoryCurve::for_mood(mood_id);
+        let k_config = crate::dj::intelligence::KinematicFilterConfig {
+            time_bandwidth_ms: 360_000.0,
+            snr_timescale_seconds: 180.0,
+            stationary_deadband: 0.0001,
+            max_history_duration_ms: 3_600_000, // 1 hour history across tracks
+            ..Default::default()
+        };
+        let p_config = crate::dj::intelligence::AdaptiveThresholdConfig {
+            base_entry_threshold: 0.70,
+            min_confirmation_ms: 180_000,
+            min_sustain_ms: 360_000,
+            building_velocity_threshold: 0.00005,
+            subduing_velocity_threshold: -0.00005,
+            sustain_drift_threshold: 0.0001,
+            recovery_velocity_threshold: 0.00005,
+            ..Default::default()
+        };
+        let kinematic_tracker = crate::dj::intelligence::KinematicSignalTracker::new(k_config)
+            .unwrap_or_else(|_| crate::dj::intelligence::KinematicSignalTracker::new(crate::dj::intelligence::KinematicFilterConfig::default()).unwrap());
+        let progression_machine = crate::dj::intelligence::ProgressionStateMachine::new(p_config)
+            .unwrap_or_else(|_| crate::dj::intelligence::ProgressionStateMachine::new(crate::dj::intelligence::AdaptiveThresholdConfig::default()).unwrap());
+
         Self {
             mood_id: mood_id.to_string(),
             total_planned_tracks: total_planned_tracks.max(10),
@@ -550,6 +576,10 @@ impl SetStoryteller {
             hook_protection_count: 0,
             controlled_surprise_count: 0,
             recovery_interval_history: Vec::new(),
+            kinematic_tracker,
+            progression_machine,
+            current_archetype: crate::dj::intelligence::ProgressionArchetype::QuiescentFlat,
+            last_kinematic_metrics: None,
         }
     }
 
@@ -661,6 +691,19 @@ impl SetStoryteller {
             score -= 15.0;
         }
 
+        // Progression Intelligence enrichment:
+        let progression_state = self.progression_machine.current_state();
+        if progression_state == crate::dj::intelligence::ProgressionState::Building && cand_overall_energy >= target_energy - 0.05 {
+            reasons.push(format!("Progression Intelligence: Sustains upward momentum ({:?})", progression_state));
+            score += 2.0;
+        } else if progression_state == crate::dj::intelligence::ProgressionState::Sustained && (cand_overall_energy - target_energy).abs() <= 0.08 {
+            reasons.push("Progression Intelligence: Consistently sustains dancefloor energy plateau".to_string());
+            score += 2.0;
+        } else if progression_state == crate::dj::intelligence::ProgressionState::Subduing && cand_overall_energy <= target_energy + 0.05 {
+            reasons.push("Progression Intelligence: Smooth controlled energy reduction".to_string());
+            score += 2.0;
+        }
+
         (score.clamp(0.0, 30.0), reasons, penalties)
     }
 
@@ -670,6 +713,13 @@ impl SetStoryteller {
         self.history_energies.push(energy);
         self.history_phases.push(phase);
         self.current_track_index += 1;
+
+        // Feed energy observation into kinematics tracker and progression state machine
+        let t_ms = (self.current_track_index as i64) * 180_000;
+        if let Ok(m) = self.kinematic_tracker.update(t_ms, energy) {
+            self.progression_machine.update(&m);
+            self.last_kinematic_metrics = Some(m);
+        }
 
         if is_hook_protected {
             self.hook_protection_count += 1;

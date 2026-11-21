@@ -181,6 +181,169 @@ impl TrackSelector {
 
         scored_candidates.into_iter().next().map(|(candidate, _)| candidate)
     }
+
+    /// Selects next track using multi-criteria robust prioritization under uncertainty.
+    /// Balances genre compatibility, BPM, key harmony, energy trajectory, and request priority
+    /// while penalizing high uncertainty and respecting hard safety constraints.
+    pub fn score_and_select_robust(
+        candidates: &[PlayableTrackCandidate],
+        currently_playing: Option<&PlayableTrackCandidate>,
+        mood: &MoodDefinition,
+        secondary_mood: Option<&MoodDefinition>,
+        target_energy: f64,
+        recent_history: &[PlaybackHistoryItem],
+        approved_requests: &[GuestRequest],
+        excluded_ids: &[String],
+        storyteller: Option<&crate::dj::energy::SetStoryteller>,
+        prioritizer_config: &crate::dj::intelligence::PrioritizerConfig,
+    ) -> Option<PlayableTrackCandidate> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let track_cooldown_ms = (mood.repetition_cooldown_mins as i64) * 60 * 1000;
+        let artist_cooldown_ms = (mood.artist_cooldown_mins as i64) * 60 * 1000;
+
+        let mut candidate_inputs: Vec<(PlayableTrackCandidate, Vec<crate::dj::intelligence::DecisionCriterion>)> =
+            Vec::with_capacity(candidates.len());
+
+        for candidate in candidates {
+            let mut criteria = Vec::new();
+
+            // 1. Hard constraint: Excluded IDs
+            let is_excluded = excluded_ids.contains(&candidate.track.id) && candidates.len() > excluded_ids.len();
+            criteria.push(crate::dj::intelligence::DecisionCriterion::hard(
+                "NotExcluded",
+                if is_excluded { 0.0 } else { 1.0 },
+                1.0,
+            ));
+
+            // 2. Cooldown check
+            let mut was_track_played_recently = false;
+            let mut was_artist_played_recently = false;
+
+            for hist in recent_history {
+                if hist.track_id == candidate.track.id && (now - hist.played_at) < track_cooldown_ms {
+                    was_track_played_recently = true;
+                    break;
+                }
+                if hist.track_artist.to_lowercase() == candidate.track.artist.to_lowercase()
+                    && (now - hist.played_at) < artist_cooldown_ms
+                {
+                    was_artist_played_recently = true;
+                }
+            }
+
+            let unplayed_candidates_exist = candidates.iter().any(|c| {
+                !excluded_ids.contains(&c.track.id)
+                    && !recent_history
+                        .iter()
+                        .any(|h| h.track_id == c.track.id && (now - h.played_at).abs() < track_cooldown_ms)
+            });
+
+            if was_track_played_recently && unplayed_candidates_exist {
+                criteria.push(crate::dj::intelligence::DecisionCriterion::hard("Cooldown", 0.0, 1.0));
+            } else {
+                criteria.push(crate::dj::intelligence::DecisionCriterion::hard("Cooldown", 1.0, 1.0));
+            }
+
+            // Artist repetition soft criterion
+            let artist_score = if was_artist_played_recently { 0.70 } else { 1.0 };
+            criteria.push(crate::dj::intelligence::DecisionCriterion::soft("ArtistVariety", artist_score, 0.10, 0.0));
+
+            // Soft criteria:
+            // A. Genre Compatibility
+            let mut primary_genre_score = 0.4;
+            for (g, weight) in &mood.genre_weights {
+                if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
+                    primary_genre_score = *weight;
+                    break;
+                }
+            }
+            let genre_score = match secondary_mood {
+                Some(sec) => {
+                    let mut sec_genre_score = 0.4;
+                    for (g, weight) in &sec.genre_weights {
+                        if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
+                            sec_genre_score = *weight;
+                            break;
+                        }
+                    }
+                    (0.70 * primary_genre_score) + (0.30 * sec_genre_score)
+                }
+                None => primary_genre_score,
+            };
+            criteria.push(crate::dj::intelligence::DecisionCriterion::soft("Genre", genre_score, 0.25, 0.05));
+
+            // B. BPM Transition Compatibility
+            let effective_min_bpm = match secondary_mood {
+                Some(sec) => mood.min_bpm.min(sec.min_bpm),
+                None => mood.min_bpm,
+            };
+            let effective_max_bpm = match secondary_mood {
+                Some(sec) => mood.max_bpm.max(sec.max_bpm),
+                None => mood.max_bpm,
+            };
+            let bpm_score = match currently_playing {
+                Some(curr) => calculate_bpm_compatibility(curr.analysis.bpm, candidate.analysis.bpm),
+                None => {
+                    if candidate.analysis.bpm >= effective_min_bpm && candidate.analysis.bpm <= effective_max_bpm {
+                        1.0
+                    } else {
+                        0.5
+                    }
+                }
+            };
+            let bpm_uncertainty = (1.0 - candidate.analysis.bpm_confidence).clamp(0.05, 0.50);
+            criteria.push(crate::dj::intelligence::DecisionCriterion::soft("BpmCompatibility", bpm_score, 0.25, bpm_uncertainty));
+
+            // C. Key Compatibility (Camelot)
+            let key_score = match currently_playing {
+                Some(curr) => calculate_camelot_compatibility(&curr.analysis.camelot_key, &candidate.analysis.camelot_key),
+                None => 0.8,
+            };
+            let key_uncertainty = (1.0 - candidate.analysis.key_confidence).clamp(0.05, 0.50);
+            criteria.push(crate::dj::intelligence::DecisionCriterion::soft("KeyHarmony", key_score, 0.25, key_uncertainty));
+
+            // D. Energy Fit / Narrative Trajectory
+            let (energy_score, energy_uncertainty) = if let Some(st) = storyteller {
+                let profile = crate::dj::energy::SectionEnergyProfile::from_phrase_markers(
+                    &[],
+                    candidate.analysis.overall_energy,
+                );
+                let (raw_score, _, _) = st.evaluate_candidate_energy_fit(&profile, candidate.analysis.overall_energy);
+                let normalized = (raw_score / 30.0).clamp(0.0, 1.0);
+                (normalized, 0.10)
+            } else {
+                let effective_target = match secondary_mood {
+                    Some(sec) => (0.70 * target_energy) + (0.30 * sec.target_energy),
+                    None => target_energy,
+                };
+                let diff = (candidate.analysis.overall_energy - effective_target).abs();
+                ((1.0 - diff).clamp(0.1, 1.0), 0.15)
+            };
+            criteria.push(crate::dj::intelligence::DecisionCriterion::soft("EnergyNarrative", energy_score, 0.25, energy_uncertainty));
+
+            // E. Request Priority
+            let is_requested = approved_requests.iter().any(|r| r.track_id == candidate.track.id);
+            if is_requested {
+                criteria.push(crate::dj::intelligence::DecisionCriterion::soft("GuestRequest", 1.0, 0.20, 0.0));
+            }
+
+            candidate_inputs.push((candidate.clone(), criteria));
+        }
+
+        let evaluated = crate::dj::intelligence::rank_candidates(candidate_inputs, prioritizer_config);
+
+        evaluated
+            .into_iter()
+            .find(|c| c.is_eligible)
+            .map(|mut c| {
+                c.payload.compatibility_score = c.robust_score;
+                c.payload
+            })
+    }
 }
 
 pub fn calculate_bpm_compatibility(bpm_a: f64, bpm_b: f64) -> f64 {

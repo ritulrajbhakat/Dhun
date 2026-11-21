@@ -189,4 +189,35 @@ impl HookUsabilityEvaluator {
         c.usability_reasons.extend(reasons);
         c.rejection_reasons.extend(rejections);
     }
+
+    /// Evaluates hook candidates with full Progression Meaningful Region integration.
+    /// Distinguishes sustained engagement from transient spikes.
+    pub fn evaluate_candidates_with_regions(
+        candidates: &mut [HookCandidate],
+        timing_profile: &TrackTimingProfile,
+        phrases: &[PhraseMarker],
+        total_duration_ms: u64,
+        meaningful_regions: &[crate::dj::intelligence::MeaningfulRegion],
+    ) {
+        Self::evaluate_candidates(candidates, timing_profile, phrases, total_duration_ms);
+
+        for c in candidates.iter_mut() {
+            let c_start = c.audio_start_ms;
+            let c_end = c.audio_end_ms;
+            for r in meaningful_regions {
+                if r.onset_ms <= c_end && r.offset_ms >= c_start {
+                    if r.sustained_duration_ms >= 1000 && r.integral_mass >= 0.20 {
+                        c.usability_reasons.push(format!(
+                            "Audience Intelligence: Verified sustained replay progression (mass: {:.2}, sustained: {}ms)",
+                            r.integral_mass, r.sustained_duration_ms
+                        ));
+                        c.dj_usability_score = (c.dj_usability_score + (r.integral_mass / (1.0 + r.integral_mass) * 0.08)).clamp(0.05, 0.98);
+                    } else if r.duration_ms < 500 && r.integral_mass < 0.10 {
+                        c.rejection_reasons.push("Audience Intelligence: Transient replay spike without sustained engagement".to_string());
+                        c.dj_usability_score = (c.dj_usability_score - 0.05).clamp(0.05, 0.98);
+                    }
+                }
+            }
+        }
+    }
 }
