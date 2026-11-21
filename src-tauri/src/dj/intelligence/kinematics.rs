@@ -95,6 +95,8 @@ pub struct KinematicFilterConfig {
     /// Characteristic timescale in seconds for converting velocity to dynamic signal swing in dimensionless SNR.
     /// Default: 1.0 second.
     pub snr_timescale_seconds: f64,
+    /// Nominal signal magnitude scale for scale-invariant normalizations. Default: 1.0.
+    pub nominal_scale: f64,
     /// Velocity magnitude below which signal is considered Stationary (units / sec).
     pub stationary_deadband: f64,
     /// Minimum standard deviation floor to avoid division by zero in SNR.
@@ -110,6 +112,7 @@ impl Default for KinematicFilterConfig {
         Self {
             time_bandwidth_ms: 300.0,
             snr_timescale_seconds: 1.0,
+            nominal_scale: 1.0,
             stationary_deadband: 0.005,
             noise_floor: 1e-5,
             min_dt_seconds: 1e-4, // 0.1 ms floor
@@ -129,6 +132,11 @@ impl KinematicFilterConfig {
         if self.snr_timescale_seconds <= 0.0 || !self.snr_timescale_seconds.is_finite() {
             return Err(KinematicError::InvalidConfig {
                 reason: "snr_timescale_seconds must be positive and finite".to_string(),
+            });
+        }
+        if self.nominal_scale <= 0.0 || !self.nominal_scale.is_finite() {
+            return Err(KinematicError::InvalidConfig {
+                reason: "nominal_scale must be positive and finite".to_string(),
             });
         }
         if self.stationary_deadband < 0.0 || !self.stationary_deadband.is_finite() {
@@ -270,7 +278,8 @@ impl KinematicSignalTracker {
         // Quality heuristic score [0.0, 1.0]
         let history_span_ms = (timestamp_ms - self.raw_history[0].timestamp_ms) as f64;
         let history_coverage = (history_span_ms / (3.0 * self.config.time_bandwidth_ms)).clamp(0.0, 1.0);
-        let stability_factor = (1.0 / (1.0 + noise_volatility)).clamp(0.0, 1.0);
+        let normalized_noise = noise_volatility / self.config.nominal_scale;
+        let stability_factor = (1.0 / (1.0 + normalized_noise)).clamp(0.0, 1.0);
         let snr_factor = (snr / (1.0 + snr)).clamp(0.0, 1.0);
 
         let quality_score = (history_coverage * 0.35 + stability_factor * 0.30 + snr_factor * 0.35)
@@ -423,7 +432,8 @@ pub fn analyze_kinematics(
         let t_span_right = (points[n - 1].timestamp_ms - t_i) as f64;
         let min_span = t_span_left.min(t_span_right);
         let coverage_factor = (min_span / (2.0 * config.time_bandwidth_ms)).clamp(0.1, 1.0);
-        let stability_factor = (1.0 / (1.0 + noise_volatility)).clamp(0.0, 1.0);
+        let normalized_noise = noise_volatility / config.nominal_scale;
+        let stability_factor = (1.0 / (1.0 + normalized_noise)).clamp(0.0, 1.0);
         let snr_factor = (snr / (1.0 + snr)).clamp(0.0, 1.0);
 
         let quality_score = (coverage_factor * 0.35 + stability_factor * 0.30 + snr_factor * 0.35)
@@ -449,6 +459,7 @@ pub fn analyze_kinematics(
 ///
 /// Locally weighted linear regression eliminates boundary bias and non-uniform sampling distortion,
 /// guaranteeing exact reproduction of linear trends with zero artificial curvature.
+/// Normalizes time coordinates by kernel bandwidth for numerical scale-invariance and stability.
 fn smooth_series_time_aware(points: &[KinematicPoint], config: &KinematicFilterConfig) -> Vec<f64> {
     let n = points.len();
     if n < 3 {
@@ -471,17 +482,17 @@ fn smooth_series_time_aware(points: &[KinematicPoint], config: &KinematicFilterC
             let dt_ms = (p.timestamp_ms - t_i) as f64;
             if dt_ms.abs() <= max_dt {
                 let weight = (-dt_ms * dt_ms / sigma2).exp();
-                let dt_sec = dt_ms / 1000.0;
+                let tau = dt_ms / sigma_t; // dimensionless coordinate normalized by bandwidth
                 s0 += weight;
-                s1 += weight * dt_sec;
-                s2 += weight * dt_sec * dt_sec;
+                s1 += weight * tau;
+                s2 += weight * tau * tau;
                 t0 += weight * p.value;
-                t1 += weight * dt_sec * p.value;
+                t1 += weight * tau * p.value;
             }
         }
 
         let det = s0 * s2 - s1 * s1;
-        if det > 1e-12 {
+        if det > 1e-7 {
             let c0 = (s2 * t0 - s1 * t1) / det;
             smoothed.push(c0);
         } else if s0 > 0.0 {
@@ -517,17 +528,17 @@ fn compute_time_aware_smoothed(history: &[KinematicPoint], current_t: i64, confi
         let dt_ms = (p.timestamp_ms - current_t) as f64;
         if dt_ms.abs() <= max_dt {
             let weight = (-dt_ms * dt_ms / sigma2).exp();
-            let dt_sec = dt_ms / 1000.0;
+            let tau = dt_ms / sigma_t;
             s0 += weight;
-            s1 += weight * dt_sec;
-            s2 += weight * dt_sec * dt_sec;
+            s1 += weight * tau;
+            s2 += weight * tau * tau;
             t0 += weight * p.value;
-            t1 += weight * dt_sec * p.value;
+            t1 += weight * tau * p.value;
         }
     }
 
     let det = s0 * s2 - s1 * s1;
-    if det > 1e-12 {
+    if det > 1e-7 {
         (s2 * t0 - s1 * t1) / det
     } else if s0 > 0.0 {
         t0 / s0
@@ -536,7 +547,7 @@ fn compute_time_aware_smoothed(history: &[KinematicPoint], current_t: i64, confi
     }
 }
 
-/// Compute standard deviation of noise residuals within a time window around index i.
+/// Compute sample standard deviation of centered noise residuals within a time window around index i.
 fn compute_time_windowed_volatility(
     points: &[KinematicPoint],
     residuals: &[f64],
@@ -546,37 +557,52 @@ fn compute_time_windowed_volatility(
     let t_i = points[i].timestamp_ms;
     let max_dt = (3.0 * config.time_bandwidth_ms) as i64;
 
-    let mut sum_sq = 0.0;
+    let mut sum = 0.0;
     let mut count = 0;
 
     for (p, res) in points.iter().zip(residuals.iter()) {
         if (p.timestamp_ms - t_i).abs() <= max_dt {
-            sum_sq += res * res;
+            sum += *res;
             count += 1;
         }
     }
 
-    if count > 1 {
-        (sum_sq / (count - 1) as f64).sqrt()
-    } else {
-        0.0
+    if count <= 1 {
+        return 0.0;
     }
+
+    let mean = sum / count as f64;
+    let mut sum_sq_diff = 0.0;
+    for (p, res) in points.iter().zip(residuals.iter()) {
+        if (p.timestamp_ms - t_i).abs() <= max_dt {
+            let diff = *res - mean;
+            sum_sq_diff += diff * diff;
+        }
+    }
+
+    (sum_sq_diff / (count - 1) as f64).sqrt()
 }
 
-/// Compute noise volatility for streaming history.
+/// Compute centered sample standard deviation of noise residuals for streaming history.
 fn compute_noise_volatility_streaming(raw: &[KinematicPoint], smoothed: &[KinematicPoint]) -> f64 {
     let n = raw.len().min(smoothed.len());
     if n <= 1 {
         return 0.0;
     }
 
-    let mut sum_sq = 0.0;
+    let mut sum = 0.0;
     for i in 0..n {
-        let res = raw[i].value - smoothed[i].value;
-        sum_sq += res * res;
+        sum += raw[i].value - smoothed[i].value;
+    }
+    let mean = sum / n as f64;
+
+    let mut sum_sq_diff = 0.0;
+    for i in 0..n {
+        let diff = (raw[i].value - smoothed[i].value) - mean;
+        sum_sq_diff += diff * diff;
     }
 
-    (sum_sq / (n - 1) as f64).sqrt()
+    (sum_sq_diff / (n - 1) as f64).sqrt()
 }
 
 /// Central 3-point parabolic derivative for non-uniform spacing.

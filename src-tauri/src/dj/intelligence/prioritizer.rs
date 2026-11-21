@@ -213,26 +213,38 @@ fn compute_pareto_ranks<T: Clone>(candidates: &mut [EvaluatedCandidate<T>]) {
 }
 
 /// Returns true if candidate A dominates candidate B.
-/// A dominates B if A is at least as good in all criteria and uncertainty, and strictly better in at least one.
+/// A dominates B if A is at least as good in all common criteria and uncertainty, and strictly better in at least one.
+/// Matches criteria by name to ensure robust ordering and subset invariance.
 fn dominates<T: Clone>(a: &EvaluatedCandidate<T>, b: &EvaluatedCandidate<T>) -> bool {
     let a_soft: Vec<&DecisionCriterion> = a.criteria.iter().filter(|c| !c.is_hard_constraint).collect();
     let b_soft: Vec<&DecisionCriterion> = b.criteria.iter().filter(|c| !c.is_hard_constraint).collect();
 
-    if a_soft.len() != b_soft.len() || a_soft.is_empty() {
+    if a_soft.is_empty() || b_soft.is_empty() {
         return a.robust_score >= b.robust_score
             && a.aggregate_uncertainty <= b.aggregate_uncertainty
             && (a.robust_score > b.robust_score || a.aggregate_uncertainty < b.aggregate_uncertainty);
     }
 
     let mut strictly_better = false;
-    for (ca, cb) in a_soft.iter().zip(b_soft.iter()) {
-        // A must be as good or higher in score, and as low or lower in uncertainty
-        if ca.score < cb.score || ca.uncertainty > cb.uncertainty {
-            return false;
-        }
-        if ca.score > cb.score || ca.uncertainty < cb.uncertainty {
-            strictly_better = true;
+    let mut compared_count = 0;
+
+    for ca in &a_soft {
+        if let Some(cb) = b_soft.iter().find(|c| c.name == ca.name) {
+            compared_count += 1;
+            if ca.score < cb.score || ca.uncertainty > cb.uncertainty {
+                return false;
+            }
+            if ca.score > cb.score || ca.uncertainty < cb.uncertainty {
+                strictly_better = true;
+            }
         }
     }
+
+    if compared_count == 0 {
+        return a.robust_score >= b.robust_score
+            && a.aggregate_uncertainty <= b.aggregate_uncertainty
+            && (a.robust_score > b.robust_score || a.aggregate_uncertainty < b.aggregate_uncertainty);
+    }
+
     strictly_better
 }

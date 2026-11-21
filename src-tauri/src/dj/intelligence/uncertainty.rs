@@ -41,6 +41,8 @@ pub struct UncertaintyConfig {
     pub interval_multiplier_z: f64,
     /// Noise floor to prevent zero-uncertainty singularity.
     pub min_noise_floor: f64,
+    /// Reference signal scale for scale-invariant normalized aleatoric noise. Default: 1.0.
+    pub nominal_scale: f64,
 }
 
 impl Default for UncertaintyConfig {
@@ -50,6 +52,7 @@ impl Default for UncertaintyConfig {
             target_sample_count: 5,
             interval_multiplier_z: 1.96,
             min_noise_floor: 1e-4,
+            nominal_scale: 1.0,
         }
     }
 }
@@ -68,6 +71,9 @@ impl UncertaintyConfig {
         if self.min_noise_floor <= 0.0 || !self.min_noise_floor.is_finite() {
             return Err("min_noise_floor must be positive and finite".to_string());
         }
+        if self.nominal_scale <= 0.0 || !self.nominal_scale.is_finite() {
+            return Err("nominal_scale must be positive and finite".to_string());
+        }
         Ok(())
     }
 }
@@ -84,22 +90,23 @@ pub fn quantify_uncertainty(
     let aleatoric_std = noise_residual_std.max(config.min_noise_floor);
 
     // 2. Epistemic uncertainty component from sample sparsity:
-    // When sample count is below target, uncertainty increases exponentially
+    // When sample count is below target, uncertainty increases with square-root degrees of freedom
     let sample_coverage = (local_sample_count as f64 / config.target_sample_count as f64).clamp(0.0, 1.0);
-    let sparsity_uncertainty = 1.0 - sample_coverage;
+    let sparsity_uncertainty = (1.0 - (local_sample_count.max(1) as f64 / config.target_sample_count as f64).sqrt()).clamp(0.0, 1.0);
 
     // 3. Epistemic uncertainty component from temporal staleness:
     // Continuous-time exponential decay: freshness = 2^(-dt / t_half) = exp(-dt * ln(2) / t_half)
     let decay_rate = std::f64::consts::LN_2 / config.staleness_half_life_seconds;
     let freshness = (-elapsed_time_seconds.max(0.0) * decay_rate).exp().clamp(0.0, 1.0);
-    let staleness_uncertainty = 1.0 - freshness;
 
-    // Combined epistemic uncertainty (bounded [0.0, 1.0])
-    let epistemic_uncertainty = (sparsity_uncertainty * 0.5 + staleness_uncertainty * 0.5).clamp(0.0, 1.0);
+    // Combined epistemic uncertainty: probabilistic union of sparsity and staleness
+    // epistemic = 1.0 - (1.0 - sparsity) * freshness
+    let epistemic_uncertainty = (1.0 - (1.0 - sparsity_uncertainty) * freshness).clamp(0.0, 1.0);
 
     // 4. Total combined uncertainty:
-    // Normalized total uncertainty combines noise scaled by signal magnitude with epistemic lack of knowledge
-    let normalized_noise = (aleatoric_std / (1.0 + aleatoric_std)).clamp(0.0, 1.0);
+    // Scale-invariant normalized noise: relative to dynamic signal scale S_ref = max(|central_value|, nominal_scale)
+    let ref_scale = central_value.abs().max(config.nominal_scale);
+    let normalized_noise = (aleatoric_std / (ref_scale + aleatoric_std)).clamp(0.0, 1.0);
     let total_uncertainty = (1.0 - (1.0 - normalized_noise) * (1.0 - epistemic_uncertainty)).clamp(0.0, 1.0);
 
     // 5. Calibrated credible interval bounds:

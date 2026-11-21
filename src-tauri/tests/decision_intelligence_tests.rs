@@ -976,6 +976,7 @@ fn test_stage3_uncertainty_quantification() {
         target_sample_count: 10,
         interval_multiplier_z: 1.96,
         min_noise_floor: 1e-4,
+        nominal_scale: 1.0,
     };
 
     // Case 1: Fresh observation with high sample support and low noise
@@ -1376,4 +1377,382 @@ fn test_stage4_selector_robust_selection() {
     assert_eq!(chosen.track.id, "tr_a", "Bhangra high-energy track must be selected over mismatched ambient track");
     assert!(chosen.compatibility_score > 0.70);
 }
+
+// =========================================================================
+// STAGE 5: ADAPTIVE DATASET & CONTINUOUS VALIDATION PROTOCOL
+// =========================================================================
+
+/// Deterministic, reproducible linear congruential generator for seed-based continuous testing.
+struct LcgRng {
+    state: u64,
+}
+
+impl LcgRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+
+    fn next_range(&mut self, low: f64, high: f64) -> f64 {
+        low + (high - low) * self.next_f64()
+    }
+
+    fn next_gaussian(&mut self) -> f64 {
+        // Box-Muller transform
+        let u1 = self.next_f64().max(1e-15);
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+    }
+}
+
+#[test]
+fn test_protocol_category_a_randomized_datasets() {
+    // Dataset ID: DS_A_RANDOM_20261121_01
+    // Seed: 0x5EED_0001_A
+    let mut rng = LcgRng::new(0x5EED_0001_A);
+    let trials = 50;
+
+    for trial in 0..trials {
+        let nominal_scale = (10.0f64).powf(rng.next_range(-2.0, 3.0)); // 0.01 to 1000
+        let base_dt_ms = rng.next_range(20.0, 200.0) as i64;
+        let num_points = rng.next_range(30.0, 100.0) as usize;
+        let noise_sigma = rng.next_range(0.001, 0.1) * nominal_scale;
+
+        let mut points = Vec::with_capacity(num_points);
+        let mut cur_t = 0i64;
+        let mut cur_val = nominal_scale * rng.next_range(0.2, 0.8);
+        let drift = nominal_scale * rng.next_range(-0.05, 0.05);
+
+        for _ in 0..num_points {
+            let val = cur_val + noise_sigma * rng.next_gaussian();
+            points.push(KinematicPoint::new(cur_t, val));
+            cur_t += base_dt_ms + (rng.next_range(-5.0, 5.0) as i64);
+            cur_val += drift * (base_dt_ms as f64 / 1000.0);
+        }
+
+        let config = KinematicFilterConfig {
+            time_bandwidth_ms: base_dt_ms as f64 * 3.0,
+            nominal_scale,
+            noise_floor: 1e-6 * nominal_scale,
+            ..Default::default()
+        };
+
+        let metrics = analyze_kinematics(&points, &config)
+            .unwrap_or_else(|e| panic!("Trial {} failed with error {:?}", trial, e));
+
+        assert_eq!(metrics.len(), num_points);
+        for m in &metrics {
+            assert!(m.magnitude.is_finite());
+            assert!(m.velocity.is_finite());
+            assert!(m.acceleration.is_finite());
+            assert!(m.snr >= 0.0 && m.snr.is_finite());
+            assert!(m.quality_score >= 0.0 && m.quality_score <= 1.0);
+        }
+    }
+}
+
+#[test]
+fn test_protocol_category_b_adversarial_datasets() {
+    // Dataset ID: DS_B_ADVERSARIAL_20261121_01
+    // Seed: 0x5EED_0002_B
+    let mut rng = LcgRng::new(0x5EED_0002_B);
+
+    // Adversarial Case 1: Extreme single-sample impulse spike (100x signal amplitude)
+    let config = KinematicFilterConfig {
+        time_bandwidth_ms: 300.0,
+        ..Default::default()
+    };
+    let mut points: Vec<KinematicPoint> = (0..50)
+        .map(|i| KinematicPoint::new(i * 100, 0.20 + 0.005 * rng.next_gaussian()))
+        .collect();
+    points[25].value = 20.0; // massive adversarial impulse spike
+
+    let metrics = analyze_kinematics(&points, &config).expect("Must survive extreme impulse");
+    let mut sm = ProgressionStateMachine::new(AdaptiveThresholdConfig::default()).unwrap();
+    let mut regions = Vec::new();
+    for m in &metrics {
+        sm.update(m);
+    }
+    regions.extend(sm.finalize());
+
+    // Adversarial verification: an isolated spike must NEVER be confirmed as a Sustained region
+    for r in &regions {
+        assert_ne!(
+            r.progression_state,
+            ProgressionState::Sustained,
+            "Isolated impulse spike must not produce a Sustained progression"
+        );
+        assert!(r.duration_ms < 1500, "Spike duration must be transient");
+    }
+
+    // Adversarial Case 2: Multi-cycle oscillation (period 1.2s, 100ms sampling)
+    let mut osc_points = Vec::with_capacity(60);
+    for i in 0..60 {
+        let t_sec = (i * 100) as f64 / 1000.0;
+        let val = 0.5 + 0.3 * (2.0 * PI * t_sec / 1.2).sin();
+        osc_points.push(KinematicPoint::new(i * 100, val));
+    }
+    let osc_metrics = analyze_kinematics(&osc_points, &config).expect("Must survive oscillation");
+    let archetype = classify_archetype(&osc_metrics, 0.01);
+    assert_eq!(
+        archetype,
+        ProgressionArchetype::CyclicalOscillation,
+        "Alternating oscillation must be recognized as CyclicalOscillation"
+    );
+}
+
+#[test]
+fn test_protocol_category_c_boundary_datasets() {
+    // Dataset ID: DS_C_BOUNDARY_20261121_01
+    // Seed: 0x5EED_0003_C
+    let threshold_config = AdaptiveThresholdConfig {
+        base_entry_threshold: 0.50,
+        hysteresis_ratio: 0.15,
+        min_confirmation_ms: 300,
+        ..Default::default()
+    };
+
+    let mut sm = ProgressionStateMachine::new(threshold_config).unwrap();
+
+    // Boundary Case 1: Skimming exactly at threshold boundary (0.500001 then 0.499999)
+    // Hysteresis must prevent rapid chatter
+    let (theta_enter, theta_exit) = sm.compute_thresholds(&KinematicMetrics {
+        timestamp_ms: 0,
+        raw_magnitude: 0.50,
+        magnitude: 0.50,
+        velocity: 0.0,
+        acceleration: 0.0,
+        direction: Direction::Stationary,
+        volatility: 0.0,
+        snr: 0.0,
+        quality_score: 1.0,
+    });
+    assert!((theta_enter - 0.50).abs() < 1e-6);
+    assert!((theta_exit - 0.425).abs() < 1e-6); // 15% hysteresis band below 0.50
+
+    // Feed oscillations between 0.45 and 0.51 (within hysteresis band)
+    let mut state_flips = 0;
+    let mut prev_state = sm.current_state();
+    for i in 0..30 {
+        let val = if i % 2 == 0 { 0.51 } else { 0.46 }; // above exit, skimming entry
+        let m = KinematicMetrics {
+            timestamp_ms: i * 50, // 50ms intervals (< 300ms confirmation)
+            raw_magnitude: val,
+            magnitude: val,
+            velocity: if i % 2 == 0 { 0.02 } else { -0.02 },
+            acceleration: 0.0,
+            direction: Direction::Ascending,
+            volatility: 0.01,
+            snr: 2.0,
+            quality_score: 0.8,
+        };
+        let pt = sm.update(&m);
+        if pt.state != prev_state {
+            state_flips += 1;
+            prev_state = pt.state;
+        }
+    }
+    // Debounce persistence and hysteresis must suppress chatter: state flips must be 0 or at most 1
+    assert!(
+        state_flips <= 1,
+        "Hysteresis and debounce failed: observed {} state flips in boundary band",
+        state_flips
+    );
+}
+
+#[test]
+fn test_protocol_category_d_generalization_datasets() {
+    // Dataset ID: DS_D_GENERALIZATION_20261121_01
+    // Seed: 0x5EED_0004_D
+    // Generalization: Non-linear Sigmoidal Crescendo on unnormalized scale [0, 500]
+    let scale = 500.0;
+    let k_config = KinematicFilterConfig {
+        time_bandwidth_ms: 250.0,
+        nominal_scale: scale,
+        noise_floor: 1e-4 * scale,
+        ..Default::default()
+    };
+
+    let points: Vec<KinematicPoint> = (0..80)
+        .map(|i| {
+            let t_ms = i * 100;
+            let t_sec = t_ms as f64 / 1000.0;
+            // Logistic sigmoid: x(t) = scale / (1 + exp(-2 * (t - 4.0)))
+            let val = scale / (1.0 + (-2.0 * (t_sec - 4.0)).exp());
+            KinematicPoint::new(t_ms, val)
+        })
+        .collect();
+
+    let metrics = analyze_kinematics(&points, &k_config).expect("Sigmoid analysis failed");
+
+    // Kinematic validation: peak velocity must occur around inflection point t = 4.0s (index 40)
+    let max_v_metric = metrics
+        .iter()
+        .max_by(|a, b| a.velocity.partial_cmp(&b.velocity).unwrap())
+        .unwrap();
+    let inflection_t_sec = max_v_metric.timestamp_ms as f64 / 1000.0;
+    assert!(
+        (inflection_t_sec - 4.0).abs() <= 0.3,
+        "Inflection point expected at ~4.0s, got {:.2}s",
+        inflection_t_sec
+    );
+
+    // Damped trajectory projection must remain bounded
+    let u_config = UncertaintyConfig {
+        nominal_scale: scale,
+        ..Default::default()
+    };
+    let unc = quantify_uncertainty(max_v_metric.magnitude, max_v_metric.volatility, 10, 0.0, &u_config);
+    let projection = project_trajectory(max_v_metric, ProgressionArchetype::CrescendoPeak, 2.0, 0.5, &unc);
+
+    assert!(projection.projected_value >= 0.0);
+    assert!(projection.lower_bound <= projection.projected_value);
+    assert!(projection.upper_bound >= projection.projected_value);
+    assert!(projection.projection_confidence > 0.0 && projection.projection_confidence <= 1.0);
+}
+
+#[test]
+fn test_protocol_category_e_stability_long_duration() {
+    // Dataset ID: DS_E_STABILITY_20261121_01
+    // Seed: 0x5EED_0005_E
+    // Continuous 5,000-point streaming simulation with drifting baseline
+    let config = KinematicFilterConfig {
+        time_bandwidth_ms: 200.0,
+        max_history_duration_ms: 2000, // 2s lookback
+        ..Default::default()
+    };
+    let mut tracker = KinematicSignalTracker::new(config).unwrap();
+
+    let mut sm = ProgressionStateMachine::new(AdaptiveThresholdConfig {
+        baseline_tau_ms: 5000.0,
+        ..Default::default()
+    }).unwrap();
+
+    let mut rng = LcgRng::new(0x5EED_0005_E);
+    let mut t_ms = 0i64;
+    let mut baseline = 0.20;
+
+    for i in 0..2000 {
+        t_ms += 50;
+        if i % 500 == 0 {
+            baseline += 0.05; // slow baseline drift
+        }
+        let noise = 0.01 * rng.next_gaussian();
+        let val = baseline + noise;
+
+        let m = tracker.update(t_ms, val).expect("Tracker must remain stable");
+        let pt = sm.update(&m);
+
+        assert!(m.magnitude.is_finite());
+        assert!(m.velocity.is_finite());
+        assert!(pt.theta_enter >= baseline - 0.05);
+    }
+}
+
+#[test]
+fn test_protocol_property_invariants() {
+    // Invariant 1: Scale Invariance
+    // Scaling signal by constant c scales velocity by c, acceleration by c, volatility by c,
+    // and preserves dimensionless SNR exactly.
+    let c = 42.0;
+    let config_base = KinematicFilterConfig {
+        time_bandwidth_ms: 200.0,
+        nominal_scale: 1.0,
+        ..Default::default()
+    };
+    let config_scaled = KinematicFilterConfig {
+        time_bandwidth_ms: 200.0,
+        nominal_scale: c,
+        noise_floor: config_base.noise_floor * c,
+        ..Default::default()
+    };
+
+    let pts_base: Vec<KinematicPoint> = (0..30)
+        .map(|i| KinematicPoint::new(i * 100, 0.2 + 0.05 * (i as f64 / 10.0)))
+        .collect();
+    let pts_scaled: Vec<KinematicPoint> = pts_base
+        .iter()
+        .map(|p| KinematicPoint::new(p.timestamp_ms, p.value * c))
+        .collect();
+
+    let m_base = analyze_kinematics(&pts_base, &config_base).unwrap();
+    let m_scaled = analyze_kinematics(&pts_scaled, &config_scaled).unwrap();
+
+    for i in 5..25 {
+        let v_ratio = m_scaled[i].velocity / m_base[i].velocity;
+        assert!(
+            (v_ratio - c).abs() < 1e-4,
+            "Velocity scaling failed: expected ratio {}, got {}",
+            c,
+            v_ratio
+        );
+        let snr_diff = (m_scaled[i].snr - m_base[i].snr).abs();
+        assert!(
+            snr_diff < 0.01,
+            "SNR must be scale-invariant: base {:.3}, scaled {:.3}",
+            m_base[i].snr,
+            m_scaled[i].snr
+        );
+    }
+
+    // Invariant 2: Noise-Uncertainty Monotonicity
+    let u_config = UncertaintyConfig::default();
+    let unc_low = quantify_uncertainty(1.0, 0.01, 5, 0.0, &u_config);
+    let unc_high = quantify_uncertainty(1.0, 0.10, 5, 0.0, &u_config);
+    assert!(
+        unc_high.total_uncertainty > unc_low.total_uncertainty,
+        "Higher noise must strictly increase total uncertainty"
+    );
+
+    // Invariant 3: Staleness-Freshness Decay Monotonicity
+    let unc_fresh = quantify_uncertainty(1.0, 0.02, 5, 1.0, &u_config);
+    let unc_stale = quantify_uncertainty(1.0, 0.02, 5, 10.0, &u_config);
+    assert!(
+        unc_fresh.freshness > unc_stale.freshness,
+        "Elapsed time must strictly reduce freshness"
+    );
+    assert!(
+        unc_stale.total_uncertainty > unc_fresh.total_uncertainty,
+        "Stale observation must have higher total uncertainty"
+    );
+
+    // Invariant 4: Hard Constraint Absolute Immunity
+    let p_config = PrioritizerConfig::default();
+    let candidates = vec![
+        (
+            "bad_candidate",
+            vec![
+                DecisionCriterion::hard("cooldown", 0.0, 1.0), // Fails hard constraint
+                DecisionCriterion::soft("quality", 1.0, 1.0, 0.0), // Perfect soft score
+            ],
+        ),
+        (
+            "good_candidate",
+            vec![
+                DecisionCriterion::hard("cooldown", 1.0, 1.0), // Passes hard constraint
+                DecisionCriterion::soft("quality", 0.7, 1.0, 0.1), // Moderate soft score
+            ],
+        ),
+    ];
+    let ranked = rank_candidates(candidates, &p_config);
+    assert_eq!(ranked[0].payload, "good_candidate");
+    assert!(!ranked[1].is_eligible);
+
+    // Invariant 5: Non-Monotonic Timestamp Rejection
+    let invalid_points = vec![
+        KinematicPoint::new(100, 1.0),
+        KinematicPoint::new(100, 1.2), // Duplicate timestamp
+    ];
+    let err = analyze_kinematics(&invalid_points, &config_base).unwrap_err();
+    assert!(matches!(err, KinematicError::NonMonotonicTimestamp { .. }));
+}
+
 

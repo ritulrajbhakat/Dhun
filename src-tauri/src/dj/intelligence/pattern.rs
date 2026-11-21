@@ -113,10 +113,12 @@ pub fn classify_archetype(metrics: &[KinematicMetrics], stationary_deadband: f64
     }
     mean_val /= n as f64;
     let amplitude = max_val - min_val;
+    let signal_scale = max_val.abs().max(min_val.abs()).max(1.0);
+    let relative_amplitude = amplitude / signal_scale;
 
-    // Check for quiescent flat
-    if amplitude < 0.05 && stat_count >= n * 3 / 4 {
-        return if mean_val > 0.5 {
+    // Check for quiescent flat vs stable plateau
+    if relative_amplitude < 0.05 && stat_count >= n * 3 / 4 {
+        return if mean_val > 0.3 * signal_scale {
             ProgressionArchetype::Plateau
         } else {
             ProgressionArchetype::QuiescentFlat
@@ -129,7 +131,7 @@ pub fn classify_archetype(metrics: &[KinematicMetrics], stationary_deadband: f64
     }
 
     // Check for transient spike: rapid rise and fall within short sample span
-    if n <= 10 && zero_crossings == 1 && amplitude > 0.4 {
+    if n <= 12 && zero_crossings == 1 && relative_amplitude > 0.20 {
         let peak_idx = metrics
             .iter()
             .enumerate()
@@ -142,7 +144,7 @@ pub fn classify_archetype(metrics: &[KinematicMetrics], stationary_deadband: f64
     }
 
     // Check for crescendo peak (positive velocity early, slowing to crest near end)
-    if zero_crossings == 1 && asc_count > desc_count {
+    if zero_crossings == 1 && asc_count >= desc_count {
         return ProgressionArchetype::CrescendoPeak;
     }
 
@@ -162,7 +164,7 @@ pub fn classify_archetype(metrics: &[KinematicMetrics], stationary_deadband: f64
     }
 
     // Check for plateau
-    if stat_count >= n / 2 && mean_val > 0.4 {
+    if stat_count >= n / 2 && mean_val > 0.2 * signal_scale {
         return ProgressionArchetype::Plateau;
     }
 

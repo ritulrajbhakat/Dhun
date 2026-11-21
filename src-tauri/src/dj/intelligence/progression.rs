@@ -104,6 +104,10 @@ pub struct AdaptiveThresholdConfig {
     pub sustain_drift_threshold: f64,
     /// Positive velocity required to transition from Subduing to Recovering (units / sec).
     pub recovery_velocity_threshold: f64,
+    /// Relative scale for meaningful region mass normalization. Default: 1.0.
+    pub nominal_mass_scale: f64,
+    /// Reference saturation duration for meaningful regions in seconds. Default: 5.0.
+    pub nominal_duration_sec: f64,
     /// Policy for initial observation state.
     pub initial_condition_policy: InitialConditionPolicy,
 }
@@ -121,6 +125,8 @@ impl Default for AdaptiveThresholdConfig {
             subduing_velocity_threshold: -0.005,
             sustain_drift_threshold: 0.020,
             recovery_velocity_threshold: 0.010,
+            nominal_mass_scale: 1.0,
+            nominal_duration_sec: 5.0,
             initial_condition_policy: InitialConditionPolicy::ColdStartActive,
         }
     }
@@ -152,6 +158,16 @@ impl AdaptiveThresholdConfig {
         if self.min_sustain_ms < 0 {
             return Err(ProgressionError::InvalidConfig {
                 reason: "min_sustain_ms must be non-negative".to_string(),
+            });
+        }
+        if self.nominal_mass_scale <= 0.0 || !self.nominal_mass_scale.is_finite() {
+            return Err(ProgressionError::InvalidConfig {
+                reason: "nominal_mass_scale must be positive and finite".to_string(),
+            });
+        }
+        if self.nominal_duration_sec <= 0.0 || !self.nominal_duration_sec.is_finite() {
+            return Err(ProgressionError::InvalidConfig {
+                reason: "nominal_duration_sec must be positive and finite".to_string(),
             });
         }
         Ok(())
@@ -577,7 +593,7 @@ impl ProgressionStateMachine {
             // Signal is not in active progression. If we had an active region, finalize it.
             if let Some(builder) = self.active_region.take() {
                 let offset_t = confirmed_transition.map(|(_, ct)| ct).unwrap_or(m.timestamp_ms);
-                let region = finalize_region(builder, offset_t, false);
+                let region = finalize_region(builder, offset_t, false, &self.config);
                 self.completed_regions.push(region);
             }
             if self.candidate_state.is_none() {
@@ -589,7 +605,7 @@ impl ProgressionStateMachine {
     /// Conclude the analysis stream and finalize any open region.
     pub fn finalize(&mut self) -> Vec<MeaningfulRegion> {
         if let Some(builder) = self.active_region.take() {
-            let region = finalize_region(builder, self.last_processed_ms, true);
+            let region = finalize_region(builder, self.last_processed_ms, true, &self.config);
             self.completed_regions.push(region);
         }
         self.completed_regions.clone()
@@ -636,7 +652,12 @@ fn accumulate_into_builder(
 }
 
 /// Helper to convert an active builder into a completed MeaningfulRegion.
-fn finalize_region(builder: ActiveRegionBuilder, offset_ms: i64, is_end_of_stream: bool) -> MeaningfulRegion {
+fn finalize_region(
+    builder: ActiveRegionBuilder,
+    offset_ms: i64,
+    is_end_of_stream: bool,
+    config: &AdaptiveThresholdConfig,
+) -> MeaningfulRegion {
     let duration_ms = (offset_ms - builder.onset_ms).max(0);
     let duration_sec = duration_ms as f64 / 1000.0;
 
@@ -658,9 +679,9 @@ fn finalize_region(builder: ActiveRegionBuilder, offset_ms: i64, is_end_of_strea
         0.0
     };
 
-    let mass_factor = (builder.accumulated_mass / (1.0 + builder.accumulated_mass)).clamp(0.0, 1.0);
+    let mass_factor = (builder.accumulated_mass / (config.nominal_mass_scale + builder.accumulated_mass)).clamp(0.0, 1.0);
     let snr_factor = (avg_snr / (1.0 + avg_snr)).clamp(0.0, 1.0);
-    let duration_factor = (duration_sec / 5.0).clamp(0.0, 1.0); // saturates at 5 seconds
+    let duration_factor = (duration_sec / config.nominal_duration_sec).clamp(0.0, 1.0);
 
     let quality_score = (sustain_fraction * 0.35 + mass_factor * 0.35 + duration_factor * 0.15 + snr_factor * 0.15)
         .clamp(0.0, 1.0);
