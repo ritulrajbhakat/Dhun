@@ -93,6 +93,14 @@ function getUpdatedAt(data) {
   return ('updated_at' in data) ? data.updated_at : 0;
 }
 
+// Identifies whether an existing document already contains prior analysis results.
+function hasAnalysisData(data) {
+  return ('analysis_version' in data && data.analysis_version > 0)
+    || ('original_bpm' in data)
+    || ('camelot_key' in data)
+    || ('beat_grid_json' in data);
+}
+
 const ALLOWED_FIELDS = new Set([
   'canonical_fingerprint', 'title', 'artist', 'version_tag',
   'duration_ms', 'original_bpm', 'half_time_bpm', 'double_time_bpm',
@@ -102,12 +110,6 @@ const ALLOWED_FIELDS = new Set([
   'analysis_confidence', 'processing_status', 'source_urls',
   'provenance', 'created_at', 'updated_at'
 ]);
-
-const ANALYSIS_DSP_FIELDS = [
-  'original_bpm', 'half_time_bpm', 'double_time_bpm', 'bpm_confidence',
-  'musical_key', 'camelot_key', 'key_confidence', 'beat_grid_json',
-  'phrase_markers_json', 'overall_energy', 'danceability', 'genre_tags', 'mood_tags'
-];
 
 function hasAllowedCatalogueFields(data) {
   return Object.keys(data).every(k => ALLOWED_FIELDS.has(k));
@@ -143,14 +145,20 @@ function isValidCatalogueData(data) {
   return true;
 }
 
-// Simulates incoming.diff(existing).affectedKeys().hasNone([...])
-function analysisFieldsUnchanged(existing, incoming) {
-  for (const f of ANALYSIS_DSP_FIELDS) {
-    const exVal = existing[f];
-    const inVal = incoming[f];
+// Simulates incoming.diff(existing).affectedKeys().hasOnly(['source_urls', 'provenance', 'updated_at'])
+function isSourceLinkUpdateOnly(existing, incoming) {
+  const allowedChanged = new Set(['source_urls', 'provenance', 'updated_at']);
+  const allKeys = new Set([...Object.keys(existing), ...Object.keys(incoming)]);
+  for (const k of allKeys) {
+    const exVal = existing[k];
+    const inVal = incoming[k];
+    let isDifferent = false;
     if (Array.isArray(exVal) || Array.isArray(inVal)) {
-      if (JSON.stringify(exVal) !== JSON.stringify(inVal)) return false;
-    } else if (exVal !== inVal) {
+      isDifferent = JSON.stringify(exVal) !== JSON.stringify(inVal);
+    } else {
+      isDifferent = exVal !== inVal;
+    }
+    if (isDifferent && !allowedChanged.has(k)) {
       return false;
     }
   }
@@ -167,23 +175,25 @@ function isAllowedStatusTransition(existing, incoming) {
     || (oldStatus === 'failed' && (newStatus === 'metadata_only' || newStatus === 'analyzed'));
 }
 
-// Revised Two-Path Model:
-// Path 1: Algorithm version upgrade: version > existing, confidence >= existing (DSP fields may change)
-// Path 2: Metadata / source link update: version == existing, confidence == existing, analysisFieldsUnchanged
+// Revised Two-Path Model with First-Analysis Anti-Downgrade Protection:
+// Case A: !hasAnalysisData(existing) -> genuine first analysis allowed.
+// Case B: hasAnalysisData(existing) -> must be analyzed, and must satisfy Path 1 or Path 2.
 function isAllowedQualityUpdate(existing, incoming) {
-  return getStatus(existing) !== 'analyzed'
+  return !hasAnalysisData(existing)
     || (
       getStatus(incoming) === 'analyzed'
       && (
+        // Path 1: Algorithm Version Upgrade (version strictly advances; confidence cannot decrease; DSP fields may change)
         (
           getVersion(incoming) > getVersion(existing)
           && getConfidence(incoming) >= getConfidence(existing)
         )
         ||
+        // Path 2: Source Link Maintenance (version & confidence identical; strictly restricted to source_urls, provenance, updated_at)
         (
           getVersion(incoming) === getVersion(existing)
           && getConfidence(incoming) === getConfidence(existing)
-          && analysisFieldsUnchanged(existing, incoming)
+          && isSourceLinkUpdateOnly(existing, incoming)
         )
       )
     );
@@ -365,50 +375,180 @@ test("TC21 [Negative]: Disallowed URL scheme (javascript:) rejected", () =>
   })
 );
 
-// Group 5: Status State Machine (isAllowedStatusTransition)
-test("TC22 [Positive]: Status transition metadata_only -> analyzed allowed", () => {
-  const existing = { ...validDoc, processing_status: "metadata_only", analysis_confidence: 0.5 };
-  const incoming = { ...validDoc, processing_status: "analyzed", analysis_confidence: 0.95, updated_at: existing.updated_at + 1000 };
-  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC23 [Positive]: Status transition pending -> analyzed allowed", () => {
-  const existing = { ...validDoc, processing_status: "pending" };
-  const incoming = { ...validDoc, processing_status: "analyzed", updated_at: existing.updated_at + 1000 };
-  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC24 [Positive]: Status transition failed -> analyzed allowed", () => {
-  const existing = { ...validDoc, processing_status: "failed" };
-  const incoming = { ...validDoc, processing_status: "analyzed", updated_at: existing.updated_at + 1000 };
-  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC25 [Negative]: Status downgrade analyzed -> metadata_only rejected", () => {
-  const existing = { ...validDoc, processing_status: "analyzed" };
-  const incoming = { ...validDoc, processing_status: "metadata_only", updated_at: existing.updated_at + 1000 };
-  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC26 [Negative]: Status downgrade analyzed -> pending or failed rejected", () => {
-  const existing = { ...validDoc, processing_status: "analyzed" };
-  const toPending = { ...validDoc, processing_status: "pending", updated_at: existing.updated_at + 1000 };
-  const toFailed = { ...validDoc, processing_status: "failed", updated_at: existing.updated_at + 1000 };
-  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, toPending) &&
-         !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, toFailed);
+// Group 5: Review Item 1 - Genuine First Analysis vs Existing Analysis Records
+test("TC22 [Positive Review 1]: Genuine first analysis of a bare metadata_only stub allowed", () => {
+  // Bare stub has NO analysis_version and NO DSP fields
+  const bareStub = {
+    canonical_fingerprint: "a1b2c3d4e5f67890abcdef",
+    title: "Animals",
+    artist: "Martin Garrix",
+    processing_status: "metadata_only",
+    created_at: 1732500000000,
+    updated_at: 1732500000000
+  };
+  const incoming = { ...validDoc, updated_at: bareStub.updated_at + 1000 };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", bareStub, incoming);
 });
 
-// Group 6: Mutually Exclusive Two-Path Model Testing (isAllowedQualityUpdate)
-// Path 1 Tests: Version Upgrade (version must strictly advance; DSP fields may change)
-test("TC27 [Positive Path 1]: Version upgrade (v2 -> v3) with equal confidence allowed to update DSP fields", () => {
+test("TC23 [Negative Review 1]: Existing pending doc with v3/0.95 CANNOT be downgraded to analyzed v1/0.10", () => {
+  // Existing record is 'pending' but already contains analysis results (v3, conf 0.95)
+  const existingPendingWithData = {
+    ...validDoc,
+    processing_status: "pending",
+    analysis_version: 3,
+    analysis_confidence: 0.95
+  };
+  const incomingDowngrade = {
+    ...validDoc,
+    processing_status: "analyzed",
+    analysis_version: 1,
+    analysis_confidence: 0.10,
+    updated_at: existingPendingWithData.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existingPendingWithData, incomingDowngrade);
+});
+
+test("TC24 [Negative Review 1]: Existing failed doc with v2/0.80 CANNOT be downgraded to analyzed v1/0.50", () => {
+  // Existing record is 'failed' but has analysis results (v2, conf 0.80)
+  const existingFailedWithData = {
+    ...validDoc,
+    processing_status: "failed",
+    analysis_version: 2,
+    analysis_confidence: 0.80
+  };
+  const incomingDowngrade = {
+    ...validDoc,
+    processing_status: "analyzed",
+    analysis_version: 1,
+    analysis_confidence: 0.50,
+    updated_at: existingFailedWithData.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existingFailedWithData, incomingDowngrade);
+});
+
+test("TC25 [Positive Review 1]: Existing failed doc with v2/0.80 CAN be upgraded to analyzed v3/0.95", () => {
+  const existingFailedWithData = {
+    ...validDoc,
+    processing_status: "failed",
+    analysis_version: 2,
+    analysis_confidence: 0.80
+  };
+  const incomingUpgrade = {
+    ...validDoc,
+    processing_status: "analyzed",
+    analysis_version: 3,
+    analysis_confidence: 0.95,
+    updated_at: existingFailedWithData.updated_at + 1000
+  };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existingFailedWithData, incomingUpgrade);
+});
+
+// Group 6: Review Item 2 - Path 2 Strict Scope Enforcement (Only source_urls, provenance, updated_at)
+test("TC26 [Positive Review 2]: Path 2 allows modifying source_urls, provenance, and updated_at", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, provenance: "client_a", source_urls: ["https://youtube.com/watch?v=1"] };
+  const incoming = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    provenance: "client_b",
+    source_urls: ["https://youtube.com/watch?v=1", "youtube:2"],
+    updated_at: existing.updated_at + 1000
+  };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+
+test("TC27 [Negative Review 2]: Path 2 REJECTS attempt to modify duration_ms", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, duration_ms: 186000 };
+  const incomingTamper = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    duration_ms: 190000, // tampered duration!
+    source_urls: ["https://youtube.com/watch?v=1", "youtube:2"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incomingTamper);
+});
+
+test("TC28 [Negative Review 2]: Path 2 REJECTS attempt to modify version_tag", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, version_tag: "original" };
+  const incomingTamper = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    version_tag: "club_mix", // tampered version_tag!
+    source_urls: ["https://youtube.com/watch?v=1", "youtube:2"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incomingTamper);
+});
+
+test("TC29 [Negative Review 2]: Path 2 REJECTS attempt to modify original_bpm", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, original_bpm: 128.0 };
+  const incomingTamper = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    original_bpm: 130.0, // tampered BPM!
+    source_urls: ["https://youtube.com/watch?v=1", "youtube:2"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incomingTamper);
+});
+
+test("TC30 [Negative Review 2]: Path 2 REJECTS attempt to modify camelot_key", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, camelot_key: "4A" };
+  const incomingTamper = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    camelot_key: "5A", // tampered Camelot!
+    source_urls: ["https://youtube.com/watch?v=1", "youtube:2"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incomingTamper);
+});
+
+test("TC31 [Negative Review 2]: Path 2 REJECTS attempt to modify beat_grid_json", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, beat_grid_json: '{"bpm":128.0}' };
+  const incomingTamper = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    beat_grid_json: '{"bpm":128.0,"downbeat":0.5}', // tampered grid!
+    source_urls: ["https://youtube.com/watch?v=1", "youtube:2"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incomingTamper);
+});
+
+test("TC32 [Negative Review 2]: Path 2 REJECTS attempt to smuggle confidence downgrade", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
+  const incomingTamper = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.80, // smuggled lower confidence!
+    source_urls: ["https://youtube.com/watch?v=1", "youtube:2"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incomingTamper);
+});
+
+// Group 7: Path 1 Mutually Exclusive Upgrade Tests
+test("TC33 [Positive Path 1]: Version upgrade (v2 -> v3) with equal confidence allowed to update DSP fields", () => {
   const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, original_bpm: 128.0 };
   const incoming = {
     ...validDoc,
     analysis_version: 3,
     analysis_confidence: 0.95,
-    original_bpm: 128.05, // modified DSP field
-    beat_grid_json: '{"bpm":128.05,"downbeat":0.05}', // modified DSP field
+    original_bpm: 128.05,
+    beat_grid_json: '{"bpm":128.05,"downbeat":0.05}',
     updated_at: existing.updated_at + 1000
   };
   return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC27b [Positive Path 1]: Version upgrade (v2 -> v3) with higher confidence allowed to update DSP fields", () => {
+
+test("TC34 [Positive Path 1]: Version upgrade (v2 -> v3) with higher confidence allowed to update DSP fields", () => {
   const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.90, original_bpm: 128.0 };
   const incoming = {
     ...validDoc,
@@ -419,91 +559,75 @@ test("TC27b [Positive Path 1]: Version upgrade (v2 -> v3) with higher confidence
   };
   return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC28 [Negative Path 1]: Version upgrade with confidence drop (0.95 -> 0.85) rejected", () => {
+
+test("TC35 [Negative Path 1]: Version upgrade with confidence drop (0.95 -> 0.85) rejected", () => {
   const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
   const incoming = { ...validDoc, analysis_version: 3, analysis_confidence: 0.85, updated_at: existing.updated_at + 1000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC29 [Negative Path 1]: Version regression (v3 -> v2) rejected", () => {
+
+test("TC36 [Negative Path 1]: Version regression (v3 -> v2) rejected", () => {
   const existing = { ...validDoc, analysis_version: 3, analysis_confidence: 0.95 };
   const incoming = { ...validDoc, analysis_version: 2, analysis_confidence: 0.98, updated_at: existing.updated_at + 1000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC30 [Negative Path 1]: Same version (v2 -> v2) with higher confidence modifying DSP fields is DELIBERATELY REJECTED", () => {
-  // Policy rule: Same-version higher confidence cannot alter DSP fields (requires version bump)
+
+test("TC37 [Negative Path 1]: Same version (v2 -> v2) modifying DSP fields is DELIBERATELY REJECTED", () => {
   const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.85, original_bpm: 128.0 };
   const incoming = {
     ...validDoc,
     analysis_version: 2,
     analysis_confidence: 0.98,
-    original_bpm: 128.5, // altered DSP field
+    original_bpm: 128.5,
     updated_at: existing.updated_at + 1000
   };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
 
-// Path 2 Tests: Metadata/Source Link Update (DSP fields unchanged, version & confidence identical)
-test("TC31 [Positive Path 2]: Source URL addition allowed when version, confidence, and DSP fields are unchanged", () => {
-  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, source_urls: ["https://youtube.com/watch?v=abc"] };
-  const incoming = {
-    ...validDoc,
-    analysis_version: 2,
-    analysis_confidence: 0.95,
-    source_urls: ["https://youtube.com/watch?v=abc", "youtube:def12345678"],
-    updated_at: existing.updated_at + 1000
-  };
-  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC32 [Negative Path 2]: Source URL update attempting to tamper with DSP fields (BPM) rejected", () => {
-  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, original_bpm: 128.0 };
-  const incoming = {
-    ...validDoc,
-    analysis_version: 2,
-    analysis_confidence: 0.95,
-    original_bpm: 130.0, // tampered DSP field under Path 2
-    source_urls: ["https://youtube.com/watch?v=abc", "youtube:def12345678"],
-    updated_at: existing.updated_at + 1000
-  };
-  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC33 [Negative Path 2]: Source URL update attempting to smuggle lower confidence rejected", () => {
-  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
-  const incoming = {
-    ...validDoc,
-    analysis_version: 2,
-    analysis_confidence: 0.80, // smuggled confidence downgrade!
-    source_urls: ["https://youtube.com/watch?v=abc", "youtube:def12345678"],
-    updated_at: existing.updated_at + 1000
-  };
+// Group 8: Status State Transitions
+test("TC38 [Negative]: Status downgrade analyzed -> metadata_only rejected", () => {
+  const existing = { ...validDoc, processing_status: "analyzed" };
+  const incoming = { ...validDoc, processing_status: "metadata_only", updated_at: existing.updated_at + 1000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
 
-// Group 7: Timestamp and Immutability Protections
-test("TC34 [Negative]: Tampering with created_at rejected", () => {
+test("TC39 [Negative]: Status downgrade analyzed -> pending or failed rejected", () => {
+  const existing = { ...validDoc, processing_status: "analyzed" };
+  const toPending = { ...validDoc, processing_status: "pending", updated_at: existing.updated_at + 1000 };
+  const toFailed = { ...validDoc, processing_status: "failed", updated_at: existing.updated_at + 1000 };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, toPending) &&
+         !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, toFailed);
+});
+
+// Group 9: Timestamp & Immutability Protections
+test("TC40 [Negative]: Tampering with created_at rejected", () => {
   const existing = { ...validDoc, created_at: 1732500000000 };
   const incoming = { ...validDoc, created_at: 1732500999999, updated_at: existing.updated_at + 1000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC35 [Negative]: Removing created_at on update rejected", () => {
+
+test("TC41 [Negative]: Removing created_at on update rejected", () => {
   const existing = { ...validDoc, created_at: 1732500000000 };
   const incoming = { ...validDoc, updated_at: existing.updated_at + 1000 };
   delete incoming.created_at;
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC36 [Negative]: Rewinding updated_at backwards rejected", () => {
+
+test("TC42 [Negative]: Rewinding updated_at backwards rejected", () => {
   const existing = { ...validDoc, updated_at: 1732500500000 };
   const incoming = { ...validDoc, updated_at: 1732500100000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC37 [Negative]: Removing updated_at on update rejected", () => {
+
+test("TC43 [Negative]: Removing updated_at on update rejected", () => {
   const existing = { ...validDoc, updated_at: 1732500500000 };
   const incoming = { ...validDoc };
   delete incoming.updated_at;
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
 
-// Group 8: Legacy / Sparse Document Compatibility
-test("TC38 [Positive]: Legacy doc missing created_at can receive created_at on update", () => {
+// Group 10: Legacy / Sparse Document Compatibility
+test("TC44 [Positive]: Legacy doc missing created_at can receive created_at on update", () => {
   const legacyDoc = {
     canonical_fingerprint: "a1b2c3d4e5f67890abcdef",
     title: "Animals",
@@ -513,7 +637,8 @@ test("TC38 [Positive]: Legacy doc missing created_at can receive created_at on u
   const incoming = { ...validDoc, created_at: 1732500000000, updated_at: 1732500000000 };
   return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", legacyDoc, incoming);
 });
-test("TC39 [Positive]: Legacy doc missing optional fields (version, confidence, timestamps) never crashes rule evaluation", () => {
+
+test("TC45 [Positive]: Legacy doc missing optional fields never crashes rule evaluation", () => {
   const sparseDoc = {
     canonical_fingerprint: "a1b2c3d4e5f67890abcdef",
     title: "Animals",
@@ -522,7 +647,8 @@ test("TC39 [Positive]: Legacy doc missing optional fields (version, confidence, 
   const incoming = { ...validDoc, updated_at: 1732500000000 };
   return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", sparseDoc, incoming);
 });
-test("TC40 [Negative]: Identity tampering (title, artist, canonical_fingerprint) rejected", () => {
+
+test("TC46 [Negative]: Identity tampering (title, artist, canonical_fingerprint) rejected", () => {
   const existing = { ...validDoc };
   const tamperedTitle = { ...validDoc, title: "Modified Title", updated_at: existing.updated_at + 1000 };
   const tamperedArtist = { ...validDoc, artist: "Modified Artist", updated_at: existing.updated_at + 1000 };

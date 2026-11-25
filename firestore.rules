@@ -118,6 +118,15 @@ service cloud.firestore {
         : 0;
     }
 
+    // Identifies whether an existing document already contains prior analysis results.
+    // Prevents non-analyzed records (e.g. pending or failed) with existing analysis from bypassing quality protection.
+    function hasAnalysisData(data) {
+      return ('analysis_version' in data && data.analysis_version > 0)
+        || ('original_bpm' in data)
+        || ('camelot_key' in data)
+        || ('beat_grid_json' in data);
+    }
+
     function hasAllowedCatalogueFields(data) {
       return data.keys().hasOnly([
         'canonical_fingerprint',
@@ -222,25 +231,6 @@ service cloud.firestore {
           || (data.updated_at is int && data.updated_at > 0));
     }
 
-    // Fields that define the actual analysis result.
-    function analysisFieldsUnchanged(existing, incoming) {
-      return incoming.diff(existing).affectedKeys().hasNone([
-        'original_bpm',
-        'half_time_bpm',
-        'double_time_bpm',
-        'bpm_confidence',
-        'musical_key',
-        'camelot_key',
-        'key_confidence',
-        'beat_grid_json',
-        'phrase_markers_json',
-        'overall_energy',
-        'danceability',
-        'genre_tags',
-        'mood_tags'
-      ]);
-    }
-
     function isAllowedStatusTransition(existing, incoming) {
       let oldStatus = getStatus(existing);
       let newStatus = getStatus(incoming);
@@ -260,23 +250,37 @@ service cloud.firestore {
         );
     }
 
-    // Mutually exclusive two-path model:
-    // Path 1: Algorithm version upgrade (version must strictly advance, confidence cannot decrease).
-    // Path 2: Metadata / source link update (DSP fields unchanged, version and confidence preserved).
+    // Path 2: Strictly restricts modifications solely to source_urls, provenance, and updated_at.
+    // Forbids modifying duration_ms, version_tag, or any DSP analysis field.
+    function isSourceLinkUpdateOnly(existing, incoming) {
+      return incoming.diff(existing).affectedKeys().hasOnly([
+        'source_urls',
+        'provenance',
+        'updated_at'
+      ]);
+    }
+
+    // Mutually exclusive two-path model with initial analysis anti-downgrade protection:
+    // Case A: Genuine first analysis of a bare record that has no prior analysis results.
+    // Case B: Existing record already has analysis data (even if status was pending or failed).
+    //   Path 1: Algorithm version upgrade (version must strictly advance, confidence cannot decrease).
+    //   Path 2: Source link maintenance (only source_urls, provenance, updated_at may change; version & confidence preserved).
     function isAllowedQualityUpdate(existing, incoming) {
-      return getStatus(existing) != 'analyzed'
+      return !hasAnalysisData(existing)
         || (
           getStatus(incoming) == 'analyzed'
           && (
+            // Path 1: Algorithm Version Upgrade (version strictly advances; confidence cannot decrease; DSP fields may change)
             (
               getVersion(incoming) > getVersion(existing)
               && getConfidence(incoming) >= getConfidence(existing)
             )
             ||
+            // Path 2: Source Link Maintenance (version & confidence identical; strictly restricted to source_urls, provenance, updated_at)
             (
               getVersion(incoming) == getVersion(existing)
               && getConfidence(incoming) == getConfidence(existing)
-              && analysisFieldsUnchanged(existing, incoming)
+              && isSourceLinkUpdateOnly(existing, incoming)
             )
           )
         );
