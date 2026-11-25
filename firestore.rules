@@ -27,14 +27,77 @@ service cloud.firestore {
       return c is number && c >= 0.0 && c <= 1.0;
     }
 
+    // Strict Camelot validation: 1A-12A or 1B-12B only
     function isValidCamelot(k) {
-      return k is string && (k.matches('^([1-9]|1[0-2])[AB]$') || (k.size() >= 1 && k.size() <= 16));
+      return k is string && k.matches('^([1-9]|1[0-2])[AB]$');
+    }
+
+    // Conventional musical key validation
+    function isValidMusicalKey(k) {
+      return k is string && k.matches('^([A-G][#b]?( (Major|Minor))?|Unknown)$');
     }
 
     function isValidStatus(s) {
       return s in ['analyzed', 'metadata_only', 'pending', 'failed'];
     }
 
+    function isValidTag(t) {
+      return t is string && t.size() >= 1 && t.size() <= 50 && t.matches('^[a-zA-Z0-9_ -]+$');
+    }
+
+    function isValidSourceUrl(u) {
+      return u is string && u.size() >= 5 && u.size() <= 500
+        && (u.matches('^https?://[a-zA-Z0-9_./#&?=%+-]+$') || u.matches('^youtube:[a-zA-Z0-9_-]+$'));
+    }
+
+    // Individual item validation for genre_tags (max 15 items)
+    function isValidTagList(tags) {
+      return tags is list && tags.size() <= 15
+        && (tags.size() == 0 || (isValidTag(tags[0])
+        && (tags.size() == 1 || (isValidTag(tags[1])
+        && (tags.size() == 2 || (isValidTag(tags[2])
+        && (tags.size() == 3 || (isValidTag(tags[3])
+        && (tags.size() == 4 || (isValidTag(tags[4])
+        && (tags.size() == 5 || (isValidTag(tags[5])
+        && (tags.size() == 6 || (isValidTag(tags[6])
+        && (tags.size() == 7 || (isValidTag(tags[7])
+        && (tags.size() == 8 || (isValidTag(tags[8])
+        && (tags.size() == 9 || (isValidTag(tags[9])
+        && (tags.size() == 10 || (isValidTag(tags[10])
+        && (tags.size() == 11 || (isValidTag(tags[11])
+        && (tags.size() == 12 || (isValidTag(tags[12])
+        && (tags.size() == 13 || (isValidTag(tags[13])
+        && (tags.size() == 14 || isValidTag(tags[14]))))))))))))))))))))))))))));
+    }
+
+    // Individual item validation for source_urls (max 5 items)
+    function isValidSourceUrlList(urls) {
+      return urls is list && urls.size() <= 5
+        && (urls.size() == 0 || (isValidSourceUrl(urls[0])
+        && (urls.size() == 1 || (isValidSourceUrl(urls[1])
+        && (urls.size() == 2 || (isValidSourceUrl(urls[2])
+        && (urls.size() == 3 || (isValidSourceUrl(urls[3])
+        && (urls.size() == 4 || isValidSourceUrl(urls[4]))))))))));
+    }
+
+    // Safe getters for optional fields to avoid evaluation crashes on missing keys
+    function getStatus(data) {
+      return ('processing_status' in data) ? data.processing_status : 'metadata_only';
+    }
+
+    function getVersion(data) {
+      return ('analysis_version' in data) ? data.analysis_version : 0;
+    }
+
+    function getConfidence(data) {
+      return ('analysis_confidence' in data) ? data.analysis_confidence : 0.0;
+    }
+
+    function getUpdatedAt(data) {
+      return ('updated_at' in data) ? data.updated_at : 0;
+    }
+
+    // Strict field allowlist - prevents smuggling arbitrary nested data or maps
     function hasAllowedCatalogueFields(data) {
       return data.keys().hasOnly([
         'canonical_fingerprint', 'title', 'artist', 'version_tag',
@@ -47,6 +110,7 @@ service cloud.firestore {
       ]);
     }
 
+    // Comprehensive document schema validation
     function isValidCatalogueData(data) {
       return hasAllowedCatalogueFields(data)
         // Mandatory identity fields
@@ -63,39 +127,47 @@ service cloud.firestore {
         && (!('key_confidence' in data) || isValidConfidence(data.key_confidence))
         && (!('overall_energy' in data) || isValidConfidence(data.overall_energy))
         && (!('danceability' in data) || isValidConfidence(data.danceability))
-        && (!('musical_key' in data) || isValidString(data.musical_key, 1, 32))
+        && (!('musical_key' in data) || isValidMusicalKey(data.musical_key))
         && (!('camelot_key' in data) || isValidCamelot(data.camelot_key))
         && (!('beat_grid_json' in data) || isValidString(data.beat_grid_json, 2, 65536))
         && (!('phrase_markers_json' in data) || isValidString(data.phrase_markers_json, 2, 65536))
         && (!('processing_status' in data) || isValidStatus(data.processing_status))
-        && (!('genre_tags' in data) || (data.genre_tags is list && data.genre_tags.size() <= 20))
-        && (!('mood_tags' in data) || (data.mood_tags is list && data.mood_tags.size() <= 20))
-        && (!('source_urls' in data) || (data.source_urls is list && data.source_urls.size() <= 10))
+        && (!('genre_tags' in data) || isValidTagList(data.genre_tags))
+        && (!('mood_tags' in data) || isValidTagList(data.mood_tags))
+        && (!('source_urls' in data) || isValidSourceUrlList(data.source_urls))
         && (!('provenance' in data) || isValidString(data.provenance, 1, 64))
         && (!('analysis_version' in data) || isValidInt(data.analysis_version, 1, 100))
         && (!('analysis_confidence' in data) || isValidConfidence(data.analysis_confidence))
-        && (!('created_at' in data) || data.created_at is int)
-        && (!('updated_at' in data) || data.updated_at is int);
+        && (!('created_at' in data) || (data.created_at is int && data.created_at > 0))
+        && (!('updated_at' in data) || (data.updated_at is int && data.updated_at > 0));
     }
 
-    // Overwrite protection: prevents overwriting high-confidence analyzed records with lower quality or unanalyzed data
+    // Enforces monotonic quality progression:
+    // Analyzed records cannot be downgraded to unanalyzed or lower confidence, even across version bumps
+    function isAllowedQualityUpdate(existing, incoming) {
+      return getStatus(existing) != 'analyzed' || (
+        getStatus(incoming) == 'analyzed'
+        && getVersion(incoming) >= getVersion(existing)
+        && getConfidence(incoming) >= getConfidence(existing)
+      );
+    }
+
+    // Overwrite protection: identity preservation, created_at immutability, updated_at monotonicity
     function isAllowedUpdate(existing, incoming) {
       return incoming.canonical_fingerprint == existing.canonical_fingerprint
         && incoming.title == existing.title
         && incoming.artist == existing.artist
-        // Cannot downgrade an analyzed document
-        && (!('processing_status' in existing) || !(existing.processing_status == 'analyzed' && incoming.processing_status != 'analyzed'))
-        // If already analyzed, incoming must have equal or higher version, and not lower confidence
-        && (
-          !('processing_status' in existing)
-          || existing.processing_status != 'analyzed'
-          || !('analysis_version' in existing)
-          || incoming.analysis_version > existing.analysis_version
-          || (
-            incoming.analysis_version == existing.analysis_version
-            && (!('analysis_confidence' in existing) || incoming.analysis_confidence >= existing.analysis_confidence)
-          )
-        );
+        // created_at is immutable once set
+        && (!('created_at' in existing) || incoming.created_at == existing.created_at)
+        // updated_at must not move backwards
+        && (!('updated_at' in incoming) || incoming.updated_at >= getUpdatedAt(existing))
+        // Quality and version progression policy
+        && isAllowedQualityUpdate(existing, incoming);
+    }
+
+    // Bound document ID strictly for primary fingerprint records
+    function isBoundDocumentId(documentId, data) {
+      return !documentId.matches('^fp_') || documentId == ('fp_' + data.canonical_fingerprint);
     }
 
     // Global Shared Song Metadata Catalogue
@@ -106,13 +178,15 @@ service cloud.firestore {
       allow read: if isAuthenticated();
 
       // Document ID naming format: fp_{fingerprint}, rec_{recording_fp}, or vid_{video_id}
-      // Prevents arbitrary document path injection or collision
+      // For fp_, the ID is strictly bound to canonical_fingerprint
       allow create: if isAuthenticated()
         && documentId.matches('^(fp|rec|vid)_[a-zA-Z0-9_.-]+$')
+        && isBoundDocumentId(documentId, request.resource.data)
         && isValidCatalogueData(request.resource.data);
 
       allow update: if isAuthenticated()
         && documentId.matches('^(fp|rec|vid)_[a-zA-Z0-9_.-]+$')
+        && isBoundDocumentId(documentId, request.resource.data)
         && isValidCatalogueData(request.resource.data)
         && isAllowedUpdate(resource.data, request.resource.data);
 
