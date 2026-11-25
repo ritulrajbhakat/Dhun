@@ -73,7 +73,9 @@ service cloud.firestore {
         && (!('source_urls' in data) || (data.source_urls is list && data.source_urls.size() <= 10))
         && (!('provenance' in data) || isValidString(data.provenance, 1, 64))
         && (!('analysis_version' in data) || isValidInt(data.analysis_version, 1, 100))
-        && (!('analysis_confidence' in data) || isValidConfidence(data.analysis_confidence));
+        && (!('analysis_confidence' in data) || isValidConfidence(data.analysis_confidence))
+        && (!('created_at' in data) || data.created_at is int)
+        && (!('updated_at' in data) || data.updated_at is int);
     }
 
     // Overwrite protection: prevents overwriting high-confidence analyzed records with lower quality or unanalyzed data
@@ -82,14 +84,16 @@ service cloud.firestore {
         && incoming.title == existing.title
         && incoming.artist == existing.artist
         // Cannot downgrade an analyzed document
-        && !(existing.processing_status == 'analyzed' && incoming.processing_status != 'analyzed')
+        && (!('processing_status' in existing) || !(existing.processing_status == 'analyzed' && incoming.processing_status != 'analyzed'))
         // If already analyzed, incoming must have equal or higher version, and not lower confidence
         && (
-          existing.processing_status != 'analyzed'
+          !('processing_status' in existing)
+          || existing.processing_status != 'analyzed'
+          || !('analysis_version' in existing)
           || incoming.analysis_version > existing.analysis_version
           || (
             incoming.analysis_version == existing.analysis_version
-            && incoming.analysis_confidence >= existing.analysis_confidence
+            && (!('analysis_confidence' in existing) || incoming.analysis_confidence >= existing.analysis_confidence)
           )
         );
     }
