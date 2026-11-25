@@ -123,9 +123,27 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .filter(|s| !s.trim().is_empty());
 
-    let sync_manager = match MetadataSyncManager::new(catalogue_url.clone(), catalogue_key) {
+    let fb_project = std::env::var("DHUN_FIREBASE_PROJECT_ID")
+        .ok()
+        .or_else(|| std::env::var("VITE_FIREBASE_PROJECT_ID").ok())
+        .or_else(|| db.get_app_setting("firebase_project_id").unwrap_or(None));
+    let fb_key = std::env::var("DHUN_FIREBASE_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("VITE_FIREBASE_API_KEY").ok())
+        .or_else(|| db.get_app_setting("firebase_api_key").unwrap_or(None));
+
+    let firestore_config = fb_project.filter(|p| !p.trim().is_empty()).map(|project_id| {
+        dhun_lib::sync::FirestoreConfig {
+            project_id,
+            api_key: fb_key.filter(|k| !k.trim().is_empty()),
+        }
+    });
+
+    let sync_manager = match MetadataSyncManager::new_with_firestore(catalogue_url.clone(), catalogue_key, firestore_config.clone()) {
         Ok(mgr) => {
-            if catalogue_url.is_some() {
+            if let Some(ref fc) = firestore_config {
+                info!("Cloud Firestore Global Shared Catalogue configured for project '{}' (zero-audio metadata sync).", fc.project_id);
+            } else if catalogue_url.is_some() {
                 info!("Global Metadata Catalogue sync configured (metadata-only, HMAC-SHA256 signed).");
             } else {
                 info!("Running in offline-first mode (no remote Global Metadata Catalogue configured; sync outbox will queue locally).");

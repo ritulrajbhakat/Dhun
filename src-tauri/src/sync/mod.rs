@@ -9,6 +9,9 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::db::models::{SyncOutboxItem, SyncStatusOverview};
 
+pub mod firestore;
+pub use firestore::{FirestoreClient, FirestoreConfig};
+
 /// Computes SHA-256 digest of payload for canonical message binding
 pub fn compute_payload_hash(payload_json: &str) -> String {
     let mut hasher = Sha256::new();
@@ -96,11 +99,22 @@ pub struct PlaybackSyncEvent {
 pub struct MetadataSyncManager {
     remote_endpoint: Option<String>,
     api_key: Option<String>,
+    firestore: Option<FirestoreClient>,
     client: reqwest::Client,
 }
 
 impl MetadataSyncManager {
     pub fn new(remote_endpoint: Option<String>, api_key: Option<String>) -> Result<Self> {
+        Self::new_with_firestore(remote_endpoint, api_key, None)
+    }
+
+    /// Initializes MetadataSyncManager with optional Cloud Firestore configuration.
+    /// Operates fully offline when neither Firestore nor a remote endpoint is provided.
+    pub fn new_with_firestore(
+        remote_endpoint: Option<String>,
+        api_key: Option<String>,
+        firestore_config: Option<FirestoreConfig>,
+    ) -> Result<Self> {
         if let Some(ref url) = remote_endpoint {
             let lower = url.to_lowercase();
             // Reject insecure HTTP endpoints (only HTTPS is permitted; loopback allowed for unit tests)
@@ -114,9 +128,12 @@ impl MetadataSyncManager {
             }
         }
 
+        let firestore = firestore_config.map(FirestoreClient::new);
+
         Ok(Self {
             remote_endpoint,
             api_key,
+            firestore,
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(std::time::Duration::from_secs(10))
@@ -125,7 +142,7 @@ impl MetadataSyncManager {
         })
     }
 
-    /// Creates sync manager loading any persisted remote sync endpoint and API key from environment or SQLite
+    /// Creates sync manager loading any persisted remote sync endpoint, Firebase credentials, or SQLite settings
     pub fn new_from_db(db: &Database) -> Result<Self> {
         let endpoint = std::env::var("DHUN_SYNC_ENDPOINT")
             .ok()
@@ -133,7 +150,28 @@ impl MetadataSyncManager {
         let api_key = std::env::var("DHUN_SYNC_API_KEY")
             .ok()
             .or_else(|| db.get_app_setting("sync_api_key").unwrap_or(None));
-        Self::new(endpoint, api_key)
+
+        let fb_project = std::env::var("DHUN_FIREBASE_PROJECT_ID")
+            .ok()
+            .or_else(|| std::env::var("VITE_FIREBASE_PROJECT_ID").ok())
+            .or_else(|| db.get_app_setting("firebase_project_id").unwrap_or(None));
+        let fb_key = std::env::var("DHUN_FIREBASE_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("VITE_FIREBASE_API_KEY").ok())
+            .or_else(|| db.get_app_setting("firebase_api_key").unwrap_or(None));
+
+        let firestore_config = fb_project.filter(|p| !p.trim().is_empty()).map(|project_id| {
+            FirestoreConfig {
+                project_id,
+                api_key: fb_key.filter(|k| !k.trim().is_empty()),
+            }
+        });
+
+        Self::new_with_firestore(endpoint, api_key, firestore_config)
+    }
+
+    pub fn firestore(&self) -> Option<&FirestoreClient> {
+        self.firestore.as_ref()
     }
 
     pub fn remote_endpoint(&self) -> Option<&str> {
@@ -224,10 +262,10 @@ impl MetadataSyncManager {
 
     /// Processes pending sync items from the outbox with retry logic & conflict handling
     pub async fn process_pending_outbox(&self, max_batch: usize, db: &Database) -> Result<usize> {
-        // If no remote endpoint is configured, keep all items queued locally in pending status
-        let Some(_) = &self.remote_endpoint else {
+        // If neither Firestore nor a remote endpoint is configured, keep all items queued locally in pending status
+        if self.remote_endpoint.is_none() && self.firestore.is_none() {
             return Ok(0);
-        };
+        }
 
         let items = db.get_pending_sync_items(max_batch)?;
         if items.is_empty() {
@@ -267,10 +305,26 @@ impl MetadataSyncManager {
         Ok(synced_count)
     }
 
-    /// Dispatches a single sync item to authenticated remote service with idempotency & request signing
+    /// Dispatches a single sync item to Cloud Firestore or authenticated remote service with idempotency
     async fn dispatch_sync_item(&self, item: &SyncOutboxItem) -> Result<()> {
+        // 1. Primary: If Cloud Firestore is configured, publish song metadata directly to Firestore
+        if item.entity_type == "global_song_metadata" {
+            if let Some(ref firestore) = self.firestore {
+                let payload: crate::metadata_service::CatalogueUpsertRequest =
+                    serde_json::from_str(&item.payload_json)?;
+                let video_id = if !item.entity_id.is_empty() {
+                    Some(item.entity_id.as_str())
+                } else {
+                    None
+                };
+                firestore.publish_metadata(&payload, video_id).await?;
+                return Ok(());
+            }
+        }
+
+        // 2. Fallback: Custom authenticated HMAC endpoint
         let Some(endpoint) = &self.remote_endpoint else {
-            return Err(anyhow!("No remote sync service configured; item remains in local pending queue."));
+            return Err(anyhow!("No remote sync service or Cloud Firestore configured; item remains in local pending queue."));
         };
         let Some(ref key) = self.api_key else {
             return Err(anyhow!("Authentication required: remote sync endpoint configured but API key is missing."));
@@ -333,12 +387,40 @@ impl MetadataSyncManager {
         Ok(id)
     }
 
-    /// Authenticated engine-only lookup against the Global Shared Song Metadata Catalogue.
-    /// Gracefully returns Ok(None) when offline or when no remote catalogue endpoint is configured.
+    /// Engine-only lookup against the Global Shared Song Metadata Catalogue (Cloud Firestore or legacy server).
+    /// Gracefully returns Ok(None) when offline or when no remote catalogue is configured.
     pub async fn lookup_global_song_metadata(
         &self,
         req: &crate::metadata_service::CatalogueLookupRequest,
     ) -> Result<Option<crate::db::models::GlobalSongMetadata>> {
+        // 1. Primary: Cloud Firestore lookup if configured
+        if let Some(ref firestore) = self.firestore {
+            // A. Lookup by direct video ID
+            if let Some(ref vid) = req.provider_video_id {
+                if let Ok(Some(hit)) = firestore.lookup_by_video_id(vid).await {
+                    return Ok(Some(hit));
+                }
+            }
+            // B. Lookup by canonical fingerprint
+            if let (Some(ref title), Some(ref artist)) = (&req.title, &req.artist) {
+                let vtag = req
+                    .version_tag
+                    .clone()
+                    .unwrap_or_else(|| crate::metadata_service::extract_version_tag(title));
+                let fp = crate::metadata_service::compute_canonical_fingerprint(
+                    title,
+                    artist,
+                    &vtag,
+                    req.duration_ms.unwrap_or(0),
+                );
+                if let Ok(Some(hit)) = firestore.lookup_by_fingerprint(&fp).await {
+                    return Ok(Some(hit));
+                }
+            }
+            return Ok(None);
+        }
+
+        // 2. Fallback: Custom authenticated HMAC endpoint
         let (Some(endpoint), Some(key)) = (&self.remote_endpoint, &self.api_key) else {
             return Ok(None);
         };

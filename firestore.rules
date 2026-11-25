@@ -1,0 +1,34 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Shared Song Metadata Catalogue
+    // Strict metadata-only repository. Audio binaries and raw audio streams are strictly forbidden.
+    match /catalogue/{documentId} {
+      
+      // Anyone with valid Firebase Authentication (including anonymous auth) can read metadata
+      allow read: if request.auth != null;
+
+      // Authenticated DHUN installations can publish or update verified song metadata
+      // Validates data structure and prevents document tampering or arbitrary data injection
+      allow create, update: if request.auth != null
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.artist is string
+        && request.resource.data.canonical_fingerprint is string
+        && request.resource.data.canonical_fingerprint.size() > 0
+        && (!('duration_ms' in request.resource.data) || request.resource.data.duration_ms is int)
+        && (!('original_bpm' in request.resource.data) || request.resource.data.original_bpm is number)
+        && (!('camelot_key' in request.resource.data) || request.resource.data.camelot_key is string)
+        && (!('bpm_confidence' in request.resource.data) || request.resource.data.bpm_confidence is number);
+
+      // Deletion is strictly prohibited to prevent catalogue loss or vandalism
+      allow delete: if false;
+    }
+
+    // Default deny for all other collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

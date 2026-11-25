@@ -118,6 +118,29 @@ pub async fn stage_2_lookup_existing_metadata(
     let oembed = fetch_youtube_metadata(parsed, http_client).await;
     let version_tag = extract_version_tag(&oembed.title);
     let fp = compute_canonical_fingerprint(&oembed.title, &oembed.artist, &version_tag, 0);
+
+    // 2d. Secondary catalogue lookup by canonical fingerprint (matches same song across alternate video uploads)
+    let fp_lookup_req = CatalogueLookupRequest {
+        source_url: Some(parsed.canonical_url.clone()),
+        provider_video_id: Some(parsed.video_id.clone()),
+        title: Some(oembed.title.clone()),
+        artist: Some(oembed.artist.clone()),
+        version_tag: Some(version_tag.clone()),
+        duration_ms: None,
+    };
+    if let Ok(Some(cloud_hit)) = sync_mgr.lookup_global_song_metadata(&fp_lookup_req).await {
+        // Persist locally so subsequent lookups work offline
+        let _ = db.upsert_global_song_metadata(
+            &cloud_hit,
+            Some((
+                &parsed.canonical_url,
+                parsed.provider.as_str(),
+                &parsed.video_id,
+            )),
+        );
+        return (cloud_hit, "global_catalogue".to_string());
+    }
+
     let now = chrono::Utc::now().timestamp_millis();
 
     let fresh = GlobalSongMetadata {
@@ -371,7 +394,41 @@ pub async fn run_local_song_pipeline(
                 cached_entry = Some(entry);
             }
 
-            if let Ok(analysis) = stage_5_local_audio_analysis(audio_path, &metadata.song_id) {
+            let is_already_analyzed = metadata.processing_status == "analyzed"
+                && metadata.original_bpm.is_some()
+                && metadata.camelot_key.is_some()
+                && metadata.beat_grid_json.is_some();
+
+            if is_already_analyzed {
+                info!(
+                    "Catalogue hit for '{}' is already fully analyzed (BPM: {:?}, Key: {:?}). Skipping local DSP analysis!",
+                    metadata.title,
+                    metadata.original_bpm,
+                    metadata.camelot_key
+                );
+                if let (Some(orig_bpm), Some(half_bpm), Some(double_bpm), Some(ref key), Some(ref camelot)) = (
+                    metadata.original_bpm,
+                    metadata.half_time_bpm,
+                    metadata.double_time_bpm,
+                    metadata.musical_key.as_ref(),
+                    metadata.camelot_key.as_ref(),
+                ) {
+                    local_analysis = Some(LocalAnalysisResult {
+                        duration_ms: metadata.duration_ms,
+                        original_bpm: orig_bpm,
+                        half_time_bpm: half_bpm,
+                        double_time_bpm: double_bpm,
+                        bpm_confidence: metadata.bpm_confidence.unwrap_or(0.95),
+                        musical_key: key.to_string(),
+                        camelot_key: camelot.to_string(),
+                        key_confidence: metadata.key_confidence.unwrap_or(0.95),
+                        beat_grid_json: metadata.beat_grid_json.clone().unwrap_or_else(|| "{}".to_string()),
+                        phrase_markers_json: metadata.phrase_markers_json.clone().unwrap_or_else(|| "[]".to_string()),
+                        overall_energy: metadata.overall_energy.unwrap_or(0.7),
+                        danceability: metadata.danceability.unwrap_or(0.7),
+                    });
+                }
+            } else if let Ok(analysis) = stage_5_local_audio_analysis(audio_path, &metadata.song_id) {
                 metadata.duration_ms = analysis.duration_ms;
                 metadata.original_bpm = Some(analysis.original_bpm);
                 metadata.half_time_bpm = Some(analysis.half_time_bpm);
@@ -410,8 +467,12 @@ pub async fn run_local_song_pipeline(
         }
     }
 
-    // Stage 6: Metadata-Only Synchronization (enqueued offline-safe, zero audio bytes)
-    let sync_outbox_id = stage_6_sync_metadata_only(&parsed, &metadata, sync_mgr, db).await.ok();
+    // Stage 6: Metadata-Only Synchronization (only publish if freshly analyzed or not yet in cloud)
+    let sync_outbox_id = if metadata.processing_status == "analyzed" && metadata_source == "local_analysis" {
+        stage_6_sync_metadata_only(&parsed, &metadata, sync_mgr, db).await.ok()
+    } else {
+        None
+    };
 
     Ok(PipelineOutcome {
         parsed,
