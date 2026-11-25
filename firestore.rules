@@ -100,31 +100,50 @@ service cloud.firestore {
         : 'metadata_only';
     }
 
+    // Comprehensive detection of all 15 analysis-related fields.
+    // An existing record containing even one of these fields does not qualify as an untouched bare stub.
+    function hasAnalysisData(data) {
+      return ('analysis_version' in data)
+        || ('analysis_confidence' in data)
+        || ('original_bpm' in data)
+        || ('half_time_bpm' in data)
+        || ('double_time_bpm' in data)
+        || ('bpm_confidence' in data)
+        || ('musical_key' in data)
+        || ('camelot_key' in data)
+        || ('key_confidence' in data)
+        || ('beat_grid_json' in data)
+        || ('phrase_markers_json' in data)
+        || ('overall_energy' in data)
+        || ('danceability' in data)
+        || ('genre_tags' in data)
+        || ('mood_tags' in data);
+    }
+
+    // Safely reads algorithm version:
+    // If analysis_version is explicit, returns it.
+    // If missing but document contains analysis data, baseline version is 2 (matching DHUN's default).
+    // Otherwise returns 0 for bare unanalyzed stubs.
     function getVersion(data) {
       return ('analysis_version' in data)
         ? data.analysis_version
-        : 0;
+        : (hasAnalysisData(data) ? 2 : 0);
     }
 
+    // Safely reads analysis confidence:
+    // If analysis_confidence is explicit, returns it.
+    // If missing but document contains analysis data, baseline confidence is 1.0 (matching DHUN's default).
+    // Otherwise returns 0.0 for bare unanalyzed stubs.
     function getConfidence(data) {
       return ('analysis_confidence' in data)
         ? data.analysis_confidence
-        : 0.0;
+        : (hasAnalysisData(data) ? 1.0 : 0.0);
     }
 
     function getUpdatedAt(data) {
       return ('updated_at' in data)
         ? data.updated_at
         : 0;
-    }
-
-    // Identifies whether an existing document already contains prior analysis results.
-    // Prevents non-analyzed records (e.g. pending or failed) with existing analysis from bypassing quality protection.
-    function hasAnalysisData(data) {
-      return ('analysis_version' in data && data.analysis_version > 0)
-        || ('original_bpm' in data)
-        || ('camelot_key' in data)
-        || ('beat_grid_json' in data);
     }
 
     function hasAllowedCatalogueFields(data) {
@@ -251,39 +270,48 @@ service cloud.firestore {
     }
 
     // Path 2: Strictly restricts modifications solely to source_urls, provenance, and updated_at.
-    // Forbids modifying duration_ms, version_tag, or any DSP analysis field.
+    // Requires an actual change to source_urls or provenance (an updated_at timestamp change alone is rejected).
+    // Strictly forbids modifying duration_ms, version_tag, or any of the 13 DSP fields.
     function isSourceLinkUpdateOnly(existing, incoming) {
-      return incoming.diff(existing).affectedKeys().hasOnly([
-        'source_urls',
-        'provenance',
-        'updated_at'
-      ]);
+      let diff = incoming.diff(existing).affectedKeys();
+      return diff.hasOnly(['source_urls', 'provenance', 'updated_at'])
+        && diff.hasAny(['source_urls', 'provenance']);
     }
 
-    // Mutually exclusive two-path model with initial analysis anti-downgrade protection:
-    // Case A: Genuine first analysis of a bare record that has no prior analysis results.
-    // Case B: Existing record already has analysis data (even if status was pending or failed).
-    //   Path 1: Algorithm version upgrade (version must strictly advance, confidence cannot decrease).
-    //   Path 2: Source link maintenance (only source_urls, provenance, updated_at may change; version & confidence preserved).
+    // Mutually exclusive three-scenario policy:
+    // Scenario A: Genuine first analysis of a bare record (no prior analysis data).
+    //   Must transition to 'analyzed', provide valid version & confidence, and preserve duration & version_tag.
+    // Scenario B: Algorithm version upgrade of an already-analyzed record.
+    //   Must strictly advance version (>), confidence must not decrease (>=), DSP fields may change.
+    // Scenario C: Source link maintenance of an already-analyzed record.
+    //   Version and confidence must be identical, and only source_urls/provenance/updated_at may change.
     function isAllowedQualityUpdate(existing, incoming) {
-      return !hasAnalysisData(existing)
-        || (
-          getStatus(incoming) == 'analyzed'
-          && (
-            // Path 1: Algorithm Version Upgrade (version strictly advances; confidence cannot decrease; DSP fields may change)
-            (
-              getVersion(incoming) > getVersion(existing)
-              && getConfidence(incoming) >= getConfidence(existing)
-            )
-            ||
-            // Path 2: Source Link Maintenance (version & confidence identical; strictly restricted to source_urls, provenance, updated_at)
-            (
-              getVersion(incoming) == getVersion(existing)
-              && getConfidence(incoming) == getConfidence(existing)
-              && isSourceLinkUpdateOnly(existing, incoming)
-            )
-          )
-        );
+      let existingHasAnalysis = hasAnalysisData(existing);
+      let incomingStatus = getStatus(incoming);
+
+      return (!existingHasAnalysis && (
+        // Scenario A: Genuine first analysis
+        incomingStatus == 'analyzed'
+        && ('analysis_version' in incoming)
+        && ('analysis_confidence' in incoming)
+        && (!('version_tag' in existing) || incoming.version_tag == existing.version_tag)
+        && (!('duration_ms' in existing) || incoming.duration_ms == existing.duration_ms)
+      ))
+      || (existingHasAnalysis && (
+        // Scenario B: Algorithm version upgrade
+        (
+          incomingStatus == 'analyzed'
+          && getVersion(incoming) > getVersion(existing)
+          && getConfidence(incoming) >= getConfidence(existing)
+        )
+        ||
+        // Scenario C: Source-link maintenance
+        (
+          getVersion(incoming) == getVersion(existing)
+          && getConfidence(incoming) == getConfidence(existing)
+          && isSourceLinkUpdateOnly(existing, incoming)
+        )
+      ));
     }
 
     function isAllowedUpdate(existing, incoming) {
@@ -307,6 +335,15 @@ service cloud.firestore {
           || (
             'updated_at' in incoming
             && incoming.updated_at >= existing.updated_at
+          )
+        )
+
+        // source_urls cannot be removed once present.
+        && (
+          !('source_urls' in existing)
+          || (
+            'source_urls' in incoming
+            && incoming.source_urls.size() > 0
           )
         )
 
