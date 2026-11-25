@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -397,24 +397,62 @@ impl MetadataSyncManager {
         if let Some(ref firestore) = self.firestore {
             // A. Lookup by direct video ID
             if let Some(ref vid) = req.provider_video_id {
-                if let Ok(Some(hit)) = firestore.lookup_by_video_id(vid).await {
-                    return Ok(Some(hit));
+                match firestore.lookup_by_video_id(vid).await {
+                    Ok(Some(hit)) => return Ok(Some(hit)),
+                    Ok(None) => {},
+                    Err(e) => {
+                        debug!("Firestore video ID lookup notice: {}", e);
+                    }
                 }
             }
-            // B. Lookup by canonical fingerprint
+            // B. Lookup by exact duration canonical fingerprint (if duration is known)
             if let (Some(ref title), Some(ref artist)) = (&req.title, &req.artist) {
                 let vtag = req
                     .version_tag
                     .clone()
                     .unwrap_or_else(|| crate::metadata_service::extract_version_tag(title));
-                let fp = crate::metadata_service::compute_canonical_fingerprint(
+
+                if let Some(dur) = req.duration_ms {
+                    if dur > 0 {
+                        let fp = crate::metadata_service::compute_canonical_fingerprint(
+                            title,
+                            artist,
+                            &vtag,
+                            dur,
+                        );
+                        match firestore.lookup_by_fingerprint(&fp).await {
+                            Ok(Some(hit)) => return Ok(Some(hit)),
+                            Ok(None) => {},
+                            Err(e) => {
+                                debug!("Firestore exact fingerprint lookup notice: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                // C. Cross-upload matching: Lookup by recording identity (duration-independent)
+                // This enables a second DHUN installation with a different video upload of the same song
+                // to find the existing metadata record published by the first installation!
+                let rec_fp = crate::metadata_service::compute_recording_fingerprint(
                     title,
                     artist,
                     &vtag,
-                    req.duration_ms.unwrap_or(0),
                 );
-                if let Ok(Some(hit)) = firestore.lookup_by_fingerprint(&fp).await {
-                    return Ok(Some(hit));
+                match firestore.lookup_by_recording_id(&rec_fp).await {
+                    Ok(Some(hit)) => return Ok(Some(hit)),
+                    Ok(None) => {},
+                    Err(e) => {
+                        debug!("Firestore recording identity lookup notice: {}", e);
+                    }
+                }
+
+                // D. Also check unk-bucket canonical fingerprint (for legacy/fallback)
+                match firestore.lookup_by_fingerprint(&rec_fp).await {
+                    Ok(Some(hit)) => return Ok(Some(hit)),
+                    Ok(None) => {},
+                    Err(e) => {
+                        debug!("Firestore fallback unk-fingerprint lookup notice: {}", e);
+                    }
                 }
             }
             return Ok(None);

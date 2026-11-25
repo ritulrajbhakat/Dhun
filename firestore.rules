@@ -2,25 +2,115 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // Helper functions for hardened data validation and security
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isValidNumber(val, minVal, maxVal) {
+      return val is number && val >= minVal && val <= maxVal;
+    }
+
+    function isValidInt(val, minVal, maxVal) {
+      return val is int && val >= minVal && val <= maxVal;
+    }
+
+    function isValidBpm(bpm) {
+      return bpm is number && bpm >= 40.0 && bpm <= 260.0;
+    }
+
+    function isValidConfidence(c) {
+      return c is number && c >= 0.0 && c <= 1.0;
+    }
+
+    function isValidCamelot(k) {
+      return k is string && (k.matches('^([1-9]|1[0-2])[AB]$') || (k.size() >= 1 && k.size() <= 16));
+    }
+
+    function isValidStatus(s) {
+      return s in ['analyzed', 'metadata_only', 'pending', 'failed'];
+    }
+
+    function hasAllowedCatalogueFields(data) {
+      return data.keys().hasOnly([
+        'canonical_fingerprint', 'title', 'artist', 'version_tag',
+        'duration_ms', 'original_bpm', 'half_time_bpm', 'double_time_bpm',
+        'bpm_confidence', 'musical_key', 'camelot_key', 'key_confidence',
+        'beat_grid_json', 'phrase_markers_json', 'overall_energy',
+        'danceability', 'genre_tags', 'mood_tags', 'analysis_version',
+        'analysis_confidence', 'processing_status', 'source_urls',
+        'provenance', 'created_at', 'updated_at'
+      ]);
+    }
+
+    function isValidCatalogueData(data) {
+      return hasAllowedCatalogueFields(data)
+        // Mandatory identity fields
+        && isValidString(data.title, 1, 300)
+        && isValidString(data.artist, 1, 300)
+        && isValidString(data.canonical_fingerprint, 16, 128)
+        && (!('version_tag' in data) || isValidString(data.version_tag, 1, 64))
+        // Audio analysis bounds
+        && (!('duration_ms' in data) || isValidInt(data.duration_ms, 0, 86400000))
+        && (!('original_bpm' in data) || isValidBpm(data.original_bpm))
+        && (!('half_time_bpm' in data) || isValidNumber(data.half_time_bpm, 20.0, 130.0))
+        && (!('double_time_bpm' in data) || isValidNumber(data.double_time_bpm, 80.0, 520.0))
+        && (!('bpm_confidence' in data) || isValidConfidence(data.bpm_confidence))
+        && (!('key_confidence' in data) || isValidConfidence(data.key_confidence))
+        && (!('overall_energy' in data) || isValidConfidence(data.overall_energy))
+        && (!('danceability' in data) || isValidConfidence(data.danceability))
+        && (!('musical_key' in data) || isValidString(data.musical_key, 1, 32))
+        && (!('camelot_key' in data) || isValidCamelot(data.camelot_key))
+        && (!('beat_grid_json' in data) || isValidString(data.beat_grid_json, 2, 65536))
+        && (!('phrase_markers_json' in data) || isValidString(data.phrase_markers_json, 2, 65536))
+        && (!('processing_status' in data) || isValidStatus(data.processing_status))
+        && (!('genre_tags' in data) || (data.genre_tags is list && data.genre_tags.size() <= 20))
+        && (!('mood_tags' in data) || (data.mood_tags is list && data.mood_tags.size() <= 20))
+        && (!('source_urls' in data) || (data.source_urls is list && data.source_urls.size() <= 10))
+        && (!('provenance' in data) || isValidString(data.provenance, 1, 64))
+        && (!('analysis_version' in data) || isValidInt(data.analysis_version, 1, 100))
+        && (!('analysis_confidence' in data) || isValidConfidence(data.analysis_confidence));
+    }
+
+    // Overwrite protection: prevents overwriting high-confidence analyzed records with lower quality or unanalyzed data
+    function isAllowedUpdate(existing, incoming) {
+      return incoming.canonical_fingerprint == existing.canonical_fingerprint
+        && incoming.title == existing.title
+        && incoming.artist == existing.artist
+        // Cannot downgrade an analyzed document
+        && !(existing.processing_status == 'analyzed' && incoming.processing_status != 'analyzed')
+        // If already analyzed, incoming must have equal or higher version, and not lower confidence
+        && (
+          existing.processing_status != 'analyzed'
+          || incoming.analysis_version > existing.analysis_version
+          || (
+            incoming.analysis_version == existing.analysis_version
+            && incoming.analysis_confidence >= existing.analysis_confidence
+          )
+        );
+    }
+
     // Global Shared Song Metadata Catalogue
     // Strict metadata-only repository. Audio binaries and raw audio streams are strictly forbidden.
     match /catalogue/{documentId} {
       
       // Anyone with valid Firebase Authentication (including anonymous auth) can read metadata
-      allow read: if request.auth != null;
+      allow read: if isAuthenticated();
 
-      // Authenticated DHUN installations can publish or update verified song metadata
-      // Validates data structure and prevents document tampering or arbitrary data injection
-      allow create, update: if request.auth != null
-        && request.resource.data.title is string
-        && request.resource.data.title.size() > 0
-        && request.resource.data.artist is string
-        && request.resource.data.canonical_fingerprint is string
-        && request.resource.data.canonical_fingerprint.size() > 0
-        && (!('duration_ms' in request.resource.data) || request.resource.data.duration_ms is int)
-        && (!('original_bpm' in request.resource.data) || request.resource.data.original_bpm is number)
-        && (!('camelot_key' in request.resource.data) || request.resource.data.camelot_key is string)
-        && (!('bpm_confidence' in request.resource.data) || request.resource.data.bpm_confidence is number);
+      // Document ID naming format: fp_{fingerprint}, rec_{recording_fp}, or vid_{video_id}
+      // Prevents arbitrary document path injection or collision
+      allow create: if isAuthenticated()
+        && documentId.matches('^(fp|rec|vid)_[a-zA-Z0-9_.-]+$')
+        && isValidCatalogueData(request.resource.data);
+
+      allow update: if isAuthenticated()
+        && documentId.matches('^(fp|rec|vid)_[a-zA-Z0-9_.-]+$')
+        && isValidCatalogueData(request.resource.data)
+        && isAllowedUpdate(resource.data, request.resource.data);
 
       // Deletion is strictly prohibited to prevent catalogue loss or vandalism
       allow delete: if false;

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::analysis::analyze_track_file;
@@ -11,8 +11,8 @@ use crate::library::cache::{RollingCacheManager, CACHE_PRIORITY_UPCOMING, DEFAUL
 use crate::library::downloader::AudioDownloader;
 use crate::library::youtube::{fetch_youtube_metadata, parse_youtube_url, ParsedYouTubeUrl};
 use crate::metadata_service::{
-    compute_canonical_fingerprint, extract_version_tag, CatalogueLookupRequest,
-    CatalogueUpsertRequest,
+    compute_canonical_fingerprint, compute_recording_fingerprint, extract_version_tag,
+    CatalogueLookupRequest, CatalogueUpsertRequest,
 };
 use crate::sync::MetadataSyncManager;
 
@@ -117,9 +117,9 @@ pub async fn stage_2_lookup_existing_metadata(
     // 2c. Official public YouTube oEmbed metadata fallback (title, creator, thumbnail only)
     let oembed = fetch_youtube_metadata(parsed, http_client).await;
     let version_tag = extract_version_tag(&oembed.title);
-    let fp = compute_canonical_fingerprint(&oembed.title, &oembed.artist, &version_tag, 0);
+    let fp = compute_recording_fingerprint(&oembed.title, &oembed.artist, &version_tag);
 
-    // 2d. Secondary catalogue lookup by canonical fingerprint (matches same song across alternate video uploads)
+    // 2d. Secondary catalogue lookup by canonical recording fingerprint (matches same song across alternate video uploads)
     let fp_lookup_req = CatalogueLookupRequest {
         source_url: Some(parsed.canonical_url.clone()),
         provider_video_id: Some(parsed.video_id.clone()),
@@ -128,17 +128,29 @@ pub async fn stage_2_lookup_existing_metadata(
         version_tag: Some(version_tag.clone()),
         duration_ms: None,
     };
-    if let Ok(Some(cloud_hit)) = sync_mgr.lookup_global_song_metadata(&fp_lookup_req).await {
-        // Persist locally so subsequent lookups work offline
-        let _ = db.upsert_global_song_metadata(
-            &cloud_hit,
-            Some((
-                &parsed.canonical_url,
-                parsed.provider.as_str(),
-                &parsed.video_id,
-            )),
-        );
-        return (cloud_hit, "global_catalogue".to_string());
+    match sync_mgr.lookup_global_song_metadata(&fp_lookup_req).await {
+        Ok(Some(cloud_hit)) => {
+            info!(
+                "Catalogue HIT for '{} - {}' via recording identity (cross-upload match). Skipping local DSP!",
+                cloud_hit.title, cloud_hit.artist
+            );
+            // Persist locally so subsequent lookups work offline
+            let _ = db.upsert_global_song_metadata(
+                &cloud_hit,
+                Some((
+                    &parsed.canonical_url,
+                    parsed.provider.as_str(),
+                    &parsed.video_id,
+                )),
+            );
+            return (cloud_hit, "global_catalogue".to_string());
+        }
+        Ok(None) => {
+            debug!("Catalogue MISS for '{}' by '{}' (song not in shared catalogue)", oembed.title, oembed.artist);
+        }
+        Err(e) => {
+            warn!("Shared catalogue lookup error (auth/network/quota: {}); falling back to local analysis", e);
+        }
     }
 
     let now = chrono::Utc::now().timestamp_millis();

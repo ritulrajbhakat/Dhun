@@ -57,7 +57,50 @@ pub fn extract_version_tag(title: &str) -> String {
 
 /// Normalizes title/artist strings by stripping upload noise (official video, 4k, lyrical, etc.)
 /// while keeping substantive recording identity intact.
+pub fn normalize_recording_tokens(title: &str, artist: &str) -> String {
+    let mut combined = format!("{} {}", title, artist).to_lowercase();
+    for noise in [
+        "official music video",
+        "official video",
+        "official audio",
+        "audio video",
+        "full video song",
+        "full video",
+        "full song",
+        "lyrical video",
+        "lyrics video",
+        "with lyrics",
+        "4k video",
+        "hd video",
+        "(official)",
+        "[official]",
+        "(audio)",
+        "[audio]",
+        "audio",
+        "video",
+        "vevo",
+    ] {
+        combined = combined.replace(noise, " ");
+    }
+
+    let mut tokens: Vec<String> = combined
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+
+    tokens.sort();
+    tokens.dedup();
+    tokens.join(" ")
+}
+
 fn normalize_text_core(input: &str) -> String {
+    normalize_recording_tokens(input, "")
+}
+
+fn _unused_old_norm(input: &str) -> String {
     let mut s = input.to_lowercase();
     for noise in [
         "official music video",
@@ -92,23 +135,31 @@ pub fn compute_canonical_fingerprint(
     version_tag: &str,
     duration_ms: i64,
 ) -> String {
-    let norm_title = normalize_text_core(title);
-    let norm_artist = normalize_text_core(artist);
+    let tokens = normalize_recording_tokens(title, artist);
     let duration_bucket = if duration_ms > 0 {
         (duration_ms / 8000).to_string()
     } else {
         "unk".to_string()
     };
     let canonical = format!(
-        "{}|{}|{}|{}",
-        norm_title,
-        norm_artist,
+        "{}|{}|{}",
+        tokens,
         version_tag.trim().to_lowercase(),
         duration_bucket
     );
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Computes the duration-independent recording fingerprint (identifies composition, performer, and version).
+/// This enables cross-upload song matching across different YouTube uploads of the same recording before audio is downloaded.
+pub fn compute_recording_fingerprint(
+    title: &str,
+    artist: &str,
+    version_tag: &str,
+) -> String {
+    compute_canonical_fingerprint(title, artist, version_tag, 0)
 }
 
 #[derive(Clone)]

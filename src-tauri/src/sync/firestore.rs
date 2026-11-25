@@ -7,7 +7,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::db::models::GlobalSongMetadata;
-use crate::metadata_service::{compute_canonical_fingerprint, CatalogueUpsertRequest};
+use crate::metadata_service::{
+    compute_canonical_fingerprint, compute_recording_fingerprint, CatalogueUpsertRequest,
+};
 
 /// Firestore configuration holding public Firebase project identifiers.
 /// No private administrative service account credentials or private keys are ever stored or distributed.
@@ -206,18 +208,25 @@ impl FirestoreClient {
             Ok(r) => r,
             Err(e) => {
                 debug!("Firestore GET {} notice: {}", url, e);
-                return Ok(None);
+                return Err(anyhow!("Firestore network error connecting to {url}: {e}"));
             }
         };
 
         if resp.status().as_u16() == 404 {
+            // True cache miss: document does not exist in Firestore
             return Ok(None);
         }
 
         if !resp.status().is_success() {
             let status = resp.status();
-            debug!("Firestore GET returned non-success status: {}", status);
-            return Ok(None);
+            let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 403 || status.as_u16() == 401 {
+                return Err(anyhow!("Firestore permission/auth error ({status}): {body}"));
+            } else if status.as_u16() == 429 {
+                return Err(anyhow!("Firestore Spark quota exceeded (429): {body}"));
+            } else {
+                return Err(anyhow!("Firestore GET returned error status ({status}): {body}"));
+            }
         }
 
         let doc: serde_json::Value = resp.json().await?;
@@ -251,7 +260,13 @@ impl FirestoreClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Firestore PATCH failed ({status}): {body}"));
+            if status.as_u16() == 403 || status.as_u16() == 401 {
+                return Err(anyhow!("Firestore permission/auth error ({status}): {body}"));
+            } else if status.as_u16() == 429 {
+                return Err(anyhow!("Firestore Spark quota exceeded (429): {body}"));
+            } else {
+                return Err(anyhow!("Firestore PATCH failed ({status}): {body}"));
+            }
         }
 
         Ok(())
@@ -260,23 +275,47 @@ impl FirestoreClient {
     /// Queries the Firestore catalogue collection by canonical fingerprint.
     pub async fn lookup_by_fingerprint(&self, fp: &str) -> Result<Option<GlobalSongMetadata>> {
         let doc_id = format!("fp_{}", fp);
-        if let Ok(Some(doc)) = self.get_document("catalogue", &doc_id).await {
-            if let Some(meta) = from_firestore_document(&doc) {
-                return Ok(Some(meta));
+        match self.get_document("catalogue", &doc_id).await? {
+            Some(doc) => {
+                if let Some(meta) = from_firestore_document(&doc) {
+                    Ok(Some(meta))
+                } else {
+                    Err(anyhow!("Corrupted document in Firestore: catalogue/{}", doc_id))
+                }
             }
+            None => Ok(None),
         }
-        Ok(None)
+    }
+
+    /// Queries the Firestore catalogue collection by recording identity (duration-independent).
+    /// Used for cross-upload song matching across different YouTube uploads of the same song.
+    pub async fn lookup_by_recording_id(&self, rec_fp: &str) -> Result<Option<GlobalSongMetadata>> {
+        let doc_id = format!("rec_{}", rec_fp);
+        match self.get_document("catalogue", &doc_id).await? {
+            Some(doc) => {
+                if let Some(meta) = from_firestore_document(&doc) {
+                    Ok(Some(meta))
+                } else {
+                    Err(anyhow!("Corrupted document in Firestore: catalogue/{}", doc_id))
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     /// Queries the Firestore catalogue collection by provider video ID alias.
     pub async fn lookup_by_video_id(&self, video_id: &str) -> Result<Option<GlobalSongMetadata>> {
         let doc_id = format!("vid_{}", video_id);
-        if let Ok(Some(doc)) = self.get_document("catalogue", &doc_id).await {
-            if let Some(meta) = from_firestore_document(&doc) {
-                return Ok(Some(meta));
+        match self.get_document("catalogue", &doc_id).await? {
+            Some(doc) => {
+                if let Some(meta) = from_firestore_document(&doc) {
+                    Ok(Some(meta))
+                } else {
+                    Err(anyhow!("Corrupted document in Firestore: catalogue/{}", doc_id))
+                }
             }
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     /// Publishes song metadata to Firestore under its canonical fingerprint and video ID alias.
@@ -294,7 +333,7 @@ impl FirestoreClient {
 
         let doc_value = to_firestore_document(payload, &fp, video_id);
 
-        // 1. Primary document indexed by canonical recording fingerprint
+        // 1. Primary document indexed by canonical recording fingerprint (exact duration bucket)
         let primary_id = format!("fp_{}", fp);
         self.patch_document("catalogue", &primary_id, doc_value.clone())
             .await?;
@@ -304,12 +343,22 @@ impl FirestoreClient {
         if let Some(vid) = video_id {
             if !vid.trim().is_empty() {
                 let alias_id = format!("vid_{}", vid.trim());
-                if let Err(e) = self.patch_document("catalogue", &alias_id, doc_value).await {
+                if let Err(e) = self.patch_document("catalogue", &alias_id, doc_value.clone()).await {
                     debug!("Notice: video ID alias write returned: {}", e);
                 } else {
                     info!("Published provider video ID alias: catalogue/{}", alias_id);
                 }
             }
+        }
+
+        // 3. Duration-independent recording identity index
+        // Enables cross-upload matching for any other DHUN installation adding a different video of the same song
+        let rec_fp = compute_recording_fingerprint(&payload.title, &payload.artist, &vtag);
+        let rec_id = format!("rec_{}", rec_fp);
+        if let Err(e) = self.patch_document("catalogue", &rec_id, doc_value).await {
+            debug!("Notice: recording identity index write returned: {}", e);
+        } else {
+            info!("Published recording identity alias: catalogue/{}", rec_id);
         }
 
         Ok(())
