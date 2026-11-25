@@ -84,6 +84,14 @@ pub struct EqBassHandoverSchedule {
     pub outgoing_low_cut_at_frac: f64,
     pub mid_carve_db: f64,
     pub high_handover_frac: f64,
+    #[serde(default)]
+    pub lookahead_vocal_ducking_sec: Option<f64>,
+    #[serde(default)]
+    pub lookahead_vocal_ducking_db: Option<f64>,
+    #[serde(default)]
+    pub filter_resonance_q: Option<f64>,
+    #[serde(default)]
+    pub tension_fill_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -676,6 +684,10 @@ pub fn plan_dj_transition(
                 outgoing_low_cut_at_frac: 0.5,
                 mid_carve_db: 0.0,
                 high_handover_frac: 0.5,
+                lookahead_vocal_ducking_sec: None,
+                lookahead_vocal_ducking_db: None,
+                filter_resonance_q: None,
+                tension_fill_type: None,
             },
             selected_technique: "safe_quick_cut".to_string(),
             scheduled_execution_sec: outgoing.current_pos_sec,
@@ -1042,7 +1054,20 @@ pub fn plan_dj_transition(
             technique: "timed_bass_swap".to_string(),
             reason: "Rejected: requires beat-locked tempo match.".to_string(),
         });
-        if party.dj_level >= DjLevel::Level4CreativeTools && genres_conflict && !recent_used("backspin_cut") {
+        let bpm_delta_ratio = match (outgoing.bpm, incoming.bpm) {
+            (Some(a), Some(b)) if a > 0.0 && b > 0.0 => (a - b).abs() / a.max(b),
+            _ => 1.0,
+        };
+        let is_disparate_tempo = bpm_delta_ratio > 0.08;
+
+        if is_disparate_tempo {
+            rejected_alternatives.push(RejectedTechniqueAlternative {
+                technique: "eq3_handover".to_string(),
+                reason: "Rejected: multi-bar EQ blend on disparate tempos (>8% delta) produces rhythmic clash / trainwreck.".to_string(),
+            });
+        }
+
+        if party.dj_level >= DjLevel::Level4CreativeTools && (genres_conflict || is_disparate_tempo) && !recent_used("backspin_cut") {
             reasons.push("Level 4 dramatic genre/tempo shift without forced pitch stretch: vinyl backspin cut.".to_string());
             "backspin_cut".to_string()
         } else if party.dj_level >= DjLevel::Level3AdvancedPerformance && !mood_rhythm.is_percussion_heavy_dhol {
@@ -1056,13 +1081,14 @@ pub fn plan_dj_transition(
             reasons.push("Level 2 filter sweep drop resolves cleanly into incoming track without tempo clash.".to_string());
             "filter_sweep_drop".to_string()
         } else if (party.dj_level == DjLevel::Level1TwoDeckMixer || party.dj_level == DjLevel::Level2SmartMixing)
+            && !is_disparate_tempo
             && beatgrid_confidence >= 0.50
             && (remaining_sec >= 6.0 || out_section_type == "outro" || in_section_type == "intro")
         {
             reasons.push("Phrase-aligned 2-deck EQ handover selected to transition cleanly between unbeatmatched / differing meter tracks.".to_string());
             "eq3_handover".to_string()
         } else {
-            reasons.push("Safe clean quick cut preserves rhythmic integrity when remaining time is short or beatgrid is unreliable.".to_string());
+            reasons.push("Safe clean quick cut preserves rhythmic integrity when remaining time is short, tempos are disparate (>8%), or beatgrid is unreliable.".to_string());
             "safe_quick_cut".to_string()
         }
     } else if bpm_decision.relationship == BpmRelationship::GradualTempoRamp {
@@ -1199,7 +1225,7 @@ pub fn plan_dj_transition(
         "backspin_cut" => 4,
         "stutter_gate_drop" | "beat_roll_buildup" | "echo_freeze_drop" => 8,
         "echo_out_blend" => {
-            if vocal_clash || mood_rhythm.prefer_short_clean_mix { 8 } else { 16 }
+            if vocal_clash || mood_rhythm.prefer_short_clean_mix || key_compat < 0.65 || !meter_compatible { 8 } else { 16 }
         }
         "eq3_handover" | "timed_bass_swap" | "filter_sweep_drop" | "filtered_buildup_drop" | "tempo_ramp_bridge" => {
             if mood_rhythm.is_cocktail_lounge {
@@ -1289,8 +1315,8 @@ pub fn plan_dj_transition(
         }
     }
 
-    // 7. EQ & Bass Handover Schedule tailored to vocal policy, timbre, and technique
-    let mid_carve: f64 = if vocal_clash || vocal_handover_type == "competing_lead_vocals" || vocal_handover_type == "rap_to_melodic" || outgoing.is_acoustic_ballad {
+    // 7. EQ & Bass Handover Schedule tailored to vocal policy, timbre, harmonic compatibility, and technique
+    let mut mid_carve: f64 = if vocal_clash || vocal_handover_type == "competing_lead_vocals" || vocal_handover_type == "rap_to_melodic" || outgoing.is_acoustic_ballad {
         -12.0
     } else if vocal_handover_type == "clean_instrumental" {
         -3.0
@@ -1300,25 +1326,71 @@ pub fn plan_dj_transition(
         -4.0
     };
 
+    // Domain-Agnostic Harmonic Intelligence: Deepen carve when key compatibility is low (e.g. tritone clash)
+    if key_compat < 0.40 {
+        mid_carve = mid_carve.min(-16.0);
+    } else if key_compat < 0.60 {
+        mid_carve = mid_carve.min(-12.0);
+    }
+
     let bass_swap_frac = match selected_technique.as_str() {
         "filter_sweep_drop" | "filtered_buildup_drop" | "beat_roll_buildup" | "stutter_gate_drop" => 0.86,
         "echo_freeze_drop" => 0.56,
         _ => if incoming.is_percussion_heavy { 0.48 } else { 0.50 },
     };
 
-    // Phase-Cancellation & Bass Mud Guardrail for Extended Blends (>= 32 beats)
+    // Phase-Cancellation & Bass Mud Guardrail for Extended Blends (>= 32 beats) and Dissonant Keys
     let (inc_low_cut_frac, out_low_cut_frac, final_mid_carve) = if duration_beats >= 32 {
         // Enforce strict non-overlapping sub-bass: incoming bass stays filtered until swap,
         // and outgoing cuts at or slightly before swap, with minimum -6 dB mid carve
-        (0.50, 0.48, mid_carve.min(-6.0))
+        (0.50, if key_compat < 0.50 { 0.38 } else { 0.48 }, mid_carve.min(-6.0))
     } else if selected_technique == "safe_quick_cut" {
         (0.0, 0.50, mid_carve)
     } else {
         (
             if incoming.is_percussion_heavy { 0.44 } else { 0.48 },
-            if vocal_clash { 0.40 } else if incoming.is_electronic_dance { 0.46 } else { 0.50 },
+            if key_compat < 0.50 { 0.35 } else if vocal_clash { 0.40 } else if incoming.is_electronic_dance { 0.46 } else { 0.50 },
             mid_carve,
         )
+    };
+
+    // Domain-Agnostic Vocal Safety: Lead-in / Anacrusis Pickup Protection
+    let (lookahead_vocal_ducking_sec, lookahead_vocal_ducking_db) = if in_has_vocal || in_section_type == "intro" || in_first_hook_sec > 0.0 {
+        let duck_sec = if vocal_clash || is_rap_melodic {
+            (beat_sec * 1.5).clamp(0.60, 1.20)
+        } else {
+            (beat_sec * 1.0).clamp(0.45, 0.90)
+        };
+        let duck_db = if vocal_clash || is_rap_melodic {
+            -6.0
+        } else {
+            -4.5
+        };
+        (Some(duck_sec), Some(duck_db))
+    } else {
+        (None, None)
+    };
+
+    let filter_resonance_q = if selected_technique == "filter_sweep_drop" || selected_technique == "filtered_buildup_drop" {
+        Some(1.414)
+    } else {
+        Some(0.707)
+    };
+
+    let tension_fill_type = if selected_technique == "safe_quick_cut" || selected_technique == "backspin_cut" || musical_purpose == "build_excitement" {
+        if outgoing.is_acoustic_ballad && (incoming.is_electronic_dance || energy_delta >= 0.25) {
+            Some("filtered_riser_and_sub_impact".to_string())
+        } else if mood_rhythm.is_punjabi_tashan || mood_rhythm.is_baraat_dhol_procession || mood_rhythm.is_shaadi_regal {
+            Some("dhol_roll".to_string())
+        } else if mood_rhythm.is_sangeet_choreography || mood_rhythm.is_haldi_folk {
+            Some("dholak_taan".to_string())
+        } else if mood_rhythm.is_house_party || mood_rhythm.is_cocktail_lounge {
+            Some("shaker_sweep".to_string())
+        } else {
+            Some("white_noise_riser".to_string())
+        }
+    } else {
+        None
     };
 
     let eq_bass_handover_schedule = EqBassHandoverSchedule {
@@ -1327,6 +1399,10 @@ pub fn plan_dj_transition(
         outgoing_low_cut_at_frac: out_low_cut_frac,
         mid_carve_db: final_mid_carve,
         high_handover_frac: if incoming.is_percussion_heavy { 0.28 } else { 0.35 },
+        lookahead_vocal_ducking_sec,
+        lookahead_vocal_ducking_db,
+        filter_resonance_q,
+        tension_fill_type,
     };
 
     reasons.push(format!(

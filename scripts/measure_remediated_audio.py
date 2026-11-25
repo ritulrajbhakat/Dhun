@@ -6,8 +6,9 @@ import struct
 import subprocess
 import json
 
-FFMPEG = r"c:\Users\ritul\.gemini\antigravity-ide\scratch\dhun\resolver-service\.venv\Scripts\ffmpeg.exe"
-RECORDINGS_DIR = r"C:\Users\ritul\.gemini\antigravity\brain\54150f37-588d-4187-8e67-1cb7efa91897\recordings"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FFMPEG = os.environ.get("FFMPEG_PATH", os.path.join(BASE_DIR, "resolver-service", ".venv", "Scripts", "ffmpeg.exe" if os.name == "nt" else "ffmpeg"))
+RECORDINGS_DIR = os.environ.get("DHUN_RECORDINGS_DIR", os.path.join(BASE_DIR, "recordings"))
 
 FILES = [
     "01_KalaChashma_to_LondonThumakda_L1_SafeQuickCut",

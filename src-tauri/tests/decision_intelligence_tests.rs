@@ -1621,12 +1621,12 @@ fn test_protocol_category_d_generalization_datasets() {
 
 #[test]
 fn test_protocol_category_e_stability_long_duration() {
-    // Dataset ID: DS_E_STABILITY_20261121_01
-    // Seed: 0x5EED_0005_E
-    // Continuous 5,000-point streaming simulation with drifting baseline
+    // Dataset ID: DS_E_STABILITY_20261121_02
+    // Seed: 0x5EED_0005_E002
+    // Continuous 5,000-point streaming simulation with drifting baseline and hard bounded-memory verification
     let config = KinematicFilterConfig {
         time_bandwidth_ms: 200.0,
-        max_history_duration_ms: 2000, // 2s lookback
+        max_history_duration_ms: 2000, // 2s lookback window
         ..Default::default()
     };
     let mut tracker = KinematicSignalTracker::new(config).unwrap();
@@ -1636,13 +1636,13 @@ fn test_protocol_category_e_stability_long_duration() {
         ..Default::default()
     }).unwrap();
 
-    let mut rng = LcgRng::new(0x5EED_0005_E);
+    let mut rng = LcgRng::new(0x5EED_0005_E002);
     let mut t_ms = 0i64;
     let mut baseline = 0.20;
 
-    for i in 0..2000 {
+    for i in 0..5000 {
         t_ms += 50;
-        if i % 500 == 0 {
+        if i % 1000 == 0 {
             baseline += 0.05; // slow baseline drift
         }
         let noise = 0.01 * rng.next_gaussian();
@@ -1654,7 +1654,321 @@ fn test_protocol_category_e_stability_long_duration() {
         assert!(m.magnitude.is_finite());
         assert!(m.velocity.is_finite());
         assert!(pt.theta_enter >= baseline - 0.05);
+
+        // Hard Bounded Memory Assertion:
+        // History buffer must strictly prune points older than 2000ms.
+        // At 50ms per step, maximum retained samples is 2000 / 50 + 2 = 42 samples.
+        let h_len = tracker.history_len();
+        assert!(
+            h_len <= 45,
+            "History memory leaked at step {}: length {} exceeds bound 45",
+            i,
+            h_len
+        );
     }
+}
+
+// =========================================================================
+// PHASE 1 VERIFICATION: TARGETED MATHEMATICAL & ENGINEERING SUITES
+// =========================================================================
+
+#[test]
+fn test_dispersion_filtering_lag_rejection() {
+    // Linear ramp with zero noise: LOWESS guarantees exact reproduction, so centered residual dispersion must be near 0
+    let config = KinematicFilterConfig {
+        time_bandwidth_ms: 200.0,
+        ..Default::default()
+    };
+    let points: Vec<KinematicPoint> = (0..50)
+        .map(|i| KinematicPoint::new(i * 100, 0.2 + 0.1 * (i as f64 / 10.0)))
+        .collect();
+
+    let metrics = analyze_kinematics(&points, &config).expect("Analysis failed");
+    for m in &metrics[5..metrics.len() - 5] {
+        assert!(
+            m.volatility < 1e-4,
+            "Linear ramp filtering lag incorrectly produced volatility at t={}: got {}",
+            m.timestamp_ms,
+            m.volatility
+        );
+    }
+}
+
+#[test]
+fn test_dispersion_smooth_curvature() {
+    // Pure quadratic curve: x(t) = 0.5 * a * t^2 with zero noise
+    let a_theo = 0.1;
+    let config = KinematicFilterConfig {
+        time_bandwidth_ms: 200.0,
+        ..Default::default()
+    };
+    let points: Vec<KinematicPoint> = (0..50)
+        .map(|i| {
+            let t = (i * 100) as f64 / 1000.0;
+            KinematicPoint::new(i * 100, 0.5 * a_theo * t * t)
+        })
+        .collect();
+
+    let metrics = analyze_kinematics(&points, &config).expect("Analysis failed");
+    // Residual dispersion reflects second-order curvature deviation from local line, but remains bounded
+    for m in &metrics[10..metrics.len() - 10] {
+        assert!(m.volatility < 0.01, "Curvature dispersion exceeded bound: got {}", m.volatility);
+    }
+}
+
+#[test]
+fn test_dispersion_genuine_observation_noise() {
+    // Constant signal with known additive Gaussian noise sigma = 0.05
+    let mut rng = LcgRng::new(0xBEEF_1234);
+    let true_sigma = 0.05;
+    let config = KinematicFilterConfig {
+        time_bandwidth_ms: 300.0,
+        ..Default::default()
+    };
+    let points: Vec<KinematicPoint> = (0..100)
+        .map(|i| KinematicPoint::new(i * 100, 0.50 + true_sigma * rng.next_gaussian()))
+        .collect();
+
+    let metrics = analyze_kinematics(&points, &config).expect("Analysis failed");
+    let mid = &metrics[30..70];
+    let avg_vol: f64 = mid.iter().map(|m| m.volatility).sum::<f64>() / mid.len() as f64;
+    let rel_err = (avg_vol - true_sigma).abs() / true_sigma;
+    assert!(
+        rel_err < 0.25,
+        "Measured residual dispersion {:.4} deviated by {:.1}% from true noise sigma {:.4}",
+        avg_vol,
+        rel_err * 100.0,
+        true_sigma
+    );
+}
+
+#[test]
+fn test_empirical_coverage_rate() {
+    // Generate 500 trials with true Gaussian noise. Check empirical coverage of the uncertainty interval.
+    let mut rng = LcgRng::new(0xC0DE_5678);
+    let u_config = UncertaintyConfig {
+        interval_multiplier_z: 1.96, // 95% nominal Gaussian coverage
+        ..Default::default()
+    };
+    let mut covered = 0;
+    let trials = 500;
+    let true_val = 0.75;
+    let noise_std = 0.04;
+
+    for _ in 0..trials {
+        let obs = true_val + noise_std * rng.next_gaussian();
+        let unc = quantify_uncertainty(obs, noise_std, 5, 0.0, &u_config);
+        if unc.contains(true_val) {
+            covered += 1;
+        }
+    }
+
+    let coverage_rate = covered as f64 / trials as f64;
+    assert!(
+        coverage_rate >= 0.90,
+        "Empirical coverage rate {:.2}% fell below 90% target",
+        coverage_rate * 100.0
+    );
+}
+
+#[test]
+fn test_uncertainty_input_validation() {
+    let u_config = UncertaintyConfig::default();
+    use dhun_lib::dj::intelligence::try_quantify_uncertainty;
+
+    // Reject NaN
+    assert!(try_quantify_uncertainty(f64::NAN, 0.01, 5, 0.0, &u_config).is_err());
+    // Reject Infinity
+    assert!(try_quantify_uncertainty(1.0, f64::INFINITY, 5, 0.0, &u_config).is_err());
+    // Reject negative duration
+    assert!(try_quantify_uncertainty(1.0, 0.01, 5, -1.0, &u_config).is_err());
+}
+
+#[test]
+fn test_prioritizer_criterion_order_permutation_invariance() {
+    let config = PrioritizerConfig::default();
+
+    let c_bpm = DecisionCriterion::soft("bpm", 0.9, 0.3, 0.05);
+    let c_key = DecisionCriterion::soft("key", 0.8, 0.3, 0.10);
+    let c_energy = DecisionCriterion::soft("energy", 0.7, 0.4, 0.15);
+
+    // Candidate A with order [bpm, key, energy]
+    let cand_a1 = ("cand_a", vec![c_bpm.clone(), c_key.clone(), c_energy.clone()]);
+    let cand_b1 = ("cand_b", vec![
+        DecisionCriterion::soft("bpm", 0.6, 0.3, 0.1),
+        DecisionCriterion::soft("key", 0.6, 0.3, 0.1),
+        DecisionCriterion::soft("energy", 0.6, 0.4, 0.1),
+    ]);
+
+    // Permuted order: Candidate A with [energy, bpm, key], Candidate B with [key, energy, bpm]
+    let cand_a2 = ("cand_a", vec![c_energy, c_bpm, c_key]);
+    let cand_b2 = ("cand_b", vec![
+        DecisionCriterion::soft("key", 0.6, 0.3, 0.1),
+        DecisionCriterion::soft("energy", 0.6, 0.4, 0.1),
+        DecisionCriterion::soft("bpm", 0.6, 0.3, 0.1),
+    ]);
+
+    let res1 = rank_candidates(vec![cand_a1, cand_b1], &config);
+    let res2 = rank_candidates(vec![cand_a2, cand_b2], &config);
+
+    assert_eq!(res1[0].payload, res2[0].payload);
+    assert!((res1[0].composite_score - res2[0].composite_score).abs() < 1e-6);
+    assert!((res1[0].robust_score - res2[0].robust_score).abs() < 1e-6);
+    assert_eq!(res1[0].pareto_rank, res2[0].pareto_rank);
+}
+
+#[test]
+fn test_prioritizer_detect_duplicate_and_missing_criteria() {
+    let config = PrioritizerConfig::default();
+
+    // Candidate with duplicate criteria name
+    let duplicate_cand = (
+        "dup_cand",
+        vec![
+            DecisionCriterion::soft("bpm", 0.9, 0.5, 0.05),
+            DecisionCriterion::soft("bpm", 0.8, 0.5, 0.05), // Duplicate name
+        ],
+    );
+    let res = rank_candidates(vec![duplicate_cand], &config);
+    assert!(!res[0].is_eligible, "Duplicate criteria must trigger disqualification");
+
+    // Candidate with missing criteria across candidates: Candidate A has [bpm, key], Candidate B has [bpm]
+    let cand_a = ("cand_a", vec![
+        DecisionCriterion::soft("bpm", 0.8, 0.5, 0.05),
+        DecisionCriterion::soft("key", 0.8, 0.5, 0.05),
+    ]);
+    let cand_b = ("cand_b", vec![
+        DecisionCriterion::soft("bpm", 0.8, 0.5, 0.05),
+        // missing "key"
+    ]);
+
+    let ranked = rank_candidates(vec![cand_a, cand_b], &config);
+    let evaluated_b = ranked.iter().find(|c| c.payload == "cand_b").unwrap();
+    // Candidate B should have received missing-criterion penalty for "key"
+    assert!(evaluated_b.criteria.iter().any(|c| c.name == "key" && c.score == 0.0 && c.uncertainty == 1.0));
+    assert!(ranked[0].payload == "cand_a", "Candidate A with complete criteria must outrank B with missing criteria");
+}
+
+#[test]
+fn test_pattern_scale_and_frequency_invariance() {
+    // Generate the same crescendo peak at:
+    // Scale 1.0, 100 Hz (10ms dt)
+    // Scale 100.0, 20 Hz (50ms dt)
+    // Scale 0.01, 10 Hz (100ms dt)
+    let total_duration_sec = 2.0;
+
+    let test_cases = vec![
+        (1.0, 10),    // 10ms
+        (100.0, 50),  // 50ms
+        (0.01, 100),  // 100ms
+    ];
+
+    for (scale, dt_ms) in test_cases {
+        let num_pts = (total_duration_sec * 1000.0 / dt_ms as f64) as usize;
+        let points: Vec<KinematicPoint> = (0..num_pts)
+            .map(|i| {
+                let t_ms = i as i64 * dt_ms;
+                let t_sec = t_ms as f64 / 1000.0;
+                // Crescendo: starts at 0, accelerates to crest at 1.5s, then begins descent
+                let val = scale * (1.0 - (t_sec - 1.5).powi(2) / 2.25).max(0.0);
+                KinematicPoint::new(t_ms, val)
+            })
+            .collect();
+
+        let config = KinematicFilterConfig {
+            time_bandwidth_ms: 200.0,
+            nominal_scale: scale,
+            ..Default::default()
+        };
+
+        let metrics = analyze_kinematics(&points, &config).expect("Analysis failed");
+        let archetype = classify_archetype(&metrics, 0.005 * scale);
+        assert_eq!(
+            archetype,
+            ProgressionArchetype::CrescendoPeak,
+            "Archetype must be CrescendoPeak for scale {} at dt {}ms, got {:?}",
+            scale,
+            dt_ms,
+            archetype
+        );
+    }
+}
+
+#[test]
+fn test_trajectory_projection_calculus_derivative() {
+    // Mathematical invariant: d(Delta_x)/dt == v(t) for all t >= 0 and gamma >= 0.
+    let m = KinematicMetrics {
+        timestamp_ms: 0,
+        raw_magnitude: 0.50,
+        magnitude: 0.50,
+        velocity: 0.08,
+        acceleration: -0.02,
+        direction: Direction::Ascending,
+        volatility: 0.01,
+        snr: 8.0,
+        quality_score: 0.9,
+    };
+    let u_config = UncertaintyConfig::default();
+    let unc = quantify_uncertainty(m.magnitude, m.volatility, 10, 0.0, &u_config);
+
+    let gammas = [0.0, 0.05, 0.2, 1.0, 5.0];
+    let horizons = [0.1, 0.5, 1.0, 2.5, 5.0];
+    let eps = 1e-5;
+
+    for &gamma in &gammas {
+        for &t in &horizons {
+            let proj_plus = project_trajectory(&m, ProgressionArchetype::MonotonicAscent, t + eps, gamma, &unc);
+            let proj_minus = project_trajectory(&m, ProgressionArchetype::MonotonicAscent, t - eps, gamma, &unc);
+            let proj_t = project_trajectory(&m, ProgressionArchetype::MonotonicAscent, t, gamma, &unc);
+
+            let numerical_derivative = (proj_plus.projected_value - proj_minus.projected_value) / (2.0 * eps);
+            let analytical_v = proj_t.projected_velocity;
+
+            let diff = (numerical_derivative - analytical_v).abs();
+            assert!(
+                diff < 1e-4,
+                "Calculus derivative failure at gamma={}, t={}: num_deriv {:.6} != analytical_v {:.6} (diff {:.2e})",
+                gamma,
+                t,
+                numerical_derivative,
+                analytical_v,
+                diff
+            );
+        }
+    }
+}
+
+#[test]
+fn test_trajectory_projection_zero_damping_and_limits() {
+    let m = KinematicMetrics {
+        timestamp_ms: 0,
+        raw_magnitude: 1.0,
+        magnitude: 1.0,
+        velocity: 0.10,
+        acceleration: 0.02,
+        direction: Direction::Ascending,
+        volatility: 0.01,
+        snr: 10.0,
+        quality_score: 0.9,
+    };
+    let u_config = UncertaintyConfig::default();
+    let unc = quantify_uncertainty(m.magnitude, m.volatility, 10, 0.0, &u_config);
+
+    // Case 1: Zero damping gamma = 0 -> exact classical kinematic: x(t) = x0 + v0*t + 0.5*a0*t^2
+    let t = 2.0;
+    let proj_undamped = project_trajectory(&m, ProgressionArchetype::MonotonicAscent, t, 0.0, &unc);
+    let expected_x = 1.0 + 0.10 * t + 0.5 * 0.02 * t * t;
+    let expected_v = 0.10 + 0.02 * t;
+    assert!((proj_undamped.projected_value - expected_x).abs() < 1e-5);
+    assert!((proj_undamped.projected_velocity - expected_v).abs() < 1e-5);
+
+    // Case 2: Long horizon with damping gamma = 1.0 -> velocity approaches 0, position converges
+    let proj_long = project_trajectory(&m, ProgressionArchetype::MonotonicAscent, 100.0, 1.0, &unc);
+    assert!(proj_long.projected_velocity < 1e-6, "Damped velocity must approach 0 at long horizons");
+    assert!(proj_long.lower_bound <= proj_long.projected_value);
+    assert!(proj_long.upper_bound >= proj_long.projected_value);
+    // Projection confidence must decay towards 0 at long horizons
+    assert!(proj_long.projection_confidence < 0.05);
 }
 
 #[test]

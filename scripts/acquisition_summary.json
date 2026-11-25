@@ -1,0 +1,142 @@
+[
+  {
+    "track": {
+      "id": "animals",
+      "title": "Animals (Original Mix)",
+      "artist": "Martin Garrix",
+      "url": "https://www.youtube.com/watch?v=DuFUtL8zUAk",
+      "expected_id": "DuFUtL8zUAk"
+    },
+    "video_id": "DuFUtL8zUAk",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\DuFUtL8zUAk.mp3",
+    "file_size": 7318700,
+    "duration": 305,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "titanium",
+      "title": "Titanium (feat. Sia)",
+      "artist": "David Guetta",
+      "url": "https://www.youtube.com/watch?v=JRfuAukYTKg",
+      "expected_id": "JRfuAukYTKg"
+    },
+    "video_id": "JRfuAukYTKg",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\JRfuAukYTKg.mp3",
+    "file_size": 5887340,
+    "duration": 245,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "dont_start_now",
+      "title": "Don't Start Now",
+      "artist": "Dua Lipa",
+      "url": "https://www.youtube.com/watch?v=oygrmJFKYZY",
+      "expected_id": "oygrmJFKYZY"
+    },
+    "video_id": "oygrmJFKYZY",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\oygrmJFKYZY.mp3",
+    "file_size": 4348268,
+    "duration": 181,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "ghungroo",
+      "title": "Ghungroo (From \"War\")",
+      "artist": "Vishal-Shekhar, Arijit Singh & Shilpa Rao",
+      "url": "https://youtu.be/qFkNATtc3mc",
+      "expected_id": "qFkNATtc3mc"
+    },
+    "video_id": "qFkNATtc3mc",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\qFkNATtc3mc.mp3",
+    "file_size": 3485420,
+    "duration": 145,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "zingaat",
+      "title": "Zingaat",
+      "artist": "Ajay-Atul",
+      "url": "https://youtu.be/Rd9wF5fAnVw",
+      "expected_id": "Rd9wF5fAnVw"
+    },
+    "video_id": "Rd9wF5fAnVw",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\Rd9wF5fAnVw.mp3",
+    "file_size": 4235948,
+    "duration": 176,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "malhari",
+      "title": "Malhari (From \"Bajirao Mastani\")",
+      "artist": "Vishal Dadlani",
+      "url": "https://www.youtube.com/watch?v=sRlA7JWTj04",
+      "expected_id": "sRlA7JWTj04"
+    },
+    "video_id": "sRlA7JWTj04",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\sRlA7JWTj04.mp3",
+    "file_size": 5858540,
+    "duration": 244,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "big_dawgs",
+      "title": "Big Dawgs",
+      "artist": "Hanumankind & Kalmi",
+      "url": "https://www.youtube.com/watch?v=hOHKltAiKXQ",
+      "expected_id": "hOHKltAiKXQ"
+    },
+    "video_id": "hOHKltAiKXQ",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\hOHKltAiKXQ.mp3",
+    "file_size": 5633324,
+    "duration": 235,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "blinding_lights",
+      "title": "Blinding Lights",
+      "artist": "The Weeknd",
+      "url": "https://www.youtube.com/watch?v=fHI8X4OXluQ",
+      "expected_id": "fHI8X4OXluQ"
+    },
+    "video_id": "fHI8X4OXluQ",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\fHI8X4OXluQ.mp3",
+    "file_size": 4878764,
+    "duration": 203,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "chaiyya_chaiyya",
+      "title": "Chaiyya Chaiyya (From \"Dil Se\")",
+      "artist": "Sukhwinder Singh & Sapna Awasthi",
+      "url": "https://www.youtube.com/watch?v=49oz7P9d8IA",
+      "expected_id": "49oz7P9d8IA"
+    },
+    "video_id": "49oz7P9d8IA",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\49oz7P9d8IA.mp3",
+    "file_size": 8913068,
+    "duration": 371,
+    "status": "success"
+  },
+  {
+    "track": {
+      "id": "perfect",
+      "title": "Perfect",
+      "artist": "Ed Sheeran",
+      "url": "https://www.youtube.com/watch?v=1UQzJfsT2eo",
+      "expected_id": "1UQzJfsT2eo"
+    },
+    "video_id": "1UQzJfsT2eo",
+    "file_path": "c:\\Users\\ritul\\.gemini\\antigravity-ide\\scratch\\dhun\\resolver-service\\cache\\1UQzJfsT2eo.mp3",
+    "file_size": 6313004,
+    "duration": 263,
+    "status": "success"
+  }
+]

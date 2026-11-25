@@ -56,20 +56,32 @@ impl TrackSelector {
             }
 
             // 1. Genre Score (0.0 to 1.0) with optional secondary mood blending (70% primary, 30% secondary)
-            let mut primary_genre_score = 0.4;
+            let mut primary_genre_score = 0.35;
             for (g, weight) in &mood.genre_weights {
                 if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
-                    primary_genre_score = *weight;
+                    primary_genre_score = if *weight >= 0.40 {
+                        1.0
+                    } else if *weight >= 0.25 {
+                        0.90
+                    } else {
+                        0.80
+                    };
                     break;
                 }
             }
 
             let genre_score = match secondary_mood {
                 Some(sec) => {
-                    let mut sec_genre_score = 0.4;
+                    let mut sec_genre_score = 0.35;
                     for (g, weight) in &sec.genre_weights {
                         if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
-                            sec_genre_score = *weight;
+                            sec_genre_score = if *weight >= 0.40 {
+                                1.0
+                            } else if *weight >= 0.25 {
+                                0.90
+                            } else {
+                                0.80
+                            };
                             break;
                         }
                     }
@@ -112,7 +124,15 @@ impl TrackSelector {
                 None => target_energy,
             };
             let energy_diff = (candidate.analysis.overall_energy - effective_target_energy).abs();
-            let energy_score = (1.0 - energy_diff).clamp(0.1, 1.0);
+            let energy_score = if energy_diff <= 0.08 {
+                1.0
+            } else if energy_diff <= 0.15 {
+                0.95
+            } else if energy_diff <= 0.22 {
+                0.85
+            } else {
+                (1.0 - energy_diff * 1.5).clamp(0.05, 0.75)
+            };
 
             // 5. Repetition Penalty
             let repetition_penalty = if was_track_played_recently {
@@ -123,19 +143,7 @@ impl TrackSelector {
                 0.0
             };
 
-            // 6. Guest Request Boost (STRICT: only applies if status is 'approved')
-            let matching_approved = approved_requests.iter().find(|r| r.track_id == candidate.track.id && r.status == "approved");
-            let request_boost = if let Some(req) = matching_approved {
-                if req.priority_order <= 1 {
-                    2.5
-                } else {
-                    1.5
-                }
-            } else {
-                0.0
-            };
-
-            // 7. Timbre & Texture clash prevention (prevents acoustic ballad vs high-energy EDM shock)
+            // 6. Timbre & Texture clash prevention (prevents acoustic ballad vs high-energy EDM shock)
             let mut timbre_penalty = 0.0;
             let mut contrast_bonus = 0.0;
             if let Some(curr) = currently_playing {
@@ -160,6 +168,22 @@ impl TrackSelector {
                     contrast_bonus = 0.08;
                 }
             }
+
+            // 7. Guest Request Boost (STRICT: only applies if status is 'approved' AND passes musical viability)
+            // Essential musical compatibility guardrail: approved requests cannot force severe timbre/tempo clashes.
+            let matching_approved = approved_requests.iter().find(|r| r.track_id == candidate.track.id && r.status == "approved");
+            let request_boost = if let Some(req) = matching_approved {
+                let is_extreme_clash = timbre_penalty > 0.0 || bpm_score < 0.35 || energy_score < 0.20;
+                if is_extreme_clash {
+                    0.0 // Request cannot overwhelm essential musical compatibility!
+                } else if req.priority_order <= 1 {
+                    2.5
+                } else {
+                    1.5
+                }
+            } else {
+                0.0
+            };
 
             // Deterministic Weighted Sum
             let total_score = (genre_score * 0.25)
@@ -254,19 +278,31 @@ impl TrackSelector {
 
             // Soft criteria:
             // A. Genre Compatibility
-            let mut primary_genre_score = 0.4;
+            let mut primary_genre_score = 0.10;
             for (g, weight) in &mood.genre_weights {
                 if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
-                    primary_genre_score = *weight;
+                    primary_genre_score = if *weight >= 0.40 {
+                        1.0
+                    } else if *weight >= 0.25 {
+                        0.90
+                    } else {
+                        0.80
+                    };
                     break;
                 }
             }
             let genre_score = match secondary_mood {
                 Some(sec) => {
-                    let mut sec_genre_score = 0.4;
+                    let mut sec_genre_score = 0.10;
                     for (g, weight) in &sec.genre_weights {
                         if candidate.track.genre.to_lowercase().contains(&g.to_lowercase()) {
-                            sec_genre_score = *weight;
+                            sec_genre_score = if *weight >= 0.40 {
+                                1.0
+                            } else if *weight >= 0.25 {
+                                0.90
+                            } else {
+                                0.80
+                            };
                             break;
                         }
                     }
@@ -325,10 +361,13 @@ impl TrackSelector {
             };
             criteria.push(crate::dj::intelligence::DecisionCriterion::soft("EnergyNarrative", energy_score, 0.25, energy_uncertainty));
 
-            // E. Request Priority
-            let is_requested = approved_requests.iter().any(|r| r.track_id == candidate.track.id);
-            if is_requested {
-                criteria.push(crate::dj::intelligence::DecisionCriterion::soft("GuestRequest", 1.0, 0.20, 0.0));
+            // E. Request Priority (standardized across candidates when party requests are active)
+            // Musical compatibility guardrail: approved request cannot cause extreme BPM/energy clash
+            if !approved_requests.is_empty() {
+                let is_requested = approved_requests.iter().any(|r| r.track_id == candidate.track.id && r.status == "approved");
+                let is_extreme_clash = bpm_score < 0.35 || energy_score < 0.20;
+                let request_score = if is_requested && !is_extreme_clash { 1.0 } else { 0.0 };
+                criteria.push(crate::dj::intelligence::DecisionCriterion::soft("GuestRequest", request_score, 0.20, 0.0));
             }
 
             candidate_inputs.push((candidate.clone(), criteria));
@@ -409,13 +448,19 @@ pub fn calculate_camelot_compatibility(key_a: &str, key_b: &str) -> f64 {
         return 0.90; // Relative major / minor swap (e.g. 8A to 8B)
     }
 
+    let diff = (num_a - num_b).abs();
     if letter_a == letter_b {
-        let diff = (num_a - num_b).abs();
         if diff == 1 || diff == 11 {
             return 0.90; // Adjacent key on wheel (+1 or -1 hour)
         }
         if diff == 2 || diff == 10 {
             return 0.75; // Energy jump (+2 hours)
+        }
+    } else {
+        // Diagonal modulation (+1 or -1 hour with mode swap, e.g. 8A -> 9B or 8A -> 7B)
+        // Represents modulation to dominant/subdominant of relative key
+        if diff == 1 || diff == 11 {
+            return 0.70; // Diagonal harmonic modulation
         }
     }
 

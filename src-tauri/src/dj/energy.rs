@@ -537,6 +537,7 @@ pub struct SetStoryteller {
     pub progression_machine: crate::dj::intelligence::ProgressionStateMachine,
     pub current_archetype: crate::dj::intelligence::ProgressionArchetype,
     pub last_kinematic_metrics: Option<crate::dj::intelligence::KinematicMetrics>,
+    pub total_elapsed_ms: i64,
 }
 
 impl SetStoryteller {
@@ -580,6 +581,7 @@ impl SetStoryteller {
             progression_machine,
             current_archetype: crate::dj::intelligence::ProgressionArchetype::QuiescentFlat,
             last_kinematic_metrics: None,
+            total_elapsed_ms: 0,
         }
     }
 
@@ -691,7 +693,7 @@ impl SetStoryteller {
             score -= 15.0;
         }
 
-        // Progression Intelligence enrichment:
+        // Progression Intelligence & Kinematic Trajectory enrichment:
         let progression_state = self.progression_machine.current_state();
         if progression_state == crate::dj::intelligence::ProgressionState::Building && cand_overall_energy >= target_energy - 0.05 {
             reasons.push(format!("Progression Intelligence: Sustains upward momentum ({:?})", progression_state));
@@ -704,21 +706,86 @@ impl SetStoryteller {
             score += 2.0;
         }
 
+        // Active Trajectory Projection Evaluation:
+        if let Some(m) = &self.last_kinematic_metrics {
+            let u_config = crate::dj::intelligence::UncertaintyConfig {
+                staleness_half_life_seconds: 300.0,
+                target_sample_count: 5,
+                nominal_scale: 1.0,
+                ..Default::default()
+            };
+            let unc = crate::dj::intelligence::quantify_uncertainty(m.magnitude, m.volatility, self.history_energies.len(), 0.0, &u_config);
+            let proj = crate::dj::intelligence::project_trajectory(m, self.current_archetype, 180.0, 0.1, &unc);
+
+            if (cand_overall_energy - proj.projected_value).abs() <= 0.10 {
+                reasons.push(format!(
+                    "Trajectory Projection: Candidate matches projected arc ({:?}, proj {:.2})",
+                    self.current_archetype, proj.projected_value
+                ));
+                score += 3.0;
+            } else if (cand_overall_energy - proj.projected_value).abs() > 0.25 {
+                penalties.push(format!(
+                    "Trajectory Clash: Deviates sharply from projected set trajectory ({:.2} vs proj {:.2})",
+                    cand_overall_energy, proj.projected_value
+                ));
+                score -= 4.0;
+            }
+        }
+
         (score.clamp(0.0, 30.0), reasons, penalties)
     }
 
     /// Records a track played into the storyteller set state, updating narrative counters.
     pub fn record_track_played(&mut self, energy: f64, is_hook_protected: bool, is_surprise: bool) {
+        self.record_track_played_with_duration(energy, is_hook_protected, is_surprise, None);
+    }
+
+    /// Records a track played with explicit or measured track duration.
+    pub fn record_track_played_with_duration(
+        &mut self,
+        energy: f64,
+        is_hook_protected: bool,
+        is_surprise: bool,
+        track_duration_ms: Option<i64>,
+    ) {
         let phase = self.current_phase();
         self.history_energies.push(energy);
         self.history_phases.push(phase);
         self.current_track_index += 1;
 
+        // Continuous-time tracking using actual track duration
+        let duration = track_duration_ms.unwrap_or(180_000).max(10_000);
+        self.total_elapsed_ms += duration;
+        let t_ms = self.total_elapsed_ms;
+
         // Feed energy observation into kinematics tracker and progression state machine
-        let t_ms = (self.current_track_index as i64) * 180_000;
         if let Ok(m) = self.kinematic_tracker.update(t_ms, energy) {
             self.progression_machine.update(&m);
             self.last_kinematic_metrics = Some(m);
+
+            // Update current_archetype dynamically from historical observations
+            let n = self.history_energies.len();
+            if n >= 3 {
+                let pts: Vec<crate::dj::intelligence::KinematicPoint> = self
+                    .history_energies
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &e)| {
+                        crate::dj::intelligence::KinematicPoint::new((idx as i64 + 1) * 180_000, e)
+                    })
+                    .collect();
+                if let Ok(recent_m) = crate::dj::intelligence::analyze_kinematics(
+                    &pts,
+                    &crate::dj::intelligence::KinematicFilterConfig {
+                        time_bandwidth_ms: 360_000.0,
+                        snr_timescale_seconds: 180.0,
+                        stationary_deadband: 0.0001,
+                        ..Default::default()
+                    },
+                ) {
+                    self.current_archetype = crate::dj::intelligence::classify_archetype(&recent_m, 0.0001);
+                }
+            }
         }
 
         if is_hook_protected {

@@ -113,12 +113,13 @@ pub fn classify_archetype(metrics: &[KinematicMetrics], stationary_deadband: f64
     }
     mean_val /= n as f64;
     let amplitude = max_val - min_val;
-    let signal_scale = max_val.abs().max(min_val.abs()).max(1.0);
+    let signal_scale = max_val.abs().max(min_val.abs()).max(1e-6);
     let relative_amplitude = amplitude / signal_scale;
+    let elapsed_duration_sec = ((metrics[n - 1].timestamp_ms - metrics[0].timestamp_ms) as f64 / 1000.0).max(0.0);
 
     // Check for quiescent flat vs stable plateau
     if relative_amplitude < 0.05 && stat_count >= n * 3 / 4 {
-        return if mean_val > 0.3 * signal_scale {
+        return if mean_val > 0.25 * signal_scale {
             ProgressionArchetype::Plateau
         } else {
             ProgressionArchetype::QuiescentFlat
@@ -130,8 +131,8 @@ pub fn classify_archetype(metrics: &[KinematicMetrics], stationary_deadband: f64
         return ProgressionArchetype::CyclicalOscillation;
     }
 
-    // Check for transient spike: rapid rise and fall within short sample span
-    if n <= 12 && zero_crossings == 1 && relative_amplitude > 0.20 {
+    // Check for transient spike: rapid rise and fall within continuous physical time (<= 1.5 seconds)
+    if elapsed_duration_sec <= 1.5 && zero_crossings == 1 && relative_amplitude > 0.20 {
         let peak_idx = metrics
             .iter()
             .enumerate()
@@ -172,46 +173,65 @@ pub fn classify_archetype(metrics: &[KinematicMetrics], stationary_deadband: f64
 }
 
 /// Projects the signal trajectory forward by a lookahead horizon using second-order kinematics with damping.
+///
+/// Velocity equation:
+///   v(t) = (v0 + a0 * t) * exp(-gamma * t)
+///
+/// Exact analytical displacement integral:
+///   Delta_x(t) = \int_0^t v(\tau) d\tau
+///   For gamma > 0:
+///     Delta_x(t) = v0 * (1 - exp(-gamma * t)) / gamma + a0 * (1 - exp(-gamma * t) * (1 + gamma * t)) / gamma^2
+///   For gamma -> 0 (or small gamma * t):
+///     Delta_x(t) = v0 * t + 0.5 * a0 * t^2
+///
+/// Guaranteed mathematical property: d(Delta_x)/dt == v(t) for all t >= 0, gamma >= 0.
 pub fn project_trajectory(
     current: &KinematicMetrics,
     archetype: ProgressionArchetype,
     horizon_seconds: f64,
-    damping_factor: f64, // e.g. 0.2 (velocity dampens towards 0 over time)
+    damping_factor: f64,
     uncertainty: &UncertaintyEstimate,
 ) -> TrajectoryProjection {
-    let dt = horizon_seconds.max(0.0);
-    let v0 = current.velocity;
-    let a0 = current.acceleration;
-    let x0 = current.magnitude;
+    let dt = if horizon_seconds.is_finite() { horizon_seconds.max(0.0) } else { 0.0 };
+    let gamma = if damping_factor.is_finite() { damping_factor.max(0.0) } else { 0.0 };
+    let v0 = if current.velocity.is_finite() { current.velocity } else { 0.0 };
+    let a0 = if current.acceleration.is_finite() { current.acceleration } else { 0.0 };
+    let x0 = if current.magnitude.is_finite() { current.magnitude } else { 0.0 };
 
-    // Damped velocity: v(t) = v0 * exp(-gamma * t) + a0 * t * exp(-gamma * t)
-    let damping_exp = (-damping_factor * dt).exp();
+    let gamma_t = gamma * dt;
+    let damping_exp = (-gamma_t).exp();
+
+    // Projected velocity: v(t) = (v0 + a0 * t) * exp(-gamma * t)
     let projected_v = (v0 + a0 * dt) * damping_exp;
 
-    // Integrated displacement under damped velocity:
-    // delta_x ~ v0 * (1 - exp(-gamma*t))/gamma + 0.5 * a0 * dt^2 * damping_exp
-    let delta_x = if damping_factor > 1e-4 {
-        v0 * (1.0 - damping_exp) / damping_factor + 0.5 * a0 * dt * dt * damping_exp
+    // Exact analytical displacement integral Delta_x(t)
+    let delta_x = if gamma_t < 1e-4 {
+        // High-precision Taylor expansion preventing catastrophic cancellation in 1/gamma^2
+        // v0 * t * (1 - 0.5 * gt + gt^2 / 6) + a0 * t^2 * (0.5 - gt / 3 + gt^2 / 8)
+        let v_term = v0 * dt * (1.0 - 0.5 * gamma_t + (gamma_t * gamma_t) / 6.0);
+        let a_term = a0 * dt * dt * (0.5 - gamma_t / 3.0 + (gamma_t * gamma_t) / 8.0);
+        v_term + a_term
     } else {
-        v0 * dt + 0.5 * a0 * dt * dt
+        let v_term = v0 * (1.0 - damping_exp) / gamma;
+        let a_term = a0 * (1.0 - damping_exp * (1.0 + gamma_t)) / (gamma * gamma);
+        v_term + a_term
     };
 
     let projected_value = (x0 + delta_x).max(0.0);
 
-    // Uncertainty expansion with time horizon:
-    // Uncertainty envelope expands as sigma_total * sqrt(1 + dt * expansion_rate)
+    // Uncertainty envelope expands monotonically with lookahead horizon
     let expansion = (1.0 + dt * 0.5).sqrt();
     let margin = uncertainty.aleatoric_std * 1.96 * expansion * (1.0 + 2.0 * uncertainty.epistemic_uncertainty);
 
     let lower_bound = (projected_value - margin).max(0.0);
     let upper_bound = projected_value + margin;
 
-    // Projection confidence decays with horizon:
+    // Projection confidence decays exponentially with horizon and epistemic uncertainty
     let confidence_decay = (-0.2 * dt).exp();
     let projection_confidence = ((1.0 - uncertainty.total_uncertainty) * confidence_decay).clamp(0.0, 1.0);
 
     TrajectoryProjection {
-        horizon_seconds,
+        horizon_seconds: dt,
         projected_value,
         lower_bound,
         upper_bound,

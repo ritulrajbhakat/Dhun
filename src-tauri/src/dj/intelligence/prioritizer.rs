@@ -94,13 +94,45 @@ pub fn rank_candidates<T: Clone>(
     candidates: Vec<(T, Vec<DecisionCriterion>)>,
     config: &PrioritizerConfig,
 ) -> Vec<EvaluatedCandidate<T>> {
+    use std::collections::{HashMap, HashSet};
+
+    // Step 0: Catalog all unique soft criteria names and representative weights
+    let mut universal_soft_criteria: HashMap<String, f64> = HashMap::new();
+    for (_, criteria) in &candidates {
+        for c in criteria {
+            if !c.is_hard_constraint {
+                universal_soft_criteria.entry(c.name.clone()).or_insert(c.weight);
+            }
+        }
+    }
+
     let mut evaluated: Vec<EvaluatedCandidate<T>> = candidates
         .into_iter()
-        .map(|(payload, criteria)| {
+        .map(|(payload, mut criteria)| {
             let mut is_eligible = true;
             let mut rationale = Vec::new();
 
-            // Step 1: Enforce hard constraints
+            // Step 1: Detect duplicate criteria within candidate
+            let mut seen_names = HashSet::new();
+            for c in &criteria {
+                if !seen_names.insert(c.name.clone()) {
+                    is_eligible = false;
+                    rationale.push(format!("DISQUALIFIED: Duplicate criterion '{}' detected", c.name));
+                }
+            }
+
+            // Step 2: Detect and harmonize missing criteria across candidates
+            for (crit_name, &default_w) in &universal_soft_criteria {
+                if !criteria.iter().any(|c| &c.name == crit_name) {
+                    rationale.push(format!(
+                        "PENALTY: Incompatible/missing criterion '{}' penalized with score 0.0 and uncertainty 1.0",
+                        crit_name
+                    ));
+                    criteria.push(DecisionCriterion::soft(crit_name, 0.0, default_w, 1.0));
+                }
+            }
+
+            // Step 3: Enforce hard constraints
             for c in &criteria {
                 if c.is_hard_constraint {
                     if let Some(min_th) = c.min_threshold {
@@ -115,7 +147,7 @@ pub fn rank_candidates<T: Clone>(
                 }
             }
 
-            // Step 2: Calculate composite score across soft criteria
+            // Step 4: Calculate composite score across soft criteria
             let soft_criteria: Vec<&DecisionCriterion> = criteria.iter().filter(|c| !c.is_hard_constraint).collect();
             let total_weight: f64 = soft_criteria.iter().map(|c| c.weight).sum();
 
@@ -127,7 +159,7 @@ pub fn rank_candidates<T: Clone>(
                 (0.0, 0.0)
             };
 
-            // Step 3: Compute robust score under uncertainty
+            // Step 5: Compute robust score under uncertainty
             let robust_score = (composite_score - config.risk_aversion_k * aggregate_uncertainty).clamp(0.0, 1.0);
 
             if is_eligible {
@@ -150,10 +182,10 @@ pub fn rank_candidates<T: Clone>(
         })
         .collect();
 
-    // Step 4: Compute Pareto Non-Domination Ranks among eligible candidates
+    // Step 6: Compute Pareto Non-Domination Ranks among eligible candidates
     compute_pareto_ranks(&mut evaluated);
 
-    // Step 5: Sort candidates:
+    // Step 7: Sort candidates:
     // 1. Eligible first (is_eligible = true)
     // 2. Pareto rank ascending (rank 0 is non-dominated frontier)
     // 3. Robust score descending
@@ -216,6 +248,13 @@ fn compute_pareto_ranks<T: Clone>(candidates: &mut [EvaluatedCandidate<T>]) {
 /// A dominates B if A is at least as good in all common criteria and uncertainty, and strictly better in at least one.
 /// Matches criteria by name to ensure robust ordering and subset invariance.
 fn dominates<T: Clone>(a: &EvaluatedCandidate<T>, b: &EvaluatedCandidate<T>) -> bool {
+    if !a.is_eligible {
+        return false;
+    }
+    if !b.is_eligible {
+        return true;
+    }
+
     let a_soft: Vec<&DecisionCriterion> = a.criteria.iter().filter(|c| !c.is_hard_constraint).collect();
     let b_soft: Vec<&DecisionCriterion> = b.criteria.iter().filter(|c| !c.is_hard_constraint).collect();
 

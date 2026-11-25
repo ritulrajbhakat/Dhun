@@ -5,10 +5,9 @@ import urllib.parse
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 PORT = 8888
-RECORDINGS_DIR = r"C:\Users\ritul\.gemini\antigravity\brain\54150f37-588d-4187-8e67-1cb7efa91897\recordings"
-os.makedirs(RECORDINGS_DIR, exist_ok=True)
-
 SCRATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RECORDINGS_DIR = os.environ.get("DHUN_RECORDINGS_DIR", os.path.join(SCRATCH_DIR, "recordings"))
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
 CACHE_DIR = os.path.join(SCRATCH_DIR, "resolver-service", "cache")
 
 class AudioEvalHandler(SimpleHTTPRequestHandler):

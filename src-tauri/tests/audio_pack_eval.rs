@@ -7,8 +7,18 @@ use dhun_lib::dj::levels::DjLevel;
 use serde_json::json;
 
 #[test]
+#[ignore = "Requires external audio pack assets in resolver-service/cache or DHUN_AUDIO_PACK_DIR"]
 fn test_audio_pack_real_track_analysis_and_transitions() {
-    let cache_dir = PathBuf::from(r"c:\Users\ritul\.gemini\antigravity-ide\scratch\dhun\resolver-service\cache");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let default_cache = manifest_dir
+        .parent()
+        .map(|p| p.join("resolver-service").join("cache"))
+        .unwrap_or_else(|| PathBuf::from("resolver-service/cache"));
+
+    let cache_dir = std::env::var("DHUN_AUDIO_PACK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(default_cache);
+
     let tracks_info = vec![
         ("track_01", "Kala Chashma", "Amar Arshi, Badshah, Neha Kakkar", "k4yXQkG2s1E.mp3", vec!["bollywood".to_string(), "dance".to_string()]),
         ("track_02", "London Thumakda", "Labh Janjua, Sonu Kakkar, Neha Kakkar", "udra3Mfw2oo.mp3", vec!["wedding".to_string(), "punjabi".to_string(), "dhol".to_string()]),
@@ -18,6 +28,20 @@ fn test_audio_pack_real_track_analysis_and_transitions() {
         ("track_06", "Dholi Taro Dhol Baaje", "Kavita Krishnamurthy, Vinod Rathod", "4a25J3p0kVI.mp3", vec!["dandiya".to_string(), "garba".to_string(), "traditional".to_string()]),
     ];
 
+    let missing_files: Vec<_> = tracks_info
+        .iter()
+        .filter(|(_, _, _, file_name, _)| !cache_dir.join(file_name).exists())
+        .map(|(_, _, _, file_name, _)| *file_name)
+        .collect();
+
+    if !missing_files.is_empty() {
+        eprintln!(
+            "SKIPPED: audio_pack_eval requires local audio assets in {:?}. Missing files: {:?}. Set DHUN_AUDIO_PACK_DIR to provide external assets.",
+            cache_dir, missing_files
+        );
+        return;
+    }
+
     println!("\n=======================================================");
     println!("DHUN REAL AUDIO ANALYSIS — BATCH 1 (6 TRACKS)");
     println!("=======================================================\n");
@@ -26,8 +50,6 @@ fn test_audio_pack_real_track_analysis_and_transitions() {
 
     for (id, title, artist, file_name, genres) in &tracks_info {
         let file_path = cache_dir.join(file_name);
-        assert!(file_path.exists(), "Audio file must exist: {:?}", file_path);
-
         println!("Analyzing: {} — {} (File: {})...", title, artist, file_name);
         let result = analyze_track_file(id, &file_path).expect("Track analysis failed");
 
@@ -229,7 +251,12 @@ fn test_audio_pack_real_track_analysis_and_transitions() {
         "transitions": transition_plans
     });
 
-    let out_report_path = PathBuf::from(r"C:\Users\ritul\.gemini\antigravity\brain\54150f37-588d-4187-8e67-1cb7efa91897\batch_1_dsp_analysis.json");
+    let out_report_path = std::env::var("DHUN_EVAL_OUT_DIR")
+        .map(|d| PathBuf::from(d).join("batch_1_dsp_analysis.json"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("batch_1_dsp_analysis.json"));
+    if let Some(parent) = out_report_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     std::fs::write(&out_report_path, serde_json::to_string_pretty(&report).unwrap()).expect("Failed to write analysis json");
     println!("\nWrote full DSP analysis report to: {:?}", out_report_path);
 }

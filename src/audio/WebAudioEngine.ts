@@ -1122,6 +1122,15 @@ export class FourDeckWebAudioEngine {
     // Track whether an echo tail lingers past `now + dur` so deck cleanup waits for clean decay
     let cleanupGraceSec = 0.2;
 
+    // Automated lookahead vocal ducking on outgoing deck to create space for incoming vocal hook
+    if (plan?.eq_bass_handover_schedule?.lookahead_vocal_ducking_sec) {
+      const duckSec = plan.eq_bass_handover_schedule.lookahead_vocal_ducking_sec;
+      const duckDb = plan.eq_bass_handover_schedule.lookahead_vocal_ducking_db ?? -2.0;
+      const duckStart = Math.max(now, now + dur - duckSec);
+      fromDeck.eqMid.gain.setValueAtTime(0, duckStart);
+      fromDeck.eqMid.gain.linearRampToValueAtTime(duckDb, now + dur);
+    }
+
     // =========================================================================
     // AUDIBLE TECHNIQUE LIBRARY (14 DISTINCT DSP SCHEDULES ACROSS LEVELS 1–4)
     // =========================================================================
@@ -1212,7 +1221,8 @@ export class FourDeckWebAudioEngine {
         // Level 2/3: resonant HPF tension sweep on outgoing -> full-bass drop on incoming
         const isExcitement = plan?.musical_purpose === 'build_excitement';
         const isBreathingRoom = plan?.musical_purpose === 'create_breathing_room';
-        const peakQ = technique === 'filtered_buildup_drop' ? 6.2 : isExcitement ? 4.8 : 3.2;
+        const baseQ = plan?.eq_bass_handover_schedule?.filter_resonance_q ?? 1.414;
+        const peakQ = technique === 'filtered_buildup_drop' ? 6.2 : isExcitement ? 4.8 : Math.max(3.2, baseQ * 2.5);
 
         if (isBreathingRoom) {
           // Low-pass warm softening into peaceful/calm incoming track

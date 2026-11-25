@@ -1,4 +1,6 @@
+import asyncio
 import os
+import random
 import sys
 
 # Automatically prepend the .venv\Scripts folder (where python, ffmpeg, and ffprobe live) 
@@ -13,6 +15,40 @@ from pydantic import BaseModel
 import yt_dlp
 
 app = FastAPI(title="DHUN Local Audio Resolver")
+
+@app.on_event("startup")
+async def start_parent_watchdog():
+    parent_pid_str = os.environ.get("DHUN_PARENT_PID")
+    if not parent_pid_str or not parent_pid_str.isdigit():
+        return
+    parent_pid = int(parent_pid_str)
+
+    def is_parent_alive():
+        if os.name == 'nt':
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, parent_pid)
+            if not handle:
+                return False
+            res = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return res == 0x00000102
+        else:
+            try:
+                os.kill(parent_pid, 0)
+                return True
+            except OSError:
+                return False
+
+    async def watchdog_loop():
+        while True:
+            await asyncio.sleep(1.0)
+            if not is_parent_alive():
+                print(f"[Watchdog] Parent DHUN process ({parent_pid}) terminated. Shutting down resolver.")
+                os._exit(0)
+
+    asyncio.create_task(watchdog_loop())
 
 # Create local cache directory for resolved MP3 files
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
@@ -31,6 +67,10 @@ class ResolveRequest(BaseModel):
 @app.post("/resolve")
 async def resolve_audio(req: ResolveRequest):
     try:
+        # Random 15–20 second non-blocking delay before hitting yt-dlp
+        delay = random.uniform(15, 20)
+        await asyncio.sleep(delay)
+
         # Extract video info first to get the clean video ID
         with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
             info = ydl.extract_info(req.source_url, download=False)

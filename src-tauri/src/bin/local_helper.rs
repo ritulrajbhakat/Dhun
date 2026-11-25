@@ -7,6 +7,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use dhun_lib::db::Database;
 use dhun_lib::library::resolver::{validate_loopback_resolver_url, AuthorizedResolverConfig};
+use dhun_lib::library::resolver_process::ResolverSupervisor;
 use dhun_lib::network::local_helper_routes::{
     create_local_helper_router, start_intake_queue_worker, LocalHelperState,
     DEFAULT_LOCAL_HELPER_PORT,
@@ -21,31 +22,45 @@ fn resolve_default_helper_data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            return PathBuf::from(local_app_data).join("DHUN").join("helper");
+            let p = PathBuf::from(local_app_data).join("DHUN").join("helper");
+            if fs::create_dir_all(&p).is_ok() {
+                return p;
+            }
         }
     }
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
+            let p = PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
                 .join("DHUN")
                 .join("helper");
+            if fs::create_dir_all(&p).is_ok() {
+                return p;
+            }
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
             if !xdg.trim().is_empty() {
-                return PathBuf::from(xdg).join("dhun").join("helper");
+                let p = PathBuf::from(xdg).join("dhun").join("helper");
+                if fs::create_dir_all(&p).is_ok() {
+                    return p;
+                }
             }
         }
         if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".local").join("share").join("dhun").join("helper");
+            let p = PathBuf::from(home).join(".local").join("share").join("dhun").join("helper");
+            if fs::create_dir_all(&p).is_ok() {
+                return p;
+            }
         }
     }
-    PathBuf::from(".").join("dhun_helper_data")
+    let fallback = PathBuf::from(".").join("dhun_helper_data");
+    let _ = fs::create_dir_all(&fallback);
+    fallback
 }
 
 /// DHUN Local Helper Service (`dhun-local-helper`)
@@ -147,13 +162,38 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
 
-    let audio_resolver = match resolver_url {
+    // Automatically supervise and start the Python audio resolver service if not explicitly disabled
+    let auto_resolver_disabled = std::env::var("DHUN_DISABLE_AUTO_RESOLVER")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let resolver_supervisor = if !auto_resolver_disabled && resolver_url.is_none() {
+        match ResolverSupervisor::start_default(&default_data_dir).await {
+            Ok(sup) => {
+                info!("Auto-started/verified Audio Resolver: {}", sup.endpoint_url());
+                Some(Arc::new(sup))
+            }
+            Err(e) => {
+                warn!("Audio Resolver auto-startup notice: {}. Continuing in offline/metadata mode.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // If resolver_url was not explicitly configured in environment, use the auto-supervised resolver
+    let auto_endpoint = resolver_supervisor.as_ref().map(|s| s.endpoint_url());
+    let effective_resolver_url = resolver_url.or(auto_endpoint);
+    let effective_allow_loopback = allow_loopback_resolver || resolver_supervisor.is_some();
+
+    let audio_resolver = match effective_resolver_url {
         Some(url) => {
             let is_loopback = validate_loopback_resolver_url(&url).is_ok();
             match AuthorizedResolverConfig::new_with_loopback(
                 url.clone(),
                 resolver_key,
-                allow_loopback_resolver || is_loopback,
+                effective_allow_loopback || is_loopback,
             ) {
                 Ok(cfg) => {
                     info!(
@@ -163,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(cfg)
                 }
                 Err(e) => {
-                    warn!("Ignored invalid DHUN_AUDIO_RESOLVER_URL '{}': {}", url, e);
+                    warn!("Ignored invalid audio resolver URL '{}': {}", url, e);
                     None
                 }
             }
@@ -220,6 +260,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    if let Some(ref sup) = resolver_supervisor {
+        sup.shutdown();
+    }
 
     info!("DHUN Local Helper stopped gracefully.");
     Ok(())

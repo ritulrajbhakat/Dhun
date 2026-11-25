@@ -7,7 +7,6 @@ node_modules/
 target/
 target-test/
 **/*.rs.bk
-Cargo.lock
 
 # Tauri build artifacts
 src-tauri/target/
@@ -17,6 +16,34 @@ src-tauri/target/
 *.db-shm
 *.db-wal
 *.log
+*.pid
+*.sqlite
+*.sqlite3
+
+# Audio files & renders (never commit large audio binaries)
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.wma
+
+# Local calibration archives & data folders (preserved locally, ignored by git)
+DHUN_CALIBRATION/
+backups/
+dhun_temp_cache/
+dhun_helper_data/
+dist-installer-win/
+dist-helper-*/
+
+# Python virtualenvs & cache
+**/__pycache__/
+**/*.py[cod]
+*$py.class
+**/.venv/
+**/venv/
+resolver-service/cache/
 
 # Environment & IDE
 .env
@@ -37,10 +64,4 @@ Thumbs.db
 [Dd]esktop.ini
 .DS_Store
 
-
-__pycache__/
-*.pyc
-.venv/
-
 dist/
-resolver-service/cache/

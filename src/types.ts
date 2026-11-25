@@ -221,6 +221,10 @@ export interface EqBassHandoverSchedule {
   outgoing_low_cut_at_frac: number;
   mid_carve_db: number;
   high_handover_frac: number;
+  lookahead_vocal_ducking_sec?: number | null;
+  lookahead_vocal_ducking_db?: number | null;
+  filter_resonance_q?: number | null;
+  tension_fill_type?: string | null;
 }
 
 export interface RejectedTechniqueAlternative {

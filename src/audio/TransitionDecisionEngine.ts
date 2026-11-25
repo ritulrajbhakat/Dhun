@@ -458,6 +458,10 @@ export function planDjTransition(
         outgoing_low_cut_at_frac: 0.5,
         mid_carve_db: 0,
         high_handover_frac: 0.5,
+        lookahead_vocal_ducking_sec: null,
+        lookahead_vocal_ducking_db: null,
+        filter_resonance_q: null,
+        tension_fill_type: null,
       },
       selected_technique: 'safe_quick_cut',
       scheduled_execution_sec: outgoing.currentPosSec,
@@ -746,18 +750,32 @@ export function planDjTransition(
       { technique: 'phrase_long_blend', reason: 'Rejected: no reliable beatmatch/meter alignment for multi-bar blend.' },
       { technique: 'timed_bass_swap', reason: 'Rejected: requires beat-locked tempo match.' }
     );
-    if (djLevel >= 4 && genresConflict && !recentUsed('backspin_cut')) {
+    const outBpm = outgoing.bpm ?? 120;
+    const inBpm = incoming.bpm ?? 120;
+    const bpmDeltaRatio = Math.abs(outBpm - inBpm) / Math.max(outBpm, inBpm, 1);
+    const isDisparateTempo = bpmDeltaRatio > 0.08;
+
+    if (isDisparateTempo) {
+      rejectedAlternatives.push({
+        technique: 'eq3_handover',
+        reason: 'Rejected: multi-bar EQ blend on disparate tempos (>8% delta) produces rhythmic clash / trainwreck.',
+      });
+    }
+
+    if (djLevel >= 4 && (genresConflict || isDisparateTempo) && !recentUsed('backspin_cut')) {
+      reasons.push('Level 4 dramatic genre/tempo shift without forced pitch stretch: vinyl backspin cut.');
       selectedTechnique = 'backspin_cut';
     } else if (djLevel >= 3 && !moodRhythm.isPercussionHeavyDhol) {
+      reasons.push('Beatmatch unavailable/unsuitable — Level 3+ beat-free echo-out tail into clean incoming drop.');
       selectedTechnique = 'echo_out_blend';
     } else if (djLevel === 2 && beatgridConfidence >= 0.50 && remainingSec >= 5.0 && !recentUsed('filter_sweep_drop')) {
       reasons.push('Level 2 filter sweep drop resolves cleanly into incoming track without tempo clash.');
       selectedTechnique = 'filter_sweep_drop';
-    } else if ((djLevel === 1 || djLevel === 2) && beatgridConfidence >= 0.50 && (remainingSec >= 6.0 || outSectionType === 'outro' || inSectionType === 'intro')) {
+    } else if ((djLevel === 1 || djLevel === 2) && !isDisparateTempo && beatgridConfidence >= 0.50 && (remainingSec >= 6.0 || outSectionType === 'outro' || inSectionType === 'intro')) {
       reasons.push('Phrase-aligned 2-deck EQ handover selected to transition cleanly between unbeatmatched / differing meter tracks.');
       selectedTechnique = 'eq3_handover';
     } else {
-      reasons.push('Safe clean quick cut preserves rhythmic integrity when remaining runway is short or beatgrid is unreliable.');
+      reasons.push('Safe clean quick cut preserves rhythmic integrity when remaining runway is short, tempos are disparate (>8%), or beatgrid is unreliable.');
       selectedTechnique = 'safe_quick_cut';
     }
   } else if (bpmDecision.relationship === 'gradual_tempo_ramp') {
@@ -848,7 +866,7 @@ export function planDjTransition(
   ) {
     rawBeats = 8;
   } else if (selectedTechnique === 'echo_out_blend') {
-    rawBeats = vocalClash || moodRhythm.preferShortCleanMix ? 8 : 16;
+    rawBeats = vocalClash || moodRhythm.preferShortCleanMix || keyCompat < 0.65 || !meterCompatible ? 8 : 16;
   } else if (
     selectedTechnique === 'eq3_handover' ||
     selectedTechnique === 'timed_bass_swap' ||
@@ -969,12 +987,38 @@ export function planDjTransition(
         midCarveDb,
       ];
 
+  const lookaheadVocalDuckingSec = (inHasVocal || inSectionType === 'intro' || inFirstHookSec > 0)
+    ? Math.max(0.40, Math.min(0.90, beatSec))
+    : null;
+  const lookaheadVocalDuckingDb = lookaheadVocalDuckingSec !== null ? -2.0 : null;
+
+  const filterResonanceQ = (selectedTechnique === 'filter_sweep_drop' || selectedTechnique === 'filtered_buildup_drop')
+    ? 1.414
+    : 0.707;
+
+  let tensionFillType: string | null = null;
+  if (selectedTechnique === 'safe_quick_cut' || selectedTechnique === 'backspin_cut' || musicalPurpose === 'build_excitement') {
+    if (moodRhythm.isPunjabiTashan || moodRhythm.isBaraatDholProcession || moodRhythm.isShaadiRegal) {
+      tensionFillType = 'dhol_roll';
+    } else if (moodRhythm.isSangeetChoreography || moodRhythm.isHaldiFolk) {
+      tensionFillType = 'dholak_taan';
+    } else if (moodRhythm.isHouseParty || moodRhythm.isCocktailLounge) {
+      tensionFillType = 'shaker_sweep';
+    } else {
+      tensionFillType = 'white_noise_riser';
+    }
+  }
+
   const eqBassHandoverSchedule: EqBassHandoverSchedule = {
     incoming_low_cut_until_frac: incLowCutFrac,
     bass_swap_at_frac: bassSwapFrac,
     outgoing_low_cut_at_frac: outLowCutFrac,
     mid_carve_db: finalMidCarveDb,
     high_handover_frac: incoming.isPercussionHeavy ? 0.28 : 0.35,
+    lookahead_vocal_ducking_sec: lookaheadVocalDuckingSec,
+    lookahead_vocal_ducking_db: lookaheadVocalDuckingDb,
+    filter_resonance_q: filterResonanceQ,
+    tension_fill_type: tensionFillType,
   };
 
   reasons.push(

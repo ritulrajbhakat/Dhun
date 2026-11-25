@@ -70,7 +70,9 @@ pub struct KinematicMetrics {
     pub acceleration: f64,
     /// Directional classification based on velocity and stationary deadband.
     pub direction: Direction,
-    /// Pure noise volatility: standard deviation of residuals (raw - smoothed).
+    /// Estimated residual dispersion (sample standard deviation of centered residuals: (raw - smoothed) - mean).
+    /// Note: This is an empirical estimate of observation variance around the smoothed trajectory,
+    /// capturing measurement noise, unmodeled higher-order curvature, and transient impulses.
     pub volatility: f64,
     /// Dimensionless Signal-to-Noise Ratio: (|v| * tau_scale) / (volatility + epsilon).
     pub snr: f64,
@@ -80,6 +82,12 @@ pub struct KinematicMetrics {
 }
 
 impl KinematicMetrics {
+    /// Alias for estimated residual dispersion around the smoothed signal.
+    #[inline]
+    pub fn residual_dispersion(&self) -> f64 {
+        self.volatility
+    }
+
     /// Backwards-compatible alias for quality_score.
     #[inline]
     pub fn confidence(&self) -> f64 {
@@ -304,6 +312,11 @@ impl KinematicSignalTracker {
     /// Get the last computed metrics, if any.
     pub fn last_metrics(&self) -> Option<KinematicMetrics> {
         self.last_metrics
+    }
+
+    /// Number of points currently retained in the lookback history window.
+    pub fn history_len(&self) -> usize {
+        self.raw_history.len()
     }
 }
 

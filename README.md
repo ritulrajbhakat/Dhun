@@ -165,7 +165,7 @@ dhun/
 
 ### 1. Install Frontend Dependencies
 ```powershell
-cd c:\Users\ritul\.gemini\antigravity-ide\scratch\dhun
+cd Dhun
 npm install
 ```
 
