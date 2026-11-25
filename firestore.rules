@@ -1,184 +1,323 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helper functions for hardened data validation and security
     function isAuthenticated() {
       return request.auth != null;
     }
 
-    function isValidString(val, minLen, maxLen) {
-      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    function isValidString(v, minLen, maxLen) {
+      return v is string
+        && v.size() >= minLen
+        && v.size() <= maxLen;
     }
 
-    function isValidNumber(val, minVal, maxVal) {
-      return val is number && val >= minVal && val <= maxVal;
+    function isValidNumber(v, minVal, maxVal) {
+      return v is number && v >= minVal && v <= maxVal;
     }
 
-    function isValidInt(val, minVal, maxVal) {
-      return val is int && val >= minVal && val <= maxVal;
+    function isValidInt(v, minVal, maxVal) {
+      return v is int && v >= minVal && v <= maxVal;
     }
 
-    function isValidBpm(bpm) {
-      return bpm is number && bpm >= 40.0 && bpm <= 260.0;
+    function isValidConfidence(v) {
+      return isValidNumber(v, 0.0, 1.0);
     }
 
-    function isValidConfidence(c) {
-      return c is number && c >= 0.0 && c <= 1.0;
+    function isValidBpm(v) {
+      return isValidNumber(v, 40.0, 260.0);
     }
 
-    // Strict Camelot validation: 1A-12A or 1B-12B only
-    function isValidCamelot(k) {
-      return k is string && k.matches('^([1-9]|1[0-2])[AB]$');
+    function isValidCamelot(v) {
+      return v is string
+        && v.matches('^([1-9]|1[0-2])[AB]$');
     }
 
-    // Conventional musical key validation
-    function isValidMusicalKey(k) {
-      return k is string && k.matches('^([A-G][#b]?( (Major|Minor))?|Unknown)$');
+    function isValidMusicalKey(v) {
+      return v is string
+        && v.matches('^([A-G][#b]?( (Major|Minor))?|Unknown)$');
     }
 
-    function isValidStatus(s) {
-      return s in ['analyzed', 'metadata_only', 'pending', 'failed'];
+    function isValidStatus(v) {
+      return v in ['analyzed', 'metadata_only', 'pending', 'failed'];
     }
 
-    function isValidTag(t) {
-      return t is string && t.size() >= 1 && t.size() <= 50 && t.matches('^[a-zA-Z0-9_ -]+$');
+    function isValidTag(v) {
+      return v is string
+        && v.size() >= 1
+        && v.size() <= 50
+        && v.matches('^[a-zA-Z0-9_ -]+$');
     }
 
-    function isValidSourceUrl(u) {
-      return u is string && u.size() >= 5 && u.size() <= 500
-        && (u.matches('^https?://[a-zA-Z0-9_./#&?=%+-]+$') || u.matches('^youtube:[a-zA-Z0-9_-]+$'));
+    function isValidSourceUrl(v) {
+      return v is string
+        && v.size() >= 5
+        && v.size() <= 500
+        && (
+          v.matches('^https?://[a-zA-Z0-9_./#&?=%+-]+$')
+          || v.matches('^youtube:[a-zA-Z0-9_-]+$')
+        );
     }
 
-    // Individual item validation for genre_tags (max 15 items)
     function isValidTagList(tags) {
-      return tags is list && tags.size() <= 15
-        && (tags.size() == 0 || (isValidTag(tags[0])
-        && (tags.size() == 1 || (isValidTag(tags[1])
-        && (tags.size() == 2 || (isValidTag(tags[2])
-        && (tags.size() == 3 || (isValidTag(tags[3])
-        && (tags.size() == 4 || (isValidTag(tags[4])
-        && (tags.size() == 5 || (isValidTag(tags[5])
-        && (tags.size() == 6 || (isValidTag(tags[6])
-        && (tags.size() == 7 || (isValidTag(tags[7])
-        && (tags.size() == 8 || (isValidTag(tags[8])
-        && (tags.size() == 9 || (isValidTag(tags[9])
-        && (tags.size() == 10 || (isValidTag(tags[10])
-        && (tags.size() == 11 || (isValidTag(tags[11])
-        && (tags.size() == 12 || (isValidTag(tags[12])
-        && (tags.size() == 13 || (isValidTag(tags[13])
-        && (tags.size() == 14 || isValidTag(tags[14]))))))))))))))))))))))))))));
+      return tags is list
+        && tags.size() <= 15
+        && (tags.size() == 0 || (
+          isValidTag(tags[0])
+          && (tags.size() < 2 || isValidTag(tags[1]))
+          && (tags.size() < 3 || isValidTag(tags[2]))
+          && (tags.size() < 4 || isValidTag(tags[3]))
+          && (tags.size() < 5 || isValidTag(tags[4]))
+          && (tags.size() < 6 || isValidTag(tags[5]))
+          && (tags.size() < 7 || isValidTag(tags[6]))
+          && (tags.size() < 8 || isValidTag(tags[7]))
+          && (tags.size() < 9 || isValidTag(tags[8]))
+          && (tags.size() < 10 || isValidTag(tags[9]))
+          && (tags.size() < 11 || isValidTag(tags[10]))
+          && (tags.size() < 12 || isValidTag(tags[11]))
+          && (tags.size() < 13 || isValidTag(tags[12]))
+          && (tags.size() < 14 || isValidTag(tags[13]))
+          && (tags.size() < 15 || isValidTag(tags[14]))
+        ));
     }
 
-    // Individual item validation for source_urls (max 5 items)
     function isValidSourceUrlList(urls) {
-      return urls is list && urls.size() <= 5
-        && (urls.size() == 0 || (isValidSourceUrl(urls[0])
-        && (urls.size() == 1 || (isValidSourceUrl(urls[1])
-        && (urls.size() == 2 || (isValidSourceUrl(urls[2])
-        && (urls.size() == 3 || (isValidSourceUrl(urls[3])
-        && (urls.size() == 4 || isValidSourceUrl(urls[4]))))))))));
+      return urls is list
+        && urls.size() <= 5
+        && (urls.size() == 0 || (
+          isValidSourceUrl(urls[0])
+          && (urls.size() < 2 || isValidSourceUrl(urls[1]))
+          && (urls.size() < 3 || isValidSourceUrl(urls[2]))
+          && (urls.size() < 4 || isValidSourceUrl(urls[3]))
+          && (urls.size() < 5 || isValidSourceUrl(urls[4]))
+        ));
     }
 
-    // Safe getters for optional fields to avoid evaluation crashes on missing keys
     function getStatus(data) {
-      return ('processing_status' in data) ? data.processing_status : 'metadata_only';
+      return ('processing_status' in data)
+        ? data.processing_status
+        : 'metadata_only';
     }
 
     function getVersion(data) {
-      return ('analysis_version' in data) ? data.analysis_version : 0;
+      return ('analysis_version' in data)
+        ? data.analysis_version
+        : 0;
     }
 
     function getConfidence(data) {
-      return ('analysis_confidence' in data) ? data.analysis_confidence : 0.0;
+      return ('analysis_confidence' in data)
+        ? data.analysis_confidence
+        : 0.0;
     }
 
     function getUpdatedAt(data) {
-      return ('updated_at' in data) ? data.updated_at : 0;
+      return ('updated_at' in data)
+        ? data.updated_at
+        : 0;
     }
 
-    // Strict field allowlist - prevents smuggling arbitrary nested data or maps
     function hasAllowedCatalogueFields(data) {
       return data.keys().hasOnly([
-        'canonical_fingerprint', 'title', 'artist', 'version_tag',
-        'duration_ms', 'original_bpm', 'half_time_bpm', 'double_time_bpm',
-        'bpm_confidence', 'musical_key', 'camelot_key', 'key_confidence',
-        'beat_grid_json', 'phrase_markers_json', 'overall_energy',
-        'danceability', 'genre_tags', 'mood_tags', 'analysis_version',
-        'analysis_confidence', 'processing_status', 'source_urls',
-        'provenance', 'created_at', 'updated_at'
+        'canonical_fingerprint',
+        'title',
+        'artist',
+        'version_tag',
+        'duration_ms',
+        'original_bpm',
+        'half_time_bpm',
+        'double_time_bpm',
+        'bpm_confidence',
+        'musical_key',
+        'camelot_key',
+        'key_confidence',
+        'beat_grid_json',
+        'phrase_markers_json',
+        'overall_energy',
+        'danceability',
+        'genre_tags',
+        'mood_tags',
+        'analysis_version',
+        'analysis_confidence',
+        'processing_status',
+        'source_urls',
+        'provenance',
+        'created_at',
+        'updated_at'
       ]);
     }
 
-    // Comprehensive document schema validation
     function isValidCatalogueData(data) {
       return hasAllowedCatalogueFields(data)
-        // Mandatory identity fields
+
         && isValidString(data.title, 1, 300)
         && isValidString(data.artist, 1, 300)
         && isValidString(data.canonical_fingerprint, 16, 128)
-        && (!('version_tag' in data) || isValidString(data.version_tag, 1, 64))
-        // Audio analysis bounds
-        && (!('duration_ms' in data) || isValidInt(data.duration_ms, 0, 86400000))
-        && (!('original_bpm' in data) || isValidBpm(data.original_bpm))
-        && (!('half_time_bpm' in data) || isValidNumber(data.half_time_bpm, 20.0, 130.0))
-        && (!('double_time_bpm' in data) || isValidNumber(data.double_time_bpm, 80.0, 520.0))
-        && (!('bpm_confidence' in data) || isValidConfidence(data.bpm_confidence))
-        && (!('key_confidence' in data) || isValidConfidence(data.key_confidence))
-        && (!('overall_energy' in data) || isValidConfidence(data.overall_energy))
-        && (!('danceability' in data) || isValidConfidence(data.danceability))
-        && (!('musical_key' in data) || isValidMusicalKey(data.musical_key))
-        && (!('camelot_key' in data) || isValidCamelot(data.camelot_key))
-        && (!('beat_grid_json' in data) || isValidString(data.beat_grid_json, 2, 65536))
-        && (!('phrase_markers_json' in data) || isValidString(data.phrase_markers_json, 2, 65536))
-        && (!('processing_status' in data) || isValidStatus(data.processing_status))
-        && (!('genre_tags' in data) || isValidTagList(data.genre_tags))
-        && (!('mood_tags' in data) || isValidTagList(data.mood_tags))
-        && (!('source_urls' in data) || isValidSourceUrlList(data.source_urls))
-        && (!('provenance' in data) || isValidString(data.provenance, 1, 64))
-        && (!('analysis_version' in data) || isValidInt(data.analysis_version, 1, 100))
-        && (!('analysis_confidence' in data) || isValidConfidence(data.analysis_confidence))
-        && (!('created_at' in data) || (data.created_at is int && data.created_at > 0))
-        && (!('updated_at' in data) || (data.updated_at is int && data.updated_at > 0));
+
+        && (!('version_tag' in data)
+          || isValidString(data.version_tag, 1, 64))
+
+        && (!('duration_ms' in data)
+          || isValidInt(data.duration_ms, 0, 86400000))
+
+        && (!('original_bpm' in data)
+          || isValidBpm(data.original_bpm))
+
+        && (!('half_time_bpm' in data)
+          || isValidNumber(data.half_time_bpm, 20.0, 130.0))
+
+        && (!('double_time_bpm' in data)
+          || isValidNumber(data.double_time_bpm, 80.0, 520.0))
+
+        && (!('bpm_confidence' in data)
+          || isValidConfidence(data.bpm_confidence))
+
+        && (!('key_confidence' in data)
+          || isValidConfidence(data.key_confidence))
+
+        && (!('overall_energy' in data)
+          || isValidConfidence(data.overall_energy))
+
+        && (!('danceability' in data)
+          || isValidConfidence(data.danceability))
+
+        && (!('musical_key' in data)
+          || isValidMusicalKey(data.musical_key))
+
+        && (!('camelot_key' in data)
+          || isValidCamelot(data.camelot_key))
+
+        && (!('beat_grid_json' in data)
+          || isValidString(data.beat_grid_json, 2, 65536))
+
+        && (!('phrase_markers_json' in data)
+          || isValidString(data.phrase_markers_json, 2, 65536))
+
+        && (!('processing_status' in data)
+          || isValidStatus(data.processing_status))
+
+        && (!('genre_tags' in data)
+          || isValidTagList(data.genre_tags))
+
+        && (!('mood_tags' in data)
+          || isValidTagList(data.mood_tags))
+
+        && (!('source_urls' in data)
+          || isValidSourceUrlList(data.source_urls))
+
+        && (!('provenance' in data)
+          || isValidString(data.provenance, 1, 64))
+
+        && (!('analysis_version' in data)
+          || isValidInt(data.analysis_version, 1, 100))
+
+        && (!('analysis_confidence' in data)
+          || isValidConfidence(data.analysis_confidence))
+
+        && (!('created_at' in data)
+          || (data.created_at is int && data.created_at > 0))
+
+        && (!('updated_at' in data)
+          || (data.updated_at is int && data.updated_at > 0));
     }
 
-    // Enforces monotonic quality progression:
-    // Analyzed records cannot be downgraded to unanalyzed or lower confidence, even across version bumps
+    // Fields that define the actual analysis result.
+    function analysisFieldsUnchanged(existing, incoming) {
+      return incoming.diff(existing).affectedKeys().hasNone([
+        'original_bpm',
+        'half_time_bpm',
+        'double_time_bpm',
+        'bpm_confidence',
+        'musical_key',
+        'camelot_key',
+        'key_confidence',
+        'beat_grid_json',
+        'phrase_markers_json',
+        'overall_energy',
+        'danceability',
+        'genre_tags',
+        'mood_tags'
+      ]);
+    }
+
+    function isAllowedStatusTransition(existing, incoming) {
+      let oldStatus = getStatus(existing);
+      let newStatus = getStatus(incoming);
+
+      return oldStatus == newStatus
+        || (
+          oldStatus == 'metadata_only'
+          && newStatus == 'analyzed'
+        )
+        || (
+          oldStatus == 'pending'
+          && (newStatus == 'metadata_only' || newStatus == 'analyzed')
+        )
+        || (
+          oldStatus == 'failed'
+          && (newStatus == 'metadata_only' || newStatus == 'analyzed')
+        );
+    }
+
+    // Mutually exclusive two-path model:
+    // Path 1: Algorithm version upgrade (version must strictly advance, confidence cannot decrease).
+    // Path 2: Metadata / source link update (DSP fields unchanged, version and confidence preserved).
     function isAllowedQualityUpdate(existing, incoming) {
-      return getStatus(existing) != 'analyzed' || (
-        getStatus(incoming) == 'analyzed'
-        && getVersion(incoming) >= getVersion(existing)
-        && getConfidence(incoming) >= getConfidence(existing)
-      );
+      return getStatus(existing) != 'analyzed'
+        || (
+          getStatus(incoming) == 'analyzed'
+          && (
+            (
+              getVersion(incoming) > getVersion(existing)
+              && getConfidence(incoming) >= getConfidence(existing)
+            )
+            ||
+            (
+              getVersion(incoming) == getVersion(existing)
+              && getConfidence(incoming) == getConfidence(existing)
+              && analysisFieldsUnchanged(existing, incoming)
+            )
+          )
+        );
     }
 
-    // Overwrite protection: identity preservation, created_at immutability, updated_at monotonicity
     function isAllowedUpdate(existing, incoming) {
-      return incoming.canonical_fingerprint == existing.canonical_fingerprint
+      return incoming.canonical_fingerprint
+          == existing.canonical_fingerprint
         && incoming.title == existing.title
         && incoming.artist == existing.artist
-        // created_at is immutable once set
-        && (!('created_at' in existing) || incoming.created_at == existing.created_at)
-        // updated_at must not move backwards
-        && (!('updated_at' in incoming) || incoming.updated_at >= getUpdatedAt(existing))
-        // Quality and version progression policy
+
+        // created_at cannot be changed or removed once present.
+        && (
+          !('created_at' in existing)
+          || (
+            'created_at' in incoming
+            && incoming.created_at == existing.created_at
+          )
+        )
+
+        // updated_at cannot be removed or moved backwards.
+        && (
+          !('updated_at' in existing)
+          || (
+            'updated_at' in incoming
+            && incoming.updated_at >= existing.updated_at
+          )
+        )
+
+        && isAllowedStatusTransition(existing, incoming)
         && isAllowedQualityUpdate(existing, incoming);
     }
 
-    // Bound document ID strictly for primary fingerprint records
     function isBoundDocumentId(documentId, data) {
-      return !documentId.matches('^fp_') || documentId == ('fp_' + data.canonical_fingerprint);
+      return !documentId.matches('^fp_')
+        || documentId == ('fp_' + data.canonical_fingerprint);
     }
 
-    // Global Shared Song Metadata Catalogue
-    // Strict metadata-only repository. Audio binaries and raw audio streams are strictly forbidden.
     match /catalogue/{documentId} {
-      
-      // Anyone with valid Firebase Authentication (including anonymous auth) can read metadata
       allow read: if isAuthenticated();
 
-      // Document ID naming format: fp_{fingerprint}, rec_{recording_fp}, or vid_{video_id}
-      // For fp_, the ID is strictly bound to canonical_fingerprint
       allow create: if isAuthenticated()
         && documentId.matches('^(fp|rec|vid)_[a-zA-Z0-9_.-]+$')
         && isBoundDocumentId(documentId, request.resource.data)
@@ -190,11 +329,9 @@ service cloud.firestore {
         && isValidCatalogueData(request.resource.data)
         && isAllowedUpdate(resource.data, request.resource.data);
 
-      // Deletion is strictly prohibited to prevent catalogue loss or vandalism
       allow delete: if false;
     }
 
-    // Default deny for all other collections
     match /{document=**} {
       allow read, write: if false;
     }

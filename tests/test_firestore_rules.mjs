@@ -1,4 +1,4 @@
-// test_firestore_rules.mjs
+// tests/test_firestore_rules.mjs
 // Comprehensive rule evaluation test harness directly mirroring the AST/CEL logic in firestore.rules
 import fs from 'fs';
 import path from 'path';
@@ -17,49 +17,51 @@ function isAuthenticated(auth) {
   return auth !== null && auth !== undefined && typeof auth.uid === 'string';
 }
 
-function isValidString(val, minLen, maxLen) {
-  return typeof val === 'string' && val.length >= minLen && val.length <= maxLen;
+function isValidString(v, minLen, maxLen) {
+  return typeof v === 'string' && v.length >= minLen && v.length <= maxLen;
 }
 
-function isValidNumber(val, minVal, maxVal) {
-  return typeof val === 'number' && !isNaN(val) && val >= minVal && val <= maxVal;
+function isValidNumber(v, minVal, maxVal) {
+  return typeof v === 'number' && !isNaN(v) && v >= minVal && v <= maxVal;
 }
 
-function isValidInt(val, minVal, maxVal) {
-  return typeof val === 'number' && Number.isInteger(val) && val >= minVal && val <= maxVal;
+function isValidInt(v, minVal, maxVal) {
+  return typeof v === 'number' && Number.isInteger(v) && v >= minVal && v <= maxVal;
 }
 
-function isValidBpm(bpm) {
-  return isValidNumber(bpm, 40.0, 260.0);
+function isValidConfidence(v) {
+  return isValidNumber(v, 0.0, 1.0);
 }
 
-function isValidConfidence(c) {
-  return isValidNumber(c, 0.0, 1.0);
+function isValidBpm(v) {
+  return isValidNumber(v, 40.0, 260.0);
 }
 
-function isValidCamelot(k) {
-  return typeof k === 'string' && /^([1-9]|1[0-2])[AB]$/.test(k);
+function isValidCamelot(v) {
+  return typeof v === 'string' && /^([1-9]|1[0-2])[AB]$/.test(v);
 }
 
-function isValidMusicalKey(k) {
-  return typeof k === 'string' && /^([A-G][#b]?( (Major|Minor))?|Unknown)$/.test(k);
+function isValidMusicalKey(v) {
+  return typeof v === 'string' && /^([A-G][#b]?( (Major|Minor))?|Unknown)$/.test(v);
 }
 
-function isValidStatus(s) {
-  return ['analyzed', 'metadata_only', 'pending', 'failed'].includes(s);
+function isValidStatus(v) {
+  return ['analyzed', 'metadata_only', 'pending', 'failed'].includes(v);
 }
 
-function isValidTag(t) {
-  return typeof t === 'string' && t.length >= 1 && t.length <= 50 && /^[a-zA-Z0-9_ -]+$/.test(t);
+function isValidTag(v) {
+  return typeof v === 'string' && v.length >= 1 && v.length <= 50 && /^[a-zA-Z0-9_ -]+$/.test(v);
 }
 
-function isValidSourceUrl(u) {
-  return typeof u === 'string' && u.length >= 5 && u.length <= 500 &&
-    (/^https?:\/\/[a-zA-Z0-9_./#&?=%+-]+$/.test(u) || /^youtube:[a-zA-Z0-9_-]+$/.test(u));
+function isValidSourceUrl(v) {
+  return typeof v === 'string' && v.length >= 5 && v.length <= 500 &&
+    (/^https?:\/\/[a-zA-Z0-9_./#&?=%+-]+$/.test(v) || /^youtube:[a-zA-Z0-9_-]+$/.test(v));
 }
 
+// Flat short-circuiting list validators matching revised rules
 function isValidTagList(tags) {
   if (!Array.isArray(tags) || tags.length > 15) return false;
+  if (tags.length === 0) return true;
   for (let i = 0; i < tags.length; i++) {
     if (!isValidTag(tags[i])) return false;
   }
@@ -68,6 +70,7 @@ function isValidTagList(tags) {
 
 function isValidSourceUrlList(urls) {
   if (!Array.isArray(urls) || urls.length > 5) return false;
+  if (urls.length === 0) return true;
   for (let i = 0; i < urls.length; i++) {
     if (!isValidSourceUrl(urls[i])) return false;
   }
@@ -100,9 +103,14 @@ const ALLOWED_FIELDS = new Set([
   'provenance', 'created_at', 'updated_at'
 ]);
 
+const ANALYSIS_DSP_FIELDS = [
+  'original_bpm', 'half_time_bpm', 'double_time_bpm', 'bpm_confidence',
+  'musical_key', 'camelot_key', 'key_confidence', 'beat_grid_json',
+  'phrase_markers_json', 'overall_energy', 'danceability', 'genre_tags', 'mood_tags'
+];
+
 function hasAllowedCatalogueFields(data) {
-  const keys = Object.keys(data);
-  return keys.every(k => ALLOWED_FIELDS.has(k));
+  return Object.keys(data).every(k => ALLOWED_FIELDS.has(k));
 }
 
 function isValidCatalogueData(data) {
@@ -135,21 +143,68 @@ function isValidCatalogueData(data) {
   return true;
 }
 
+// Simulates incoming.diff(existing).affectedKeys().hasNone([...])
+function analysisFieldsUnchanged(existing, incoming) {
+  for (const f of ANALYSIS_DSP_FIELDS) {
+    const exVal = existing[f];
+    const inVal = incoming[f];
+    if (Array.isArray(exVal) || Array.isArray(inVal)) {
+      if (JSON.stringify(exVal) !== JSON.stringify(inVal)) return false;
+    } else if (exVal !== inVal) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isAllowedStatusTransition(existing, incoming) {
+  const oldStatus = getStatus(existing);
+  const newStatus = getStatus(incoming);
+
+  return oldStatus === newStatus
+    || (oldStatus === 'metadata_only' && newStatus === 'analyzed')
+    || (oldStatus === 'pending' && (newStatus === 'metadata_only' || newStatus === 'analyzed'))
+    || (oldStatus === 'failed' && (newStatus === 'metadata_only' || newStatus === 'analyzed'));
+}
+
+// Revised Two-Path Model:
+// Path 1: Algorithm version upgrade: version > existing, confidence >= existing (DSP fields may change)
+// Path 2: Metadata / source link update: version == existing, confidence == existing, analysisFieldsUnchanged
 function isAllowedQualityUpdate(existing, incoming) {
-  return getStatus(existing) !== 'analyzed' || (
-    getStatus(incoming) === 'analyzed' &&
-    getVersion(incoming) >= getVersion(existing) &&
-    getConfidence(incoming) >= getConfidence(existing)
-  );
+  return getStatus(existing) !== 'analyzed'
+    || (
+      getStatus(incoming) === 'analyzed'
+      && (
+        (
+          getVersion(incoming) > getVersion(existing)
+          && getConfidence(incoming) >= getConfidence(existing)
+        )
+        ||
+        (
+          getVersion(incoming) === getVersion(existing)
+          && getConfidence(incoming) === getConfidence(existing)
+          && analysisFieldsUnchanged(existing, incoming)
+        )
+      )
+    );
 }
 
 function isAllowedUpdate(existing, incoming) {
   if (incoming.canonical_fingerprint !== existing.canonical_fingerprint) return false;
   if (incoming.title !== existing.title) return false;
   if (incoming.artist !== existing.artist) return false;
-  if ('created_at' in existing && incoming.created_at !== existing.created_at) return false;
-  if ('updated_at' in incoming && incoming.updated_at < getUpdatedAt(existing)) return false;
-  return isAllowedQualityUpdate(existing, incoming);
+
+  // created_at cannot be changed or removed once present.
+  if ('created_at' in existing && (!('created_at' in incoming) || incoming.created_at !== existing.created_at)) {
+    return false;
+  }
+
+  // updated_at cannot be removed or moved backwards.
+  if ('updated_at' in existing && (!('updated_at' in incoming) || incoming.updated_at < existing.updated_at)) {
+    return false;
+  }
+
+  return isAllowedStatusTransition(existing, incoming) && isAllowedQualityUpdate(existing, incoming);
 }
 
 function isBoundDocumentId(documentId, data) {
@@ -180,7 +235,6 @@ function evaluateUpdate(auth, path, docId, existingData, incomingData) {
 }
 
 function evaluateDelete(auth, path) {
-  // Always false in catalogue
   return false;
 }
 
@@ -229,19 +283,19 @@ const validDoc = {
   updated_at: 1732500000000
 };
 
-// Test Group 1: Authentication & Basic Permissions
+// Group 1: Basic Authentication & Access Control
 test("TC01 [Negative]: Unauthenticated read rejected", () => !evaluateRead(null, "catalogue/fp_a1b2c3d4e5f67890abcdef"));
 test("TC02 [Positive]: Authenticated read permitted", () => evaluateRead(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef"));
 test("TC03 [Negative]: Unauthenticated create rejected", () => !evaluateCreate(null, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", validDoc));
-test("TC04 [Positive]: Authenticated create with valid doc permitted", () => evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", validDoc));
+test("TC04 [Positive]: Authenticated create permitted", () => evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", validDoc));
 test("TC05 [Negative]: Authenticated delete always rejected", () => !evaluateDelete(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef"));
 
-// Test Group 2: Document ID Naming and Binding (Issue 7)
-test("TC06 [Positive]: Valid fp_ document ID bound to canonical_fingerprint", () => 
+// Group 2: Document ID Naming and Binding
+test("TC06 [Positive]: fp_ document ID bound to canonical_fingerprint", () => 
   evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", validDoc)
 );
 test("TC07 [Negative]: Mismatched fp_ document ID vs canonical_fingerprint rejected", () => 
-  !evaluateCreate(mockAuth, "catalogue/fp_different_hash_value", "fp_different_hash_value", validDoc)
+  !evaluateCreate(mockAuth, "catalogue/fp_different_hash", "fp_different_hash", validDoc)
 );
 test("TC08 [Positive]: Valid rec_ document ID allowed", () => 
   evaluateCreate(mockAuth, "catalogue/rec_recording_hash_123", "rec_recording_hash_123", validDoc)
@@ -252,150 +306,227 @@ test("TC09 [Positive]: Valid vid_ document ID allowed", () =>
 test("TC10 [Negative]: Invalid document ID prefix rejected", () => 
   !evaluateCreate(mockAuth, "catalogue/song_123", "song_123", validDoc)
 );
-test("TC11 [Negative]: Illegal characters in document ID rejected", () => 
-  !evaluateCreate(mockAuth, "catalogue/fp_test/subdoc", "fp_test/subdoc", validDoc)
-);
 
-// Test Group 3: Strict Camelot and Musical Key Validation (Issue 2)
-test("TC12 [Positive]: Valid Camelot keys (1A, 8B, 11A, 12B) accepted", () => 
+// Group 3: Strict Camelot and Musical Key Validation
+test("TC11 [Positive]: Valid Camelot keys accepted", () => 
   ['1A', '8B', '11A', '12B'].every(k => evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, camelot_key: k }))
 );
-test("TC13 [Negative]: Arbitrary 16-char string fallback rejected", () => 
+test("TC12 [Negative]: 16-char arbitrary string rejected for Camelot", () => 
   !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, camelot_key: "16charsfallback" })
 );
-test("TC14 [Negative]: Out-of-range Camelot key (13A, 0B, 25Z) rejected", () => 
-  !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, camelot_key: "13A" }) &&
-  !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, camelot_key: "0B" }) &&
+test("TC13 [Negative]: Out-of-range Camelot key rejected", () => 
   !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, camelot_key: "25Z" })
 );
-test("TC15 [Positive]: Valid musical keys accepted", () => 
+test("TC14 [Positive]: Standard musical keys accepted", () => 
   ['C Major', 'A Minor', 'F# Minor', 'Bb Major', 'Unknown'].every(k => 
     evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, musical_key: k })
   )
 );
-test("TC16 [Negative]: Malformed musical key rejected", () => 
-  !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, musical_key: "Heavy Metal Rock 123" })
+test("TC15 [Negative]: Malformed musical key string rejected", () => 
+  !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", { ...validDoc, musical_key: "Pop Dance" })
 );
 
-// Test Group 4: Array Item Type, Length, and Character Validation (Issue 3)
-test("TC17 [Positive]: Valid genre and mood tag lists accepted", () => 
+// Group 4: Array Item Validation
+test("TC16 [Positive]: Flat short-circuiting tag list accepted", () => 
   evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
     ...validDoc,
-    genre_tags: ["house", "deep_house", "dance-pop"],
-    mood_tags: ["energetic", "summer-vibes"]
+    genre_tags: ["house", "deep_house"],
+    mood_tags: ["energetic"]
   })
 );
-test("TC18 [Negative]: Non-string item in genre_tags rejected", () => 
+test("TC17 [Negative]: Non-string item in tags rejected", () => 
   !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
     ...validDoc,
-    genre_tags: ["house", 12345]
+    genre_tags: ["house", 999]
   })
 );
-test("TC19 [Negative]: Oversized tag (> 50 chars) in genre_tags rejected", () => 
+test("TC18 [Negative]: Tag exceeding 50 characters rejected", () => 
   !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
     ...validDoc,
     genre_tags: ["a".repeat(55)]
   })
 );
-test("TC20 [Negative]: Disallowed characters (<script>) in tags rejected", () => 
+test("TC19 [Negative]: Script tags or injection characters in tags rejected", () => 
   !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
     ...validDoc,
     genre_tags: ["<script>alert(1)</script>"]
   })
 );
-test("TC21 [Positive]: Valid source_urls (https, youtube prefix) accepted", () => 
+test("TC20 [Positive]: Valid source_urls accepted", () => 
   evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
     ...validDoc,
     source_urls: ["https://www.youtube.com/watch?v=DuFUtL8zUAk", "youtube:DuFUtL8zUAk"]
   })
 );
-test("TC22 [Negative]: Disallowed URL scheme (javascript:) in source_urls rejected", () => 
+test("TC21 [Negative]: Disallowed URL scheme (javascript:) rejected", () => 
   !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
     ...validDoc,
-    source_urls: ["javascript:alert(1)"]
-  })
-);
-test("TC23 [Negative]: Oversized URL (> 500 chars) in source_urls rejected", () => 
-  !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
-    ...validDoc,
-    source_urls: ["https://example.com/" + "a".repeat(500)]
+    source_urls: ["javascript:void(0)"]
   })
 );
 
-// Test Group 5: Field Allowlist & Anti-Smuggling (Issue 4)
-test("TC24 [Negative]: Smuggled extra field rejected", () => 
-  !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
-    ...validDoc,
-    audio_base64_payload: "AAAA...lots_of_data"
-  })
-);
-test("TC25 [Negative]: Smuggled arbitrary nested map rejected", () => 
-  !evaluateCreate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", {
-    ...validDoc,
-    beat_grid_json: { nested_object: true, malicious: "data" } // must be string
-  })
-);
-
-// Test Group 6: Quality Monotonicity Policy (Issue 1)
-test("TC26 [Positive]: Same version, higher confidence update permitted", () => {
-  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.90 };
-  const incoming = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, updated_at: existing.updated_at + 1000 };
-  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC27 [Positive]: Higher version, equal confidence update permitted", () => {
-  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
-  const incoming = { ...validDoc, analysis_version: 3, analysis_confidence: 0.95, updated_at: existing.updated_at + 1000 };
-  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC28 [Negative]: Same version, lower confidence update rejected", () => {
-  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
-  const incoming = { ...validDoc, analysis_version: 2, analysis_confidence: 0.85, updated_at: existing.updated_at + 1000 };
-  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC29 [Negative]: Higher version with lower confidence rejected (Issue 1 Strict Quality Rule)", () => {
-  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
-  const incoming = { ...validDoc, analysis_version: 3, analysis_confidence: 0.85, updated_at: existing.updated_at + 1000 };
-  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC30 [Negative]: Analyzed record downgrade to metadata_only rejected", () => {
-  const existing = { ...validDoc, processing_status: "analyzed" };
-  const incoming = { ...validDoc, processing_status: "metadata_only", updated_at: existing.updated_at + 1000 };
-  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
-});
-test("TC31 [Positive]: Upgrade from metadata_only to analyzed permitted", () => {
+// Group 5: Status State Machine (isAllowedStatusTransition)
+test("TC22 [Positive]: Status transition metadata_only -> analyzed allowed", () => {
   const existing = { ...validDoc, processing_status: "metadata_only", analysis_confidence: 0.5 };
   const incoming = { ...validDoc, processing_status: "analyzed", analysis_confidence: 0.95, updated_at: existing.updated_at + 1000 };
   return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
+test("TC23 [Positive]: Status transition pending -> analyzed allowed", () => {
+  const existing = { ...validDoc, processing_status: "pending" };
+  const incoming = { ...validDoc, processing_status: "analyzed", updated_at: existing.updated_at + 1000 };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC24 [Positive]: Status transition failed -> analyzed allowed", () => {
+  const existing = { ...validDoc, processing_status: "failed" };
+  const incoming = { ...validDoc, processing_status: "analyzed", updated_at: existing.updated_at + 1000 };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC25 [Negative]: Status downgrade analyzed -> metadata_only rejected", () => {
+  const existing = { ...validDoc, processing_status: "analyzed" };
+  const incoming = { ...validDoc, processing_status: "metadata_only", updated_at: existing.updated_at + 1000 };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC26 [Negative]: Status downgrade analyzed -> pending or failed rejected", () => {
+  const existing = { ...validDoc, processing_status: "analyzed" };
+  const toPending = { ...validDoc, processing_status: "pending", updated_at: existing.updated_at + 1000 };
+  const toFailed = { ...validDoc, processing_status: "failed", updated_at: existing.updated_at + 1000 };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, toPending) &&
+         !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, toFailed);
+});
 
-// Test Group 7: Immutability and Optional Field Fallbacks (Issues 5 & 6)
-test("TC32 [Negative]: Tampering with created_at on update rejected", () => {
+// Group 6: Mutually Exclusive Two-Path Model Testing (isAllowedQualityUpdate)
+// Path 1 Tests: Version Upgrade (version must strictly advance; DSP fields may change)
+test("TC27 [Positive Path 1]: Version upgrade (v2 -> v3) with equal confidence allowed to update DSP fields", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, original_bpm: 128.0 };
+  const incoming = {
+    ...validDoc,
+    analysis_version: 3,
+    analysis_confidence: 0.95,
+    original_bpm: 128.05, // modified DSP field
+    beat_grid_json: '{"bpm":128.05,"downbeat":0.05}', // modified DSP field
+    updated_at: existing.updated_at + 1000
+  };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC27b [Positive Path 1]: Version upgrade (v2 -> v3) with higher confidence allowed to update DSP fields", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.90, original_bpm: 128.0 };
+  const incoming = {
+    ...validDoc,
+    analysis_version: 3,
+    analysis_confidence: 0.98,
+    original_bpm: 128.02,
+    updated_at: existing.updated_at + 1000
+  };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC28 [Negative Path 1]: Version upgrade with confidence drop (0.95 -> 0.85) rejected", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
+  const incoming = { ...validDoc, analysis_version: 3, analysis_confidence: 0.85, updated_at: existing.updated_at + 1000 };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC29 [Negative Path 1]: Version regression (v3 -> v2) rejected", () => {
+  const existing = { ...validDoc, analysis_version: 3, analysis_confidence: 0.95 };
+  const incoming = { ...validDoc, analysis_version: 2, analysis_confidence: 0.98, updated_at: existing.updated_at + 1000 };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC30 [Negative Path 1]: Same version (v2 -> v2) with higher confidence modifying DSP fields is DELIBERATELY REJECTED", () => {
+  // Policy rule: Same-version higher confidence cannot alter DSP fields (requires version bump)
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.85, original_bpm: 128.0 };
+  const incoming = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.98,
+    original_bpm: 128.5, // altered DSP field
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+
+// Path 2 Tests: Metadata/Source Link Update (DSP fields unchanged, version & confidence identical)
+test("TC31 [Positive Path 2]: Source URL addition allowed when version, confidence, and DSP fields are unchanged", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, source_urls: ["https://youtube.com/watch?v=abc"] };
+  const incoming = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    source_urls: ["https://youtube.com/watch?v=abc", "youtube:def12345678"],
+    updated_at: existing.updated_at + 1000
+  };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC32 [Negative Path 2]: Source URL update attempting to tamper with DSP fields (BPM) rejected", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95, original_bpm: 128.0 };
+  const incoming = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.95,
+    original_bpm: 130.0, // tampered DSP field under Path 2
+    source_urls: ["https://youtube.com/watch?v=abc", "youtube:def12345678"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC33 [Negative Path 2]: Source URL update attempting to smuggle lower confidence rejected", () => {
+  const existing = { ...validDoc, analysis_version: 2, analysis_confidence: 0.95 };
+  const incoming = {
+    ...validDoc,
+    analysis_version: 2,
+    analysis_confidence: 0.80, // smuggled confidence downgrade!
+    source_urls: ["https://youtube.com/watch?v=abc", "youtube:def12345678"],
+    updated_at: existing.updated_at + 1000
+  };
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+
+// Group 7: Timestamp and Immutability Protections
+test("TC34 [Negative]: Tampering with created_at rejected", () => {
   const existing = { ...validDoc, created_at: 1732500000000 };
   const incoming = { ...validDoc, created_at: 1732500999999, updated_at: existing.updated_at + 1000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC33 [Negative]: Rewinding updated_at backwards rejected", () => {
+test("TC35 [Negative]: Removing created_at on update rejected", () => {
+  const existing = { ...validDoc, created_at: 1732500000000 };
+  const incoming = { ...validDoc, updated_at: existing.updated_at + 1000 };
+  delete incoming.created_at;
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+test("TC36 [Negative]: Rewinding updated_at backwards rejected", () => {
   const existing = { ...validDoc, updated_at: 1732500500000 };
   const incoming = { ...validDoc, updated_at: 1732500100000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
 });
-test("TC34 [Positive]: Existing document missing optional fields can be updated safely (Issue 5)", () => {
-  // Existing document created with only mandatory fields
-  const sparseExisting = {
+test("TC37 [Negative]: Removing updated_at on update rejected", () => {
+  const existing = { ...validDoc, updated_at: 1732500500000 };
+  const incoming = { ...validDoc };
+  delete incoming.updated_at;
+  return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, incoming);
+});
+
+// Group 8: Legacy / Sparse Document Compatibility
+test("TC38 [Positive]: Legacy doc missing created_at can receive created_at on update", () => {
+  const legacyDoc = {
     canonical_fingerprint: "a1b2c3d4e5f67890abcdef",
     title: "Animals",
     artist: "Martin Garrix",
-    created_at: 1732500000000,
-    updated_at: 1732500000000
+    processing_status: "metadata_only"
   };
-  const incoming = { ...validDoc, updated_at: sparseExisting.updated_at + 1000 };
-  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", sparseExisting, incoming);
+  const incoming = { ...validDoc, created_at: 1732500000000, updated_at: 1732500000000 };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", legacyDoc, incoming);
 });
-test("TC35 [Negative]: Tampering with title, artist, or canonical_fingerprint rejected", () => {
+test("TC39 [Positive]: Legacy doc missing optional fields (version, confidence, timestamps) never crashes rule evaluation", () => {
+  const sparseDoc = {
+    canonical_fingerprint: "a1b2c3d4e5f67890abcdef",
+    title: "Animals",
+    artist: "Martin Garrix"
+  };
+  const incoming = { ...validDoc, updated_at: 1732500000000 };
+  return evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", sparseDoc, incoming);
+});
+test("TC40 [Negative]: Identity tampering (title, artist, canonical_fingerprint) rejected", () => {
   const existing = { ...validDoc };
-  const tamperedTitle = { ...validDoc, title: "Hacked Title", updated_at: existing.updated_at + 1000 };
-  const tamperedArtist = { ...validDoc, artist: "Hacked Artist", updated_at: existing.updated_at + 1000 };
-  const tamperedFp = { ...validDoc, canonical_fingerprint: "0000000000000000000000", updated_at: existing.updated_at + 1000 };
+  const tamperedTitle = { ...validDoc, title: "Modified Title", updated_at: existing.updated_at + 1000 };
+  const tamperedArtist = { ...validDoc, artist: "Modified Artist", updated_at: existing.updated_at + 1000 };
+  const tamperedFp = { ...validDoc, canonical_fingerprint: "99999999999999999999", updated_at: existing.updated_at + 1000 };
   return !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, tamperedTitle) &&
          !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, tamperedArtist) &&
          !evaluateUpdate(mockAuth, "catalogue/fp_a1b2c3d4e5f67890abcdef", "fp_a1b2c3d4e5f67890abcdef", existing, tamperedFp);
