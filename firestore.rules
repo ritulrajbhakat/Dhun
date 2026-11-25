@@ -120,6 +120,18 @@ service cloud.firestore {
         || ('mood_tags' in data);
     }
 
+    // Essential Stage 5 DSP analysis outputs required for any record claiming 'analyzed' status.
+    // Legitimate optional fields (phrase_markers_json, overall_energy, danceability, genre_tags,
+    // mood_tags, half_time_bpm, double_time_bpm) may be omitted.
+    function hasRequiredDspAnalysis(data) {
+      return ('original_bpm' in data)
+        && ('bpm_confidence' in data)
+        && ('musical_key' in data)
+        && ('camelot_key' in data)
+        && ('key_confidence' in data)
+        && ('beat_grid_json' in data);
+    }
+
     // Safely reads algorithm version:
     // If analysis_version is explicit, returns it.
     // If missing but document contains analysis data, baseline version is 2 (matching DHUN's default).
@@ -225,6 +237,16 @@ service cloud.firestore {
         && (!('processing_status' in data)
           || isValidStatus(data.processing_status))
 
+        // Records claiming 'analyzed' status must include the essential Stage 5 DSP outputs,
+        // analysis algorithm version, and analysis confidence metric.
+        && (!('processing_status' in data)
+          || data.processing_status != 'analyzed'
+          || (
+            hasRequiredDspAnalysis(data)
+            && ('analysis_version' in data)
+            && ('analysis_confidence' in data)
+          ))
+
         && (!('genre_tags' in data)
           || isValidTagList(data.genre_tags))
 
@@ -280,9 +302,11 @@ service cloud.firestore {
 
     // Mutually exclusive three-scenario policy:
     // Scenario A: Genuine first analysis of a bare record (no prior analysis data).
-    //   Must transition to 'analyzed', provide valid version & confidence, and preserve duration & version_tag.
+    //   Must transition to 'analyzed', provide required DSP results, valid version & confidence,
+    //   and preserve duration & version_tag.
     // Scenario B: Algorithm version upgrade of an already-analyzed record.
-    //   Must strictly advance version (>), confidence must not decrease (>=), DSP fields may change.
+    //   Must strictly advance version (>), confidence must not decrease (>=),
+    //   must provide required DSP results, and cannot modify immutable metadata.
     // Scenario C: Source link maintenance of an already-analyzed record.
     //   Version and confidence must be identical, and only source_urls/provenance/updated_at may change.
     function isAllowedQualityUpdate(existing, incoming) {
@@ -294,6 +318,7 @@ service cloud.firestore {
         incomingStatus == 'analyzed'
         && ('analysis_version' in incoming)
         && ('analysis_confidence' in incoming)
+        && hasRequiredDspAnalysis(incoming)
         && (!('version_tag' in existing) || incoming.version_tag == existing.version_tag)
         && (!('duration_ms' in existing) || incoming.duration_ms == existing.duration_ms)
       ))
@@ -301,6 +326,9 @@ service cloud.firestore {
         // Scenario B: Algorithm version upgrade
         (
           incomingStatus == 'analyzed'
+          && ('analysis_version' in incoming)
+          && ('analysis_confidence' in incoming)
+          && hasRequiredDspAnalysis(incoming)
           && getVersion(incoming) > getVersion(existing)
           && getConfidence(incoming) >= getConfidence(existing)
         )
@@ -319,6 +347,24 @@ service cloud.firestore {
           == existing.canonical_fingerprint
         && incoming.title == existing.title
         && incoming.artist == existing.artist
+
+        // version_tag cannot be changed or removed once present.
+        && (
+          !('version_tag' in existing)
+          || (
+            'version_tag' in incoming
+            && incoming.version_tag == existing.version_tag
+          )
+        )
+
+        // duration_ms cannot be changed or removed once present.
+        && (
+          !('duration_ms' in existing)
+          || (
+            'duration_ms' in incoming
+            && incoming.duration_ms == existing.duration_ms
+          )
+        )
 
         // created_at cannot be changed or removed once present.
         && (
