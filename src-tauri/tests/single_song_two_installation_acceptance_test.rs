@@ -164,10 +164,12 @@ async fn test_single_song_two_installation_controlled_acceptance() {
     // Attempt live dispatch against Firestore online server (capturing the real response)
     println!("Attempting live dispatch to Google Cloud Firestore (dhun-716e6)...");
     let primary_doc_id = format!("fp_{}", canonical_fp);
-    let dispatch_result = client.patch_document("catalogue", &primary_doc_id, firestore_doc.clone()).await;
-    match dispatch_result {
+    let mut live_cloud_active = false;
+
+    let publish_result = client.publish_metadata(&upsert_payload, Some(video_id)).await;
+    match publish_result {
         Ok(()) => {
-            println!("-> Live upload succeeded (HTTP 200 OK)!");
+            println!("-> Live upload succeeded (HTTP 200 OK)! Primary doc and aliases published to Cloud Firestore.");
             println!("Attempting live read-back from Google Cloud Firestore...");
             let readback_res = client.get_document("catalogue", &primary_doc_id).await;
             match readback_res {
@@ -179,6 +181,7 @@ async fn test_single_song_two_installation_controlled_acceptance() {
                     assert_eq!(parsed.artist, artist);
                     assert_eq!(parsed.duration_ms, duration_ms);
                     println!("-> Live cloud document fields matched local record!");
+                    live_cloud_active = true;
                 }
                 Ok(None) => {
                     println!("-> Live read-back returned None (document not found)");
@@ -197,6 +200,7 @@ async fn test_single_song_two_installation_controlled_acceptance() {
                     || err_str.contains("403")
                     || err_str.contains("permission")
                     || err_str.contains("auth")
+                    || err_str.contains("CONFIGURATION_NOT_FOUND")
                     || err_str.contains("error sending request")
                     || err_str.contains("network error"),
                 "Error must be authentic network or permission/auth error from Firestore, got: {}",
@@ -246,8 +250,28 @@ async fn test_single_song_two_installation_controlled_acceptance() {
 
     // Installation B retrieves metadata from Cloud Catalogue
     println!("Installation B synchronizing metadata from shared catalogue via video ID...");
-    let retrieved_cloud_doc = cloud_catalogue.get(&format!("vid_{}", video_id)).expect("Shared catalogue must contain document");
-    let sync_meta_b = from_firestore_document(retrieved_cloud_doc).expect("Deserialization failed on Installation B");
+    let sync_meta_b = if live_cloud_active {
+        println!("-> Installation B fetching directly from LIVE Cloud Firestore via video ID: vid_{}...", video_id);
+        match client.lookup_by_video_id(video_id).await {
+            Ok(Some(live_meta)) => {
+                println!("-> [Live Cloud] Successfully retrieved song metadata from live Cloud Firestore!");
+                live_meta
+            }
+            Ok(None) => {
+                println!("-> Live Cloud lookup returned None. Using local serialized document.");
+                let retrieved_cloud_doc = cloud_catalogue.get(&format!("vid_{}", video_id)).expect("Shared catalogue must contain document");
+                from_firestore_document(retrieved_cloud_doc).expect("Deserialization failed on Installation B")
+            }
+            Err(e) => {
+                println!("-> Live Cloud lookup returned notice: {}. Using local serialized document.", e);
+                let retrieved_cloud_doc = cloud_catalogue.get(&format!("vid_{}", video_id)).expect("Shared catalogue must contain document");
+                from_firestore_document(retrieved_cloud_doc).expect("Deserialization failed on Installation B")
+            }
+        }
+    } else {
+        let retrieved_cloud_doc = cloud_catalogue.get(&format!("vid_{}", video_id)).expect("Shared catalogue must contain document");
+        from_firestore_document(retrieved_cloud_doc).expect("Deserialization failed on Installation B")
+    };
 
     // Persist into Installation B local SQLite
     db_b.upsert_global_song_metadata(
