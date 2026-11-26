@@ -280,43 +280,113 @@ impl FirestoreClient {
         Ok(Some(doc))
     }
 
-    /// Lists documents from the Firestore catalogue collection.
+    /// Lists documents from the Firestore catalogue collection, supporting pagination.
     pub async fn list_catalogue(
         &self,
         page_size: usize,
     ) -> Result<Vec<(String, serde_json::Value)>> {
+        let mut results = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let mut url = format!(
+                "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/catalogue?pageSize={}",
+                self.config.project_id, page_size
+            );
+            if let Some(ref pt) = page_token {
+                url.push_str(&format!("&pageToken={}", pt));
+            }
+
+            let mut req = self.http_client.get(&url);
+            if let Some(token) = self.get_id_token().await {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            }
+
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("Firestore catalogue list failed ({status}): {body}"));
+            }
+
+            let body: serde_json::Value = resp.json().await?;
+            let documents = body
+                .get("documents")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            for doc in documents {
+                let name = doc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let doc_id = name.rsplit('/').next().unwrap_or("").to_string();
+                results.push((doc_id, doc));
+            }
+
+            if let Some(next_pt) = body.get("nextPageToken").and_then(|t| t.as_str()) {
+                if !next_pt.trim().is_empty() {
+                    page_token = Some(next_pt.to_string());
+                    continue;
+                }
+            }
+            break;
+        }
+
+        Ok(results)
+    }
+
+    /// Deletes a document from Firestore by collection and document ID.
+    pub async fn delete_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let clean_doc_id = sanitize_doc_id(doc_id);
         let url = format!(
-            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/catalogue?pageSize={}",
-            self.config.project_id, page_size
+            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/{}/{}",
+            self.config.project_id, collection, clean_doc_id
         );
 
-        let mut req = self.http_client.get(&url);
+        let mut req = self.http_client.delete(&url);
+        if let Some(token) = self.get_id_token().await {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// Lists subcollection IDs for a document in the catalogue.
+    pub async fn list_subcollections(&self, doc_id: &str) -> Result<Vec<String>> {
+        let clean_doc_id = sanitize_doc_id(doc_id);
+        let url = format!(
+            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/catalogue/{}:listCollectionIds",
+            self.config.project_id, clean_doc_id
+        );
+
+        let mut req = self.http_client.post(&url).json(&serde_json::json!({}));
         if let Some(token) = self.get_id_token().await {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
 
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Firestore catalogue list failed ({status}): {body}"));
+            return Ok(Vec::new());
         }
 
         let body: serde_json::Value = resp.json().await?;
-        let documents = body
-            .get("documents")
-            .and_then(|d| d.as_array())
-            .cloned()
+        let collection_ids = body
+            .get("collectionIds")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
 
-        let mut results = Vec::new();
-        for doc in documents {
-            let name = doc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let doc_id = name.rsplit('/').next().unwrap_or("").to_string();
-            results.push((doc_id, doc));
-        }
-
-        Ok(results)
+        Ok(collection_ids)
     }
 
     /// Upserts a document in Firestore via PATCH.
