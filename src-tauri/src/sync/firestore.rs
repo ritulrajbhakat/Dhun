@@ -280,6 +280,45 @@ impl FirestoreClient {
         Ok(Some(doc))
     }
 
+    /// Lists documents from the Firestore catalogue collection.
+    pub async fn list_catalogue(
+        &self,
+        page_size: usize,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        let url = format!(
+            "https://firestore.googleapis.com/v1/projects/{}/databases/(default)/documents/catalogue?pageSize={}",
+            self.config.project_id, page_size
+        );
+
+        let mut req = self.http_client.get(&url);
+        if let Some(token) = self.get_id_token().await {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Firestore catalogue list failed ({status}): {body}"));
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let documents = body
+            .get("documents")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut results = Vec::new();
+        for doc in documents {
+            let name = doc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let doc_id = name.rsplit('/').next().unwrap_or("").to_string();
+            results.push((doc_id, doc));
+        }
+
+        Ok(results)
+    }
+
     /// Upserts a document in Firestore via PATCH.
     pub async fn patch_document(
         &self,
