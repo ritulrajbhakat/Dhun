@@ -81,6 +81,11 @@ try {
         console.log(`-> WARNING: Token audience '${payload.aud}' does not match expected project '${PROJECT_ID}'.\n`);
       }
     }
+  } else if (authResp.status === 400 && authBody.includes("CONFIGURATION_NOT_FOUND")) {
+    console.log(`Response Body: ${authBody.trim()}`);
+    console.log("-> VERIFIED: Google Cloud Web API Key is AUTHENTIC and recognized by Google!");
+    console.log("   Root Cause: Firebase Authentication has not yet been initialized in Firebase Console for project 'dhun-716e6'.");
+    console.log("   Resolution: Go to Firebase Console -> Build -> Authentication -> Click 'Get started' -> Sign-in method -> enable 'Anonymous' -> Save.\n");
   } else if (authResp.status === 400 && authBody.includes("API_KEY_INVALID")) {
     console.log(`Response Body: ${authBody.trim()}`);
     console.log("-> VERIFIED: Google Identity Toolkit actively listening and enforces API key validity.");

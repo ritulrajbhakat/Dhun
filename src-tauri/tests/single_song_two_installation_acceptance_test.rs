@@ -65,7 +65,9 @@ async fn test_single_song_two_installation_controlled_acceptance() {
         }
         Err(e) => {
             println!("  -> Authentication Notice: {}", e);
-            if e.to_string().contains("API_KEY_INVALID") {
+            if e.to_string().contains("CONFIGURATION_NOT_FOUND") {
+                println!("  -> Diagnostics: Valid API key for dhun-716e6 recognized! Firebase Authentication needs to be activated in Firebase Console (Authentication -> Get started -> enable Anonymous).");
+            } else if e.to_string().contains("API_KEY_INVALID") {
                 println!("  -> Diagnostics: Configured key is placeholder/invalid and rejected by Identity Toolkit.");
             }
         }
