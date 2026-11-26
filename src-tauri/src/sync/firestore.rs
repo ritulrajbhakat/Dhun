@@ -51,6 +51,53 @@ impl FirestoreClient {
         &self.config.project_id
     }
 
+    /// Explicitly signs in anonymously via Firebase Auth REST API or returns cached token,
+    /// returning a detailed error if the configured API key is invalid or rejected by Identity Toolkit.
+    pub async fn authenticate_anonymous(&self) -> Result<String> {
+        let api_key = self
+            .config
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("No Firebase Web API key configured in .env or settings"))?;
+        if api_key.trim().is_empty() {
+            return Err(anyhow!("Firebase Web API key is empty"));
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        {
+            let read_guard = self.cached_auth.read().await;
+            if let Some(ref auth) = *read_guard {
+                if now < auth.expires_at_epoch_sec - 120 {
+                    return Ok(auth.id_token.clone());
+                }
+            }
+        }
+
+        let mut write_guard = self.cached_auth.write().await;
+        if let Some(ref auth) = *write_guard {
+            if now < auth.expires_at_epoch_sec - 120 {
+                return Ok(auth.id_token.clone());
+            }
+        }
+
+        let new_token = self.sign_in_anonymously(api_key).await?;
+        let id_token = new_token.id_token.clone();
+        *write_guard = Some(new_token);
+        Ok(id_token)
+    }
+
+    /// Verifies that an ID token was issued for the expected Firebase project ID by parsing JWT claims.
+    pub fn verify_token_project(&self, id_token: &str) -> Result<bool> {
+        let parts: Vec<&str> = id_token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(anyhow!("Invalid JWT token: expected 3 parts, got {}", parts.len()));
+        }
+        let payload_bytes = decode_base64_url(parts[1])?;
+        let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)?;
+        let aud = claims.get("aud").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(aud == self.config.project_id)
+    }
+
     /// Obtains a valid Firebase ID token using Anonymous Auth or Token Refresh.
     /// Returns None if no Web API key is configured (allowing unauthenticated access if rules permit).
     pub async fn get_id_token(&self) -> Option<String> {
@@ -552,6 +599,33 @@ fn sanitize_doc_id(id: &str) -> String {
             }
         })
         .collect()
+}
+
+pub fn decode_base64_url(input: &str) -> Result<Vec<u8>> {
+    let mut s = input.replace('-', "+").replace('_', "/");
+    while s.len() % 4 != 0 {
+        s.push('=');
+    }
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::new();
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in s.as_bytes() {
+        if b == b'=' {
+            break;
+        }
+        let val = TABLE
+            .iter()
+            .position(|&x| x == b)
+            .ok_or_else(|| anyhow!("Invalid base64 character: {}", b as char))? as u32;
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(Level::INFO)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+    dhun_lib::sync::load_dotenv_if_present();
 
     info!("=================================================================");
     info!("DHUN धुन — Local Party Helper Service (v2.1.0)");

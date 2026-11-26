@@ -12,6 +12,42 @@ use crate::db::models::{SyncOutboxItem, SyncStatusOverview};
 pub mod firestore;
 pub use firestore::{FirestoreClient, FirestoreConfig};
 
+/// Loads key-value pairs from .env into std::env if not already set, checking common search paths.
+pub fn load_dotenv_if_present() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok().map(std::path::PathBuf::from);
+    let mut search_paths = vec![
+        std::path::PathBuf::from(".env"),
+        std::path::PathBuf::from("../.env"),
+        std::path::PathBuf::from("../../.env"),
+    ];
+    if let Some(ref md) = manifest_dir {
+        search_paths.push(md.join(".env"));
+        if let Some(parent) = md.parent() {
+            search_paths.push(parent.join(".env"));
+        }
+    }
+    for path in &search_paths {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = trimmed.split_once('=') {
+                        let key = k.trim();
+                        let val = v.trim().trim_matches('"').trim_matches('\'');
+                        if std::env::var(key).is_err() && !val.is_empty() {
+                            std::env::set_var(key, val);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
 /// Computes SHA-256 digest of payload for canonical message binding
 pub fn compute_payload_hash(payload_json: &str) -> String {
     let mut hasher = Sha256::new();
@@ -144,6 +180,7 @@ impl MetadataSyncManager {
 
     /// Creates sync manager loading any persisted remote sync endpoint, Firebase credentials, or SQLite settings
     pub fn new_from_db(db: &Database) -> Result<Self> {
+        load_dotenv_if_present();
         let endpoint = std::env::var("DHUN_SYNC_ENDPOINT")
             .ok()
             .or_else(|| db.get_app_setting("sync_remote_endpoint").unwrap_or(None));

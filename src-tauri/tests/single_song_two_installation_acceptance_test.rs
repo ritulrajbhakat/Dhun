@@ -40,14 +40,36 @@ async fn test_single_song_two_installation_controlled_acceptance() {
     let file_len = std::fs::metadata(&audio_file).unwrap().len();
     println!("             File size: {} bytes ({:.2} MB)", file_len, file_len as f64 / 1_048_576.0);
 
-    let project_id = "dhun-716e6".to_string();
+    dhun_lib::sync::load_dotenv_if_present();
+    let project_id = std::env::var("DHUN_FIREBASE_PROJECT_ID")
+        .or_else(|_| std::env::var("VITE_FIREBASE_PROJECT_ID"))
+        .unwrap_or_else(|_| "dhun-716e6".to_string());
+    let api_key = std::env::var("DHUN_FIREBASE_API_KEY")
+        .or_else(|_| std::env::var("VITE_FIREBASE_API_KEY"))
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| Some("AIzaSyExampleVerificationKey".to_string()));
+
     let firestore_config = FirestoreConfig {
         project_id: project_id.clone(),
-        api_key: Some("AIzaSyExampleVerificationKey".to_string()),
+        api_key: api_key.clone(),
     };
     let client = FirestoreClient::new(firestore_config.clone());
     assert_eq!(client.project_id(), "dhun-716e6");
     println!("[Step B] Configured Firestore client targeting project: {}", client.project_id());
+    match client.authenticate_anonymous().await {
+        Ok(token) => {
+            let is_target = client.verify_token_project(&token).unwrap_or(false);
+            println!("  -> Authentication: SUCCESS");
+            println!("  -> Target Project Verified (aud == {}): {}", project_id, is_target);
+        }
+        Err(e) => {
+            println!("  -> Authentication Notice: {}", e);
+            if e.to_string().contains("API_KEY_INVALID") {
+                println!("  -> Diagnostics: Configured key is placeholder/invalid and rejected by Identity Toolkit.");
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // STEP C & D: INSTALLATION A — REAL AUDIO DSP ANALYSIS & METADATA UPLOAD
@@ -139,10 +161,30 @@ async fn test_single_song_two_installation_controlled_acceptance() {
 
     // Attempt live dispatch against Firestore online server (capturing the real response)
     println!("Attempting live dispatch to Google Cloud Firestore (dhun-716e6)...");
-    let dispatch_result = client.patch_document("catalogue", &format!("fp_{}", canonical_fp), firestore_doc.clone()).await;
+    let primary_doc_id = format!("fp_{}", canonical_fp);
+    let dispatch_result = client.patch_document("catalogue", &primary_doc_id, firestore_doc.clone()).await;
     match dispatch_result {
         Ok(()) => {
-            println!("-> Live upload succeeded!");
+            println!("-> Live upload succeeded (HTTP 200 OK)!");
+            println!("Attempting live read-back from Google Cloud Firestore...");
+            let readback_res = client.get_document("catalogue", &primary_doc_id).await;
+            match readback_res {
+                Ok(Some(cloud_doc)) => {
+                    println!("-> Live read-back succeeded (HTTP 200 OK)!");
+                    let parsed = from_firestore_document(&cloud_doc).expect("Deserialization of live cloud doc failed");
+                    assert_eq!(parsed.canonical_fingerprint, canonical_fp);
+                    assert_eq!(parsed.title, raw_title);
+                    assert_eq!(parsed.artist, artist);
+                    assert_eq!(parsed.duration_ms, duration_ms);
+                    println!("-> Live cloud document fields matched local record!");
+                }
+                Ok(None) => {
+                    println!("-> Live read-back returned None (document not found)");
+                }
+                Err(e) => {
+                    println!("-> Live read-back returned error: {}", e);
+                }
+            }
         }
         Err(ref e) => {
             println!("-> Live upload returned expected security response: {}", e);
