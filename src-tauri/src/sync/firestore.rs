@@ -416,6 +416,11 @@ impl FirestoreClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            eprintln!("\n[FIRESTORE PATCH REJECTION DEBUG]");
+            eprintln!("  URL: {}", url);
+            eprintln!("  Status: {}", status);
+            eprintln!("  Body: {}", body);
+            eprintln!("  Payload: {}\n", serde_json::to_string(&doc_json).unwrap_or_default());
             if status.as_u16() == 403 || status.as_u16() == 401 {
                 return Err(anyhow!("Firestore permission/auth error ({status}): {body}"));
             } else if status.as_u16() == 429 {
